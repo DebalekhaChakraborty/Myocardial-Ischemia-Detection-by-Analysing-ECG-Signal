@@ -1,7 +1,7 @@
 # Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal
 Processing ECG Signal, QRS and ST Segment Detection, BPM Calculation, ST Slope Measurement and Myocardial Ischemia Detection.
 
-I have done this project on my 4th year of B.Tech and submitted as Final Project. In this poject I collected various ecg signals from online opensources and used them to study the behaviour of the signal in the presence of abnormal heart rate and myocardial ischemia.  
+I have done this project on my 4th year of B.Tech and submitted as Final Project. In this project I collected various ecg signals from online opensources and used them to study the behaviour of the signal in the presence of abnormal heart rate and myocardial ischemia.  
 
 <b>SYSTEM ANALYSIS & DESIGN:</b>
 
