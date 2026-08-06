@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cardiosentinel"
+version = "0.1.0"
+description = "Research software foundation for transient ischemic ST-episode detection."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "CardioSentinel contributors" }]
+dependencies = [
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+# Development dependencies are intentionally lightweight for Phase 0.
+dev = [
+  "pytest>=8.0,<9",
+  "ruff>=0.6,<1",
+]
+# Reserved groups; no ML or documentation framework is required yet.
+ml = []
+docs = []
+
+[project.scripts]
+cardiosentinel = "cardiosentinel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 88
+extend-exclude = ["legacy/college-v1"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]

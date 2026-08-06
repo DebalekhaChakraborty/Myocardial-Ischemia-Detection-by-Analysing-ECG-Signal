@@ -1,0 +1,8 @@
+extends: base
+
+project:
+  profile: development
+
+paths:
+  output_root: ${CARDIOSENTINEL_ARTIFACT_ROOT:-artifacts}/development
+
