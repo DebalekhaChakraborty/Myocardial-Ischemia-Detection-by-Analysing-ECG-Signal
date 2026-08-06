@@ -51,3 +51,9 @@ every downloaded file against its corresponding official SHA-256 entry and never
 downloads `.dat` waveform files. Its URLs are explicitly pinned to the declared
 dataset version rather than a library's current-release lookup. Remote probe and
 validation commands use WFDB `pn_dir` access for headers and annotations only.
+
+Phase 2 waveform probes are a separate, explicitly bounded operation. They use
+WFDB physical calibration and request only the declared half-open sample
+interval and selected channels. Probe output contains metadata and aggregate
+amplitude summaries, not raw arrays. Waveform segments and derived outputs must
+remain outside Git.

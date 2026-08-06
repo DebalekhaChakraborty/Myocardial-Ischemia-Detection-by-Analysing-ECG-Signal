@@ -9,7 +9,6 @@ data:
   sampling_frequency_hz: null
 
 # Define these values only in a reviewed experiment configuration.
-window:
+windowing:
   length_seconds: null
-  overlap_seconds: null
-
+  stride_seconds: null

@@ -11,12 +11,20 @@ from typing import Any, Mapping
 
 import yaml
 
+from cardiosentinel.signal.config import (
+    FilterProfile,
+    HighPassConfig,
+    LowPassConfig,
+    NotchConfig,
+)
+from cardiosentinel.signal.errors import SignalValidationError
+
 DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "base.yaml"
 _ENV_PATTERN = re.compile(r"\$\{([A-Z][A-Z0-9_]*)(?::-([^}]*))?\}")
 
 
 class ConfigValidationError(ValueError):
-    """Raised when a configuration violates a Phase 0 research invariant."""
+    """Raised when configuration violates a research invariant."""
 
 
 @dataclass(frozen=True)
@@ -46,11 +54,18 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
-class WindowConfig:
-    """Windowing parameters, intentionally unset until protocol review."""
+class SignalConfig:
+    """Physical waveform representation settings."""
+
+    canonical_unit: str
+
+
+@dataclass(frozen=True)
+class WindowingConfig:
+    """Causal windowing parameters, unset until a protocol defines them."""
 
     length_seconds: float | None
-    overlap_seconds: float | None
+    stride_seconds: float | None
 
 
 @dataclass(frozen=True)
@@ -64,11 +79,10 @@ class SplitConfig:
 
 
 @dataclass(frozen=True)
-class SignalPreprocessingConfig:
-    """Future signal-preprocessing selection without an implementation."""
+class SignalQualityConfig:
+    """Enable descriptive waveform-only quality measurements."""
 
     enabled: bool
-    filter_profile: str | None
 
 
 @dataclass(frozen=True)
@@ -115,10 +129,12 @@ class CardioSentinelConfig:
     project: ProjectConfig
     paths: PathsConfig
     data: DataConfig
-    window: WindowConfig
+    signal: SignalConfig
+    preprocessing: FilterProfile
+    windowing: WindowingConfig
+    signal_quality: SignalQualityConfig
     random_seed: int
     split: SplitConfig
-    signal_preprocessing: SignalPreprocessingConfig
     training: TrainingConfig
     calibration: CalibrationConfig
     personalization: PersonalizationConfig
@@ -128,6 +144,7 @@ class CardioSentinelConfig:
 
 def _expand_environment(value: Any) -> Any:
     if isinstance(value, str):
+
         def replace(match: re.Match[str]) -> str:
             name, default = match.groups()
             environment_value = os.getenv(name)
@@ -203,6 +220,14 @@ def _as_optional_positive_float(value: Any, name: str) -> float | None:
     return float(value)
 
 
+def _as_optional_positive_int(value: Any, name: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigValidationError(f"{name} must be a positive integer or null.")
+    return value
+
+
 def _as_fraction(value: Any, name: str) -> float:
     if (
         isinstance(value, bool)
@@ -230,9 +255,20 @@ def _as_string(value: Any, name: str, allow_none: bool = False) -> str | None:
 
 def _build_config(raw: Mapping[str, Any]) -> CardioSentinelConfig:
     expected_sections = {
-        "project", "paths", "data", "window", "random_seed", "split",
-        "signal_preprocessing", "training", "calibration", "personalization",
-        "episodes", "edge",
+        "project",
+        "paths",
+        "data",
+        "signal",
+        "preprocessing",
+        "windowing",
+        "signal_quality",
+        "random_seed",
+        "split",
+        "training",
+        "calibration",
+        "personalization",
+        "episodes",
+        "edge",
     }
     _expect_keys(raw, "configuration", expected_sections)
 
@@ -271,30 +307,86 @@ def _build_config(raw: Mapping[str, Any]) -> CardioSentinelConfig:
     if not data_config.require_record_metadata:
         raise ConfigValidationError("data.require_record_metadata must remain true.")
 
-    window = _mapping(raw["window"], "window")
-    _expect_keys(window, "window", {"length_seconds", "overlap_seconds"})
-    window_config = WindowConfig(
+    signal = _mapping(raw["signal"], "signal")
+    _expect_keys(signal, "signal", {"canonical_unit"})
+    signal_config = SignalConfig(
+        canonical_unit=_as_string(signal["canonical_unit"], "signal.canonical_unit")
+    )
+    if signal_config.canonical_unit != "mV":
+        raise ConfigValidationError("signal.canonical_unit must be mV.")
+
+    preprocessing = _mapping(raw["preprocessing"], "preprocessing")
+    _expect_keys(
+        preprocessing,
+        "preprocessing",
+        {"profile", "highpass", "lowpass", "notch"},
+    )
+    highpass = _mapping(preprocessing["highpass"], "preprocessing.highpass")
+    _expect_keys(highpass, "preprocessing.highpass", {"enabled", "cutoff_hz", "order"})
+    lowpass = _mapping(preprocessing["lowpass"], "preprocessing.lowpass")
+    _expect_keys(lowpass, "preprocessing.lowpass", {"enabled", "cutoff_hz", "order"})
+    notch = _mapping(preprocessing["notch"], "preprocessing.notch")
+    _expect_keys(
+        notch,
+        "preprocessing.notch",
+        {"enabled", "frequency_hz", "quality_factor"},
+    )
+    try:
+        preprocessing_config = FilterProfile(
+            name=_as_string(preprocessing["profile"], "preprocessing.profile"),
+            highpass=HighPassConfig(
+                enabled=_as_bool(highpass["enabled"], "preprocessing.highpass.enabled"),
+                cutoff_hz=_as_optional_positive_float(
+                    highpass["cutoff_hz"], "preprocessing.highpass.cutoff_hz"
+                ),
+                order=_as_optional_positive_int(
+                    highpass["order"], "preprocessing.highpass.order"
+                ),
+            ),
+            lowpass=LowPassConfig(
+                enabled=_as_bool(lowpass["enabled"], "preprocessing.lowpass.enabled"),
+                cutoff_hz=_as_optional_positive_float(
+                    lowpass["cutoff_hz"], "preprocessing.lowpass.cutoff_hz"
+                ),
+                order=_as_optional_positive_int(
+                    lowpass["order"], "preprocessing.lowpass.order"
+                ),
+            ),
+            notch=NotchConfig(
+                enabled=_as_bool(notch["enabled"], "preprocessing.notch.enabled"),
+                frequency_hz=_as_optional_positive_float(
+                    notch["frequency_hz"], "preprocessing.notch.frequency_hz"
+                ),
+                quality_factor=_as_optional_positive_float(
+                    notch["quality_factor"], "preprocessing.notch.quality_factor"
+                ),
+            ),
+        )
+    except SignalValidationError as error:
+        raise ConfigValidationError(str(error)) from error
+
+    windowing = _mapping(raw["windowing"], "windowing")
+    _expect_keys(windowing, "windowing", {"length_seconds", "stride_seconds"})
+    windowing_config = WindowingConfig(
         length_seconds=_as_optional_positive_float(
-            window["length_seconds"], "window.length_seconds"
+            windowing["length_seconds"], "windowing.length_seconds"
         ),
-        overlap_seconds=_as_optional_positive_float(
-            window["overlap_seconds"], "window.overlap_seconds"
+        stride_seconds=_as_optional_positive_float(
+            windowing["stride_seconds"], "windowing.stride_seconds"
         ),
     )
-    if (window_config.length_seconds is None) != (
-        window_config.overlap_seconds is None
+    if (windowing_config.length_seconds is None) != (
+        windowing_config.stride_seconds is None
     ):
         raise ConfigValidationError(
-            "window length and overlap must be set together or both null."
+            "windowing length and stride must be set together or both null."
         )
-    if (
-        window_config.length_seconds is not None
-        and window_config.overlap_seconds is not None
-        and window_config.overlap_seconds >= window_config.length_seconds
-    ):
-        raise ConfigValidationError(
-            "window.overlap_seconds must be less than window.length_seconds."
-        )
+
+    signal_quality = _mapping(raw["signal_quality"], "signal_quality")
+    _expect_keys(signal_quality, "signal_quality", {"enabled"})
+    signal_quality_config = SignalQualityConfig(
+        enabled=_as_bool(signal_quality["enabled"], "signal_quality.enabled")
+    )
 
     random_seed = raw["random_seed"]
     if (
@@ -329,17 +421,6 @@ def _build_config(raw: Mapping[str, Any]) -> CardioSentinelConfig:
         abs_tol=1e-9,
     ):
         raise ConfigValidationError("split fractions must sum to 1.0.")
-
-    preprocessing = _mapping(raw["signal_preprocessing"], "signal_preprocessing")
-    _expect_keys(preprocessing, "signal_preprocessing", {"enabled", "filter_profile"})
-    preprocessing_config = SignalPreprocessingConfig(
-        enabled=_as_bool(preprocessing["enabled"], "signal_preprocessing.enabled"),
-        filter_profile=_as_string(
-            preprocessing["filter_profile"],
-            "signal_preprocessing.filter_profile",
-            allow_none=True,
-        ),
-    )
 
     training = _mapping(raw["training"], "training")
     _expect_keys(training, "training", {"enabled"})
@@ -378,9 +459,7 @@ def _build_config(raw: Mapping[str, Any]) -> CardioSentinelConfig:
     edge = _mapping(raw["edge"], "edge")
     _expect_keys(edge, "edge", {"benchmark_enabled", "hardware_target"})
     edge_config = EdgeConfig(
-        benchmark_enabled=_as_bool(
-            edge["benchmark_enabled"], "edge.benchmark_enabled"
-        ),
+        benchmark_enabled=_as_bool(edge["benchmark_enabled"], "edge.benchmark_enabled"),
         hardware_target=_as_string(
             edge["hardware_target"], "edge.hardware_target", allow_none=True
         ),
@@ -390,10 +469,12 @@ def _build_config(raw: Mapping[str, Any]) -> CardioSentinelConfig:
         project=project_config,
         paths=paths_config,
         data=data_config,
-        window=window_config,
+        signal=signal_config,
+        preprocessing=preprocessing_config,
+        windowing=windowing_config,
+        signal_quality=signal_quality_config,
         random_seed=random_seed,
         split=split_config,
-        signal_preprocessing=preprocessing_config,
         training=training_config,
         calibration=calibration_config,
         personalization=personalization_config,
