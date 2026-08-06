@@ -3,9 +3,11 @@
 Future changes must be independently reviewable and must follow the experiment
 contract.
 
-1. **Dataset ingestion and annotation validation:** complete. Versioned EDB and
-   LTSTDB contracts, strict WFDB metadata inspection, annotation preservation,
-   manifest generation, leakage validation, and synthetic tests are available.
+1. **Dataset ingestion and annotation validation:** implementation and
+   annotation-semantic validation complete. Versioned EDB and LTSTDB contracts,
+   strict WFDB metadata inspection, annotation preservation, manifest
+   generation, leakage validation, remote header/annotation validation, and
+   synthetic tests are available.
 2. **Signal-processing pipeline:** deterministic loading, quality checks, and
    documented preprocessing.
 3. **Reproducible baselines:** non-neural and simple learned baselines with

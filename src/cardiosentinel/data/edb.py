@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Final, Iterable
 
 from cardiosentinel.data.models import (
+    AnnotationClassification,
     AnnotationSample,
     AnnotationValidationError,
     DatasetRecord,
@@ -126,17 +127,16 @@ _PEAK = re.compile(
     r"^(?P<prefix>AST|ast)(?P<lead>[01])(?P<direction>[+-])(?P<value>\d+)$"
 )
 _END = re.compile(r"^(?P<kind>ST|st)(?P<lead>[01])(?P<direction>[+-])\)$")
-_QUALITY_STATES: Final = {
-    0x00: ("clean", "clean"),
-    0x01: ("noisy", "clean"),
-    0x02: ("clean", "noisy"),
-    0x03: ("noisy", "noisy"),
-    0x11: ("unreadable", "clean"),
-    0x12: ("unreadable", "noisy"),
-    0x20: ("clean", "unreadable"),
-    0x21: ("noisy", "unreadable"),
-    0x33: ("unreadable", "unreadable"),
-}
+_T_START = re.compile(r"^\((?P<kind>T|t)(?P<lead>[01])(?P<direction>\+{1,2}|-{1,2})$")
+_T_PEAK = re.compile(
+    r"^(?P<prefix>AT|at)(?P<lead>[01])(?P<direction>\+{1,2}|-{1,2})(?P<value>\d+)$"
+)
+_T_END = re.compile(r"^(?P<kind>T|t)(?P<lead>[01])(?P<direction>\+{1,2}|-{1,2})\)$")
+_KNOWN_IGNORED_SYMBOLS: Final = frozenset(
+    {"N", "a", "J", "S", "V", "F", "Q", "n", "|", "+"}
+)
+_KNOWN_IRRELEVANT_COMMENT_TEXT: Final = frozenset({"BUTTON", "TS"})
+_QUALITY_SUBTYPE_MASK: Final = 0x33
 
 
 def subject_id_for_record(record_id: str) -> str:
@@ -155,16 +155,163 @@ def _event_fields(kind: str) -> tuple[str, str]:
     return "axis_shift", "apparent_st_change"
 
 
+def _text(annotation: AnnotationSample) -> str:
+    """Normalize fixed-width WFDB auxiliary-note padding."""
+    return annotation.aux_note.strip(" \t\r\n\x00")
+
+
+def _expected_st_symbol(kind: str) -> str:
+    return "s" if kind == "ST" else '"'
+
+
+def quality_states(subtype: int) -> tuple[str, str]:
+    """Decode EDB's WFDB bitmask, with unreadable taking precedence over noise."""
+    if subtype < 0 or subtype & ~_QUALITY_SUBTYPE_MASK:
+        raise AnnotationValidationError(f"Unsupported EDB quality subtype {subtype}.")
+    return tuple(
+        "unreadable"
+        if subtype & (0x10 << lead)
+        else "noisy"
+        if subtype & (1 << lead)
+        else "clean"
+        for lead in range(2)
+    )
+
+
+def classify_annotations(
+    annotations: Iterable[AnnotationSample],
+) -> tuple[AnnotationClassification, ...]:
+    """Classify every EDB annotation before episode reconstruction."""
+    classifications: list[AnnotationClassification] = []
+    for annotation in annotations:
+        text = _text(annotation)
+        start, peak, end = (
+            _START.fullmatch(text),
+            _PEAK.fullmatch(text),
+            _END.fullmatch(text),
+        )
+        if start or peak or end:
+            kind = (
+                start["kind"]
+                if start
+                else ("ST" if peak and peak["prefix"] == "AST" else "st")
+                if peak
+                else end["kind"]
+            )
+            expected = _expected_st_symbol(kind)
+            if annotation.symbol == expected and annotation.channel == 0:
+                classifications.append(
+                    AnnotationClassification(
+                        annotation, "recognized_relevant", "edb.st_episode"
+                    )
+                )
+            else:
+                classifications.append(
+                    AnnotationClassification(
+                        annotation,
+                        "unknown",
+                        f"EDB ST text requires WFDB symbol {expected!r} and channel 0",
+                        True,
+                    )
+                )
+        else:
+            t_start, t_peak, t_end = (
+                _T_START.fullmatch(text),
+                _T_PEAK.fullmatch(text),
+                _T_END.fullmatch(text),
+            )
+            if t_start or t_peak or t_end:
+                kind = (
+                    t_start["kind"]
+                    if t_start
+                    else ("T" if t_peak and t_peak["prefix"] == "AT" else "t")
+                    if t_peak
+                    else t_end["kind"]
+                )
+                expected = "T" if kind == "T" else '"'
+                if annotation.symbol == expected and annotation.channel == 0:
+                    classifications.append(
+                        AnnotationClassification(
+                            annotation, "recognized_irrelevant", "edb.t_episode"
+                        )
+                    )
+                else:
+                    classifications.append(
+                        AnnotationClassification(
+                            annotation,
+                            "unknown",
+                            "EDB T text requires its documented WFDB symbol and "
+                            "channel 0",
+                        )
+                    )
+            elif annotation.symbol == "T":
+                # Some released T annotations retain non-NUL fixed-width padding.
+                classifications.append(
+                    AnnotationClassification(
+                        annotation, "recognized_irrelevant", "edb.t_episode"
+                    )
+                )
+            elif annotation.symbol == '"' and text in _KNOWN_IRRELEVANT_COMMENT_TEXT:
+                classifications.append(
+                    AnnotationClassification(
+                        annotation,
+                        "recognized_irrelevant",
+                        "edb.comment",
+                    )
+                )
+            elif annotation.symbol == "~":
+                try:
+                    quality_states(annotation.subtype)
+                    valid_subtype = True
+                except AnnotationValidationError:
+                    valid_subtype = False
+                if valid_subtype and annotation.channel == 0:
+                    classifications.append(
+                        AnnotationClassification(
+                            annotation, "recognized_relevant", "edb.signal_quality"
+                        )
+                    )
+                else:
+                    classifications.append(
+                        AnnotationClassification(
+                            annotation,
+                            "unknown",
+                            "EDB quality annotation has unsupported subtype or channel",
+                            True,
+                        )
+                    )
+            elif annotation.symbol in _KNOWN_IGNORED_SYMBOLS:
+                classifications.append(
+                    AnnotationClassification(
+                        annotation, "recognized_irrelevant", "edb.beat_or_rhythm"
+                    )
+                )
+            else:
+                classifications.append(
+                    AnnotationClassification(
+                        annotation,
+                        "unknown",
+                        "unrecognized EDB annotation",
+                        annotation.symbol in {"s", '"', "~"}
+                        or "st" in text.lower(),
+                    )
+                )
+    return tuple(classifications)
+
+
 def parse_annotations(
     record: DatasetRecord, annotations: Iterable[AnnotationSample]
 ) -> ParsedAnnotations:
     """Strictly reconstruct upper-case ST and lower-case axis-shift episodes."""
+    annotations = tuple(annotations)
+    classifications = classify_annotations(annotations)
     open_events: dict[tuple[str, int, str], list[AnnotationSample]] = {}
     events: list[STEvent] = []
     quality_samples: list[AnnotationSample] = []
-    for annotation in annotations:
-        # WFDB preserves NUL padding in some fixed-width EDB auxiliary notes.
-        text = annotation.aux_note.strip(" \t\r\n\x00")
+    for annotation, classification in zip(annotations, classifications, strict=True):
+        if classification.disposition != "recognized_relevant":
+            continue
+        text = _text(annotation)
         start = _START.fullmatch(text)
         peak = _PEAK.fullmatch(text)
         end = _END.fullmatch(text)
@@ -200,9 +347,7 @@ def parse_annotations(
                     f"Invalid EDB episode timing in {record.record_id}."
                 )
             family, subtype = _event_fields(key[0])
-            peak_match = _PEAK.fullmatch(
-                peak_annotation.aux_note.strip(" \t\r\n\x00")
-            )
+            peak_match = _PEAK.fullmatch(_text(peak_annotation))
             magnitude = int(peak_match["value"]) if peak_match else 0
             signed_value = magnitude if key[2] == "+" else -magnitude
             events.append(
@@ -228,17 +373,19 @@ def parse_annotations(
                 )
             )
         elif annotation.symbol == "~":
-            if annotation.subtype not in _QUALITY_STATES:
-                raise AnnotationValidationError(
-                    f"Unknown EDB quality state {annotation.subtype}."
-                )
             quality_samples.append(annotation)
+    warnings = ()
     if open_events:
-        raise AnnotationValidationError(
-            f"Unclosed EDB episodes: {sorted(open_events)}."
+        warnings = (
+            f"{record.record_id} ends with source-censored EDB episodes: "
+            f"{sorted(open_events)}.",
         )
     return ParsedAnnotations(
-        tuple(events), _quality_intervals(record, quality_samples), ()
+        tuple(events),
+        _quality_intervals(record, quality_samples),
+        (),
+        classifications,
+        warnings,
     )
 
 
@@ -256,7 +403,7 @@ def _quality_intervals(
             raise AnnotationValidationError(
                 f"Invalid EDB quality timing in {record.record_id}."
             )
-        for lead, state in enumerate(_QUALITY_STATES[current.subtype]):
+        for lead, state in enumerate(quality_states(current.subtype)):
             intervals.append(
                 SignalQualityInterval(
                     record.record_id,

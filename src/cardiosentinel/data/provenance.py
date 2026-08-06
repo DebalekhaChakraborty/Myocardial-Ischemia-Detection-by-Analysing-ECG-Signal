@@ -29,8 +29,10 @@ def selected_file_digests(root: Path, paths: Iterable[Path]) -> dict[str, str]:
     }
 
 
-def verify_sha256_manifest(checksums_path: Path, root: Path) -> dict[str, str]:
-    """Verify every file listed by an official SHA-256 checksum manifest."""
+def verify_sha256_manifest(
+    checksums_path: Path, root: Path, paths: Iterable[Path] | None = None
+) -> dict[str, str]:
+    """Verify a selected download, or a complete release when paths is omitted."""
     expected: dict[str, str] = {}
     for line in checksums_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -44,12 +46,20 @@ def verify_sha256_manifest(checksums_path: Path, root: Path) -> dict[str, str]:
             raise ValueError(f"Malformed checksum entry in {checksums_path}: {line!r}")
         expected[filename] = digest.lower()
 
-    missing = [filename for filename in expected if not (root / filename).is_file()]
+    selected = sorted(expected) if paths is None else sorted(
+        path.relative_to(root).as_posix() for path in paths
+    )
+    missing_entries = [filename for filename in selected if filename not in expected]
+    if missing_entries:
+        raise ValueError(
+            f"No checksum entry for downloaded files: {sorted(missing_entries)}"
+        )
+    missing = [filename for filename in selected if not (root / filename).is_file()]
     if missing:
         raise ValueError(
             f"Missing files required by checksum manifest: {sorted(missing)}"
         )
-    actual = {filename: sha256_file(root / filename) for filename in sorted(expected)}
+    actual = {filename: sha256_file(root / filename) for filename in selected}
     mismatches = [
         filename for filename, digest in actual.items() if digest != expected[filename]
     ]

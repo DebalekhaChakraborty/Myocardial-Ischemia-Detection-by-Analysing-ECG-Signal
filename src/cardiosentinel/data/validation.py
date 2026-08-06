@@ -2,10 +2,18 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 
-from cardiosentinel.data.models import DatasetRecord, SignalQualityInterval, STEvent
+from cardiosentinel.data.models import (
+    AnnotationMarker,
+    DatasetRecord,
+    ParsedAnnotations,
+    SignalQualityInterval,
+    STEvent,
+    annotation_pattern,
+)
 
 
 @dataclass(frozen=True)
@@ -63,12 +71,17 @@ def validate_dataset(
     expected_records: int,
     expected_subjects: int,
     primary_definition: str | None,
+    markers: Iterable[AnnotationMarker] = (),
+    parsed_annotations: Iterable[ParsedAnnotations] = (),
 ) -> ValidationReport:
     """Validate record, event, channel, and quality invariants for a full dataset."""
     records = tuple(records)
     events = tuple(events)
     quality_intervals = tuple(quality_intervals)
+    markers = tuple(markers)
+    parsed_annotations = tuple(parsed_annotations)
     errors: list[str] = []
+    warnings: list[str] = []
     by_record = {record.record_id: record for record in records}
     if len(records) != expected_records:
         errors.append(f"Expected {expected_records} records, found {len(records)}.")
@@ -118,12 +131,69 @@ def validate_dataset(
             errors.append(
                 f"Signal-quality interval has invalid lead in {interval.record_id}."
             )
+    for marker in markers:
+        record = by_record.get(marker.record_id)
+        if record is None or not 0 <= marker.sample < record.sample_count:
+            errors.append(f"Invalid annotation marker in {marker.record_id}.")
+        elif marker.lead is not None and not 0 <= marker.lead < record.signal_count:
+            errors.append(f"Annotation marker has invalid lead in {marker.record_id}.")
+    unknown = tuple(
+        item for parsed in parsed_annotations for item in parsed.unknown_annotations
+    )
+    unknown_relevant = tuple(
+        item
+        for parsed in parsed_annotations
+        for item in parsed.unknown_relevant_annotations
+    )
+    if unknown_relevant:
+        patterns = sorted(
+            {annotation_pattern(item.annotation.aux_note) for item in unknown_relevant}
+        )[:20]
+        errors.append(
+            "Unknown potentially ST-related annotation forms: " f"{patterns}."
+        )
+    warnings.extend(
+        warning for parsed in parsed_annotations for warning in parsed.warnings
+    )
+    event_subtypes = Counter(event.event_subtype for event in events)
+    marker_subtypes = Counter(marker.subtype for marker in markers)
+    quality_states = Counter(interval.state for interval in quality_intervals)
+    recognized_reasons = Counter(
+        item.reason for parsed in parsed_annotations for item in parsed.classifications
+    )
     return ValidationReport(
         errors=tuple(errors),
+        warnings=tuple(warnings),
         summary={
             "record_count": len(records),
             "subject_count": subject_count,
             "event_count": len(events),
             "signal_quality_interval_count": len(quality_intervals),
+            "marker_count": len(markers),
+            "recognized_annotation_count": sum(
+                item.recognized_annotation_count for item in parsed_annotations
+            ),
+            "ignored_known_annotation_count": sum(
+                item.ignored_known_annotation_count for item in parsed_annotations
+            ),
+            "unknown_annotation_count": len(unknown),
+            "unknown_relevant_annotation_count": len(unknown_relevant),
+            "reference_st_change_event_count": event_subtypes[
+                "reference_st_change"
+            ],
+            "apparent_st_change_event_count": event_subtypes[
+                "apparent_st_change"
+            ],
+            "ischemic_episode_count": event_subtypes["ischemic"],
+            "heart_rate_related_episode_count": event_subtypes[
+                "heart_rate_related"
+            ],
+            "axis_shift_marker_count": marker_subtypes["axis_related"],
+            "conduction_change_marker_count": marker_subtypes["conduction_related"],
+            "noise_marker_count": marker_subtypes["point_noise"],
+            "global_reference_count": marker_subtypes["global"],
+            "local_reference_count": marker_subtypes["local"],
+            "unreadable_interval_count": quality_states["unreadable"],
+            "edb_quality_change_count": recognized_reasons["edb.signal_quality"],
         },
     )

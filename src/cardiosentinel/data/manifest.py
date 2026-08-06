@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from urllib.request import urlretrieve
 
 from cardiosentinel.data import edb, ltstdb
@@ -80,6 +81,7 @@ def validate_local_dataset(
     intervals = tuple(
         interval for item in parsed for interval in item.quality_intervals
     )
+    markers = tuple(marker for item in parsed for marker in item.markers)
     primary = (
         "edb.reference"
         if dataset_id == "edb"
@@ -92,6 +94,8 @@ def validate_local_dataset(
         module.EXPECTED_RECORD_COUNT,
         module.EXPECTED_SUBJECT_COUNT,
         primary,
+        markers,
+        parsed,
     )
 
 
@@ -112,6 +116,11 @@ def build_manifest(
     markers = tuple(marker for item in parsed for marker in item.markers)
     relevant = [source / "RECORDS", source / "SHA256SUMS.txt"]
     relevant.extend(source / f"{record.record_id}.hea" for record in records)
+    selected = annotation_set or module.PRIMARY_ANNOTATION
+    relevant.extend(source / f"{record.record_id}.{selected}" for record in records)
+    unknown_patterns = sorted(
+        {pattern for item in parsed for pattern in item.unknown_aux_patterns}
+    )[:20]
     return {
         "schema_version": PARSER_SCHEMA_VERSION,
         "generated_at": generated_at or datetime.now(timezone.utc).isoformat(),
@@ -123,6 +132,16 @@ def build_manifest(
         "subject_mapping": {record.record_id: record.subject_id for record in records},
         "file_digests": selected_file_digests(source, relevant),
         "annotation_counts": {"events": len(events), "markers": len(markers)},
+        "recognized_annotation_count": sum(
+            item.recognized_annotation_count for item in parsed
+        ),
+        "ignored_known_annotation_count": sum(
+            item.ignored_known_annotation_count for item in parsed
+        ),
+        "unknown_annotation_count": sum(
+            len(item.unknown_annotations) for item in parsed
+        ),
+        "unknown_aux_patterns": unknown_patterns,
         "event_counts_by_type": dict(
             sorted(Counter(event.event_subtype for event in events).items())
         ),
@@ -161,31 +180,51 @@ def destination_is_git_ignored(destination: Path) -> bool:
     return result.returncode == 0
 
 
-def download_dataset(dataset_id: str, destination: Path) -> Path:
-    """Download an explicit official dataset version only into an ignored location."""
+def _download_metadata_file(source_url: str, destination: Path, filename: str) -> Path:
+    """Download a known release file without following a moving dataset version."""
+    target = (destination / filename).resolve()
+    try:
+        target.relative_to(destination.resolve())
+    except ValueError as error:
+        raise ValueError(f"Invalid metadata filename {filename!r}.") from error
+    target.parent.mkdir(parents=True, exist_ok=True)
+    urlretrieve(f"{source_url}{quote(filename, safe='/')}", target)
+    return target
+
+
+def download_metadata(
+    dataset_id: str, destination: Path, annotation_set: str | None = None
+) -> Path:
+    """Download headers and one annotation stream, never ECG waveform files."""
     if not destination_is_git_ignored(destination):
         raise ValueError(
             "Refusing to download physiological data into a Git-tracked location."
         )
     module = dataset_module(dataset_id)
-    import wfdb
 
     destination.mkdir(parents=True, exist_ok=True)
+    if dataset_id == "edb" and annotation_set not in (None, edb.PRIMARY_ANNOTATION):
+        raise ValueError("EDB supports only the documented atr annotation stream.")
+    selected = annotation_set or module.PRIMARY_ANNOTATION
     source_url = (
         f"https://physionet.org/files/{module.DATASET_ID}/{module.DATASET_VERSION}/"
     )
-    wfdb.dl_database(
-        f"{module.DATASET_ID}/{module.DATASET_VERSION}",
-        str(destination),
-        overwrite=False,
-    )
-    checksum_path = destination / "SHA256SUMS.txt"
-    urlretrieve(f"{source_url}SHA256SUMS.txt", checksum_path)
-    digests = verify_sha256_manifest(checksum_path, destination)
+    checksum_path = _download_metadata_file(source_url, destination, "SHA256SUMS.txt")
+    _download_metadata_file(source_url, destination, "RECORDS")
+    record_ids = discover_record_ids(destination)
+    files = [f"{record_id}.hea" for record_id in record_ids]
+    files.extend(f"{record_id}.{selected}" for record_id in record_ids)
+    for filename in files:
+        _download_metadata_file(source_url, destination, filename)
+    selected_files = [destination / "RECORDS", *[destination / name for name in files]]
+    digests = verify_sha256_manifest(checksum_path, destination, selected_files)
     manifest = {
         "dataset": {"id": module.DATASET_ID, "version": module.DATASET_VERSION},
         "source": source_url,
         "acquired_at": datetime.now(timezone.utc).isoformat(),
+        "file_list": [
+            path.relative_to(destination).as_posix() for path in selected_files
+        ],
         "checksums": digests,
     }
     write_manifest(manifest, destination / "cardiosentinel-acquisition.json")

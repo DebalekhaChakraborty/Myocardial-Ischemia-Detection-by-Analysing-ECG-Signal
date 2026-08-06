@@ -16,3 +16,10 @@ protocol. Future windows, reference functions, or post-event annotations must
 never leak backward into causal inputs. Expert annotations remain ground truth,
 not input features.
 
+## Ground-Truth Boundary
+
+Expert episode annotations, `.stf` reference functions, global/local-reference
+annotations, expert-corrected ST-deviation values, future episode endpoints, and
+future samples may define targets and evaluation intervals only. They must never
+be used as predictive inputs, baseline features, personalization state, or
+model-selection signals.

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Literal, Mapping
 
 
 class AnnotationValidationError(ValueError):
@@ -19,6 +20,31 @@ class AnnotationSample:
     subtype: int = 0
     channel: int = 0
     aux_note: str = ""
+
+
+AnnotationDisposition = Literal[
+    "recognized_relevant", "recognized_irrelevant", "unknown"
+]
+
+
+@dataclass(frozen=True)
+class AnnotationClassification:
+    """Explicit accounting decision for one raw WFDB annotation."""
+
+    annotation: AnnotationSample
+    disposition: AnnotationDisposition
+    reason: str
+    potentially_st_related: bool = False
+
+
+def annotation_pattern(aux_note: str) -> str:
+    """Return a non-identifying structural representation of an auxiliary note."""
+    normalized = aux_note.strip(" \t\r\n\x00")
+    if not normalized:
+        return "<empty>"
+    normalized = re.sub(r"[A-Za-z]+", "A", normalized)
+    normalized = re.sub(r"\d+", "#", normalized)
+    return normalized[:80]
 
 
 @dataclass(frozen=True)
@@ -99,3 +125,46 @@ class ParsedAnnotations:
     events: tuple[STEvent, ...]
     quality_intervals: tuple[SignalQualityInterval, ...]
     markers: tuple[AnnotationMarker, ...]
+    classifications: tuple[AnnotationClassification, ...] = ()
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def recognized_annotation_count(self) -> int:
+        """Count source annotations used as explicit, relevant semantics."""
+        return sum(
+            item.disposition == "recognized_relevant" for item in self.classifications
+        )
+
+    @property
+    def ignored_known_annotation_count(self) -> int:
+        """Count explicitly known annotations outside this phase's target schema."""
+        return sum(
+            item.disposition == "recognized_irrelevant"
+            for item in self.classifications
+        )
+
+    @property
+    def unknown_annotations(self) -> tuple[AnnotationClassification, ...]:
+        """Return annotations with no documented classification."""
+        return tuple(
+            item for item in self.classifications if item.disposition == "unknown"
+        )
+
+    @property
+    def unknown_relevant_annotations(self) -> tuple[AnnotationClassification, ...]:
+        """Return unknown forms that might alter ST semantics."""
+        return tuple(
+            item for item in self.unknown_annotations if item.potentially_st_related
+        )
+
+    @property
+    def unknown_aux_patterns(self) -> tuple[str, ...]:
+        """Return bounded structural forms without exposing raw auxiliary text."""
+        return tuple(
+            sorted(
+                {
+                    annotation_pattern(item.annotation.aux_note)
+                    for item in self.unknown_annotations
+                }
+            )[:20]
+        )

@@ -43,3 +43,11 @@ PhysioNet access and attribution terms apply. Before using either resource,
 review the source page, any applicable credentialing or data-use conditions, and
 the repository `NOTICE.md`; the MIT license does not grant dataset rights.
 
+## Acquisition Boundary
+
+`cardiosentinel data download-metadata` retrieves only `RECORDS`, WFDB headers,
+one requested annotation stream, and the official checksum manifest. It verifies
+every downloaded file against its corresponding official SHA-256 entry and never
+downloads `.dat` waveform files. Its URLs are explicitly pinned to the declared
+dataset version rather than a library's current-release lookup. Remote probe and
+validation commands use WFDB `pn_dir` access for headers and annotations only.

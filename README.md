@@ -48,11 +48,12 @@ research changes.
 
 ## Development status
 
-CardioSentinel can reproducibly inspect and validate locally acquired,
-expert-annotated EDB and LTSTDB records while preserving subject identity,
-episode semantics, and provenance. Signal processing, models, personalization,
-calibration, episode reasoning, and edge benchmarking remain planned work. No
-results are reported.
+Phase 1 implementation and annotation-semantic validation are complete for
+header and annotation metadata from EDB and LTSTDB. CardioSentinel preserves
+subject identity, episode semantics, unknown-form accounting, and provenance;
+it does not download ECG waveforms during remote probes or validation. Signal
+processing, models, personalization, calibration, episode reasoning, and edge
+benchmarking remain planned work. No results are reported.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
