@@ -1,24 +1,59 @@
-# Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal
-Processing ECG Signal, QRS and ST Segment Detection, BPM Calculation, ST Slope Measurement and Myocardial Ischemia Detection.
+# CardioSentinel
 
-I have done this project on my 4th year of B.Tech and submitted as Final Project. In this project I collected various ecg signals from online opensources and used them to study the behaviour of the signal in the presence of abnormal heart rate and myocardial ischemia.  
+CardioSentinel is a research-software foundation for patient-adaptive,
+uncertainty-aware, edge-oriented investigation of transient ischemic ST episodes
+in ambulatory ECG. It is not a medical device and does not provide diagnosis,
+treatment, or medical recommendations.
 
-<b>SYSTEM ANALYSIS & DESIGN:</b>
+## Project evolution
 
-The QRS complex (or R peak) is detected from the ECG signal. Based on that, BPM (Beats Per Minute) is calculated. Then ST segmentation is computed and slope of the ST segment is measured. A threshold is set and ischemic episode is detected according to that threshold.
+This repository previously hosted a 2020 B.Tech prototype based on fixed ECG
+thresholds. That work is retained unchanged in
+[`legacy/college-v1/`](legacy/college-v1/README.md) for historical traceability.
+It is not part of the CardioSentinel pipeline and its outputs are not clinical
+evidence.
 
-<b>•	Database:</b> ECG signals are used from the Physiobank database (Goldberger et al., 2000). The European ST-T database in Physiobank contains ECG signals with ST segment and T wave changes (Taddei, et al., 1992). The database contains ECG signals from ischemic patients where normal ECG sections and sudden ischemic episodes are annotated.  
+The current research objective is a reproducible system that can eventually
+support the physical-system loop:
 
-<b>•	Proposed Algorithm Process Flow:</b>
+`ECG acquisition or replay -> edge processing -> patient-adaptive inference -> uncertainty -> local decision or escalation -> temporal episode reasoning -> evidence-grounded alert`.
 
- <pre>     <img src="https://imgur.com/Enk857g.jpg" width="500">  
- </pre>
- 
- <b>•	Result:</b>
- 
- <pre>        <img src="https://imgur.com/mp5PKT1.jpg" width="500"><br/>
-              <img src="https://imgur.com/FFuvFLN.jpg" width="500">
- </pre>
- 
- 
-For Details, refer to the "REPORT" file of the Repository.
+No model, dataset, performance result, or clinical effectiveness claim is
+provided in Phase 0.
+
+## Repository structure
+
+- `src/cardiosentinel/`: package and future research domains.
+- `configs/`: versioned, validated configuration profiles.
+- `docs/`: scope, integrity contract, audit, and implementation roadmap.
+- `tests/`: offline unit, contract, and integration tests.
+- `data/` and `artifacts/`: documented local locations; their contents are not
+  committed.
+- `legacy/college-v1/`: preserved academic prototype.
+
+## Setup
+
+Python 3.11 is the initial supported version.
+
+```bash
+python -m pip install -e ".[dev]"
+python -m cardiosentinel --help
+python -m cardiosentinel info
+```
+
+Raw or processed physiological data is not included. Read
+[`docs/RESEARCH_SCOPE.md`](docs/RESEARCH_SCOPE.md) and
+[`docs/EXPERIMENT_CONTRACT.md`](docs/EXPERIMENT_CONTRACT.md) before conducting
+research changes.
+
+## Development status
+
+Phase 0 establishes repository governance, packaging, configuration, tests, and
+CI. Dataset ingestion, signal processing, models, personalization, calibration,
+episode reasoning, and edge benchmarking remain planned work. No results are
+reported.
+
+## License and attribution
+
+The repository code is licensed under the MIT License. See `NOTICE.md` before
+adding third-party data, annotations, models, or documentation.

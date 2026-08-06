@@ -1,0 +1,15 @@
+extends: base
+
+project:
+  profile: experiment-example
+
+# Set sampling frequency only from verified record metadata or an explicitly
+# documented dataset contract. Do not inherit a legacy 250 Hz assumption.
+data:
+  sampling_frequency_hz: null
+
+# Define these values only in a reviewed experiment configuration.
+window:
+  length_seconds: null
+  overlap_seconds: null
+
