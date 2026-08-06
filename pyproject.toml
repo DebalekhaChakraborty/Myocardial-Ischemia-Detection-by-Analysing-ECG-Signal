@@ -23,6 +23,10 @@ dev = [
 # Reserved groups; no ML or documentation framework is required yet.
 ml = []
 docs = []
+data = [
+  "numpy>=1.26,<3",
+  "wfdb>=4.1,<5",
+]
 
 [project.scripts]
 cardiosentinel = "cardiosentinel.cli:main"

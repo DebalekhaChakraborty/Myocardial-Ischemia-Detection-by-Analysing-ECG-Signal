@@ -48,10 +48,20 @@ research changes.
 
 ## Development status
 
-Phase 0 establishes repository governance, packaging, configuration, tests, and
-CI. Dataset ingestion, signal processing, models, personalization, calibration,
-episode reasoning, and edge benchmarking remain planned work. No results are
-reported.
+Phase 1 implementation and annotation-semantic validation are complete for
+header and annotation metadata from EDB and LTSTDB. CardioSentinel preserves
+subject identity, episode semantics, unknown-form accounting, and provenance;
+it does not download ECG waveforms during remote probes or validation. Signal
+processing, models, personalization, calibration, episode reasoning, and edge
+benchmarking remain planned work. No results are reported.
+
+Data commands require the optional `data` dependency group and never download
+data during import or tests:
+
+```bash
+python -m pip install -e ".[dev,data]"
+python -m cardiosentinel data --help
+```
 
 ## License and attribution
 
