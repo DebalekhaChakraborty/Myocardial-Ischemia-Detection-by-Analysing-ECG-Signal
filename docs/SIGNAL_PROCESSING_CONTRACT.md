@@ -92,15 +92,17 @@ For each completed window, CardioSentinel reports:
 - `flatline_fraction`
 - `repeated_value_fraction`
 - `robust_amplitude_range_mv` (95th minus 5th percentile)
-- `robust_derivative_scale_mv` (scaled derivative MAD)
+- `robust_derivative_scale_mv_per_s` (scaled first-derivative MAD in mV/s)
 - `derivative_outlier_fraction`
 - `low_frequency_power_ratio` for 0.01--0.5 Hz
 - `high_frequency_power_ratio` for 40--100 Hz when below Nyquist
 - `powerline_ratio_50hz` for 49--51 Hz
 - `powerline_ratio_60hz` for 59--61 Hz
 
-Welch spectral ratios are relative to finite non-DC power. Unsupported bands,
-insufficient bins, non-finite windows, and near-zero total power return `null`.
+Welch spectral ratios are relative to finite non-DC power. Each requested band
+requires at least two usable frequency bins; unsupported bands, insufficient
+spectral resolution, non-finite windows, and near-zero total power return
+`null`.
 There is no composite or purported universal signal-quality score. Expert EDB
 and LTSTDB quality labels are not imported or consumed.
 

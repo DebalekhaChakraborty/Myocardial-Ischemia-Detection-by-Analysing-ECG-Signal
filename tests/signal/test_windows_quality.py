@@ -104,7 +104,7 @@ def test_signal_quality_is_stable_and_label_free() -> None:
     metrics = compute_signal_quality(window(values, fs))
     assert metrics.finite_sample_fraction == 1.0
     assert metrics.robust_amplitude_range_mv is not None
-    assert metrics.robust_derivative_scale_mv is not None
+    assert metrics.robust_derivative_scale_mv_per_s is not None
     assert metrics.powerline_ratio_50hz is not None
     assert 0 <= metrics.powerline_ratio_50hz <= 1
 
@@ -118,6 +118,49 @@ def test_flatline_and_nonfinite_quality_are_explicit() -> None:
     nonfinite = compute_signal_quality(window(np.array([0.0, np.nan, np.inf, 1.0])))
     assert nonfinite.finite_sample_fraction == 0.5
     assert nonfinite.low_frequency_power_ratio is None
+
+
+def test_derivative_scale_is_consistent_across_sampling_frequencies() -> None:
+    """Finite-difference derivative estimates converge for the same waveform."""
+    duration_seconds = 20.0
+    frequency_hz = 3.0
+    metrics_by_rate = {}
+    for sampling_frequency_hz in (200.0, 400.0):
+        sample_count = int(duration_seconds * sampling_frequency_hz)
+        time = np.arange(sample_count) / sampling_frequency_hz
+        values = np.sin(2.0 * np.pi * frequency_hz * time)
+        metrics_by_rate[sampling_frequency_hz] = compute_signal_quality(
+            window(values, sampling_frequency_hz)
+        )
+
+    scale_200 = metrics_by_rate[200.0].robust_derivative_scale_mv_per_s
+    scale_400 = metrics_by_rate[400.0].robust_derivative_scale_mv_per_s
+    assert scale_200 is not None
+    assert scale_400 is not None
+    # The first difference is a midpoint approximation; 0.5% bounds discretization.
+    assert scale_200 == pytest.approx(scale_400, rel=0.005)
+
+
+def test_spectral_bands_require_resolution_and_identify_powerline_energy() -> None:
+    fs = 250.0
+    long_time = np.arange(2_500) / fs
+    fifty_hz = compute_signal_quality(
+        window(np.sin(2.0 * np.pi * 50.0 * long_time), fs)
+    )
+    sixty_hz = compute_signal_quality(
+        window(np.sin(2.0 * np.pi * 60.0 * long_time), fs)
+    )
+    assert fifty_hz.low_frequency_power_ratio is not None
+    assert fifty_hz.powerline_ratio_50hz is not None
+    assert sixty_hz.powerline_ratio_60hz is not None
+    assert fifty_hz.powerline_ratio_50hz > 0.95
+    assert sixty_hz.powerline_ratio_60hz > 0.95
+
+    short_time = np.arange(500) / fs
+    short_metrics = compute_signal_quality(
+        window(np.sin(2.0 * np.pi * 5.0 * short_time), fs)
+    )
+    assert short_metrics.low_frequency_power_ratio is None
 
 
 def test_frequency_bands_validate_sampling_support() -> None:

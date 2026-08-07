@@ -161,7 +161,7 @@ class SignalQualityMetrics:
     flatline_fraction: float | None
     repeated_value_fraction: float | None
     robust_amplitude_range_mv: float | None
-    robust_derivative_scale_mv: float | None
+    robust_derivative_scale_mv_per_s: float | None
     derivative_outlier_fraction: float | None
     low_frequency_power_ratio: float | None
     high_frequency_power_ratio: float | None

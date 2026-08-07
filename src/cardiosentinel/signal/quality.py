@@ -35,9 +35,10 @@ def _band_ratio(
         validate_frequency_band(sampling_frequency_hz, lower_hz, upper_hz)
     except SignalValidationError:
         return None
-    selected = (frequencies >= lower_hz) & (frequencies <= upper_hz)
-    total = frequencies > 0
-    if not selected.any() or not total.any():
+    usable = np.isfinite(frequencies) & np.isfinite(power) & (power >= 0.0)
+    selected = usable & (frequencies >= lower_hz) & (frequencies <= upper_hz)
+    total = usable & (frequencies > 0.0)
+    if np.count_nonzero(selected) < 2 or not total.any():
         return None
     denominator = float(np.sum(power[total]))
     if denominator <= np.finfo(np.float64).tiny:
@@ -58,6 +59,7 @@ def compute_signal_quality(window: CausalWindow) -> SignalQualityMetrics:
 
     adjacent_finite = finite[:-1] & finite[1:]
     differences = np.diff(values)[adjacent_finite]
+    derivative_mv_per_s = differences * window.sampling_frequency_hz
     scale_reference = max(float(np.max(np.abs(finite_values))), 1.0)
     flatline_tolerance = max(np.finfo(np.float64).eps * scale_reference * 16.0, 1e-12)
     flatline_fraction = (
@@ -71,15 +73,16 @@ def compute_signal_quality(window: CausalWindow) -> SignalQualityMetrics:
     )
     derivative_scale: float | None = None
     derivative_outliers: float | None = None
-    if differences.size:
-        median_difference = float(np.median(differences))
+    if derivative_mv_per_s.size:
+        median_derivative = float(np.median(derivative_mv_per_s))
         derivative_scale = float(
-            1.4826 * np.median(np.abs(differences - median_difference))
+            1.4826 * np.median(np.abs(derivative_mv_per_s - median_derivative))
         )
         if derivative_scale > np.finfo(np.float64).eps:
             derivative_outliers = float(
                 np.mean(
-                    np.abs(differences - median_difference) > 6.0 * derivative_scale
+                    np.abs(derivative_mv_per_s - median_derivative)
+                    > 6.0 * derivative_scale
                 )
             )
         else:
@@ -113,7 +116,7 @@ def compute_signal_quality(window: CausalWindow) -> SignalQualityMetrics:
         flatline_fraction=flatline_fraction,
         repeated_value_fraction=repeated_fraction,
         robust_amplitude_range_mv=robust_range,
-        robust_derivative_scale_mv=derivative_scale,
+        robust_derivative_scale_mv_per_s=derivative_scale,
         derivative_outlier_fraction=derivative_outliers,
         low_frequency_power_ratio=low_ratio,
         high_frequency_power_ratio=high_ratio,
