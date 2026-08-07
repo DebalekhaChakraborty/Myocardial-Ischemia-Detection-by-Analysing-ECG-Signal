@@ -12,8 +12,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install development, signal, and ML dependencies
-        run: python -m pip install -e ".[dev,signal,ml]"
+      - name: Install development, signal, ML, and neural dependencies
+        run: python -m pip install -e ".[dev,signal,ml,neural]"
       - name: Lint
         run: python -m ruff check .
       - name: Test

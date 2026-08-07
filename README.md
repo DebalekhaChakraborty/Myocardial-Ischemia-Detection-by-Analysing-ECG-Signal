@@ -60,8 +60,9 @@ training-sampling policy, and metrics protocol. Phase 3B-1 is complete: each
 frozen B0--B3 global classical baseline received one sealed-test evaluation,
 with no test-guided tuning. The compact evidence and limitations are recorded in
 [`docs/PHASE3B1_CLASSICAL_BASELINE_RESULTS.md`](docs/PHASE3B1_CLASSICAL_BASELINE_RESULTS.md).
-The next planned baseline is B4, a prospective compact raw-waveform neural
-baseline whose contract must be frozen before training or testing.
+The prospective B4 compact raw-waveform neural baseline is frozen in
+[`docs/B4_PROTOCOL_V1.md`](docs/B4_PROTOCOL_V1.md) before implementation or
+training. B4 remains unimplemented and untrained.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
