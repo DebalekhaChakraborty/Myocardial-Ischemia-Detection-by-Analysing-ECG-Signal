@@ -48,6 +48,12 @@ Slow drift and mixed phenomena are not inferred from annotations that do not
 explicitly encode them; their interpretation stays in source-traceable markers
 and future protocol work.
 
+Benchmark windows preserve source marker context independently of primary target
+precedence. Axis/conduction marker vicinity and directly contained point-noise
+markers remain traceable on ischemic-positive windows without changing the
+binary target, creating a new disease class, inventing point-noise duration, or
+automatically excluding the window.
+
 For both datasets, lead identifiers are validated against WFDB header signal
 count. Peak deviation, direction, source extension, definition, and raw WFDB
 annotation fields are retained for traceability.

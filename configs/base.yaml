@@ -31,8 +31,8 @@ preprocessing:
     quality_factor: null
 
 windowing:
-  length_seconds: null
-  stride_seconds: null
+  length_seconds: 10
+  stride_seconds: 5
 
 signal_quality:
   enabled: true

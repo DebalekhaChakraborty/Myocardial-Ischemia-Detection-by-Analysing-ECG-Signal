@@ -119,6 +119,20 @@ class AnnotationMarker:
 
 
 @dataclass(frozen=True)
+class SourceCensoredInterval:
+    """A conservative region where source annotations lack one event boundary."""
+
+    record_id: str
+    subject_id: str
+    lead: int | None
+    start_sample: int
+    end_sample: int
+    reason: str
+    annotation_source: str
+    original_annotations: tuple[AnnotationSample, ...]
+
+
+@dataclass(frozen=True)
 class ParsedAnnotations:
     """Events, quality intervals, and point markers from one annotation set."""
 
@@ -127,6 +141,7 @@ class ParsedAnnotations:
     markers: tuple[AnnotationMarker, ...]
     classifications: tuple[AnnotationClassification, ...] = ()
     warnings: tuple[str, ...] = ()
+    source_censored_intervals: tuple[SourceCensoredInterval, ...] = ()
 
     @property
     def recognized_annotation_count(self) -> int:

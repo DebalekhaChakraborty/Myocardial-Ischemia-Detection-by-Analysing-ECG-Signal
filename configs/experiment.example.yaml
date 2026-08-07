@@ -8,7 +8,7 @@ project:
 data:
   sampling_frequency_hz: null
 
-# Define these values only in a reviewed experiment configuration.
+# Frozen Phase-3 benchmark geometry; alternatives require a versioned protocol.
 windowing:
-  length_seconds: null
-  stride_seconds: null
+  length_seconds: 10
+  stride_seconds: 5

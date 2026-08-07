@@ -145,6 +145,27 @@ def validate_dataset(
         for parsed in parsed_annotations
         for item in parsed.unknown_relevant_annotations
     )
+    source_censored = tuple(
+        interval
+        for parsed in parsed_annotations
+        for interval in parsed.source_censored_intervals
+    )
+    for interval in source_censored:
+        record = by_record.get(interval.record_id)
+        if (
+            record is None
+            or not (
+                0
+                <= interval.start_sample
+                < interval.end_sample
+                <= record.sample_count
+            )
+        ):
+            errors.append(f"Invalid source-censored interval in {interval.record_id}.")
+        elif interval.lead is not None and not 0 <= interval.lead < record.signal_count:
+            errors.append(
+                f"Source-censored interval has invalid lead in {interval.record_id}."
+            )
     if unknown_relevant:
         patterns = sorted(
             {annotation_pattern(item.annotation.aux_note) for item in unknown_relevant}
@@ -194,6 +215,7 @@ def validate_dataset(
             "global_reference_count": marker_subtypes["global"],
             "local_reference_count": marker_subtypes["local"],
             "unreadable_interval_count": quality_states["unreadable"],
+            "source_censored_interval_count": len(source_censored),
             "edb_quality_change_count": recognized_reasons["edb.signal_quality"],
         },
     )

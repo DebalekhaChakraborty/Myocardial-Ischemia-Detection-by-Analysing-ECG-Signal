@@ -5,6 +5,13 @@ one person must map to exactly one partition. EDB uses the explicitly documented
 shared-subject groups; LTSTDB uses the documented record-name relationship in
 which records from one subject differ only in their final digit.
 
+Before any V1 model result, the deterministic LTSTDB split balances source-only
+subject burden including ischemic/rate episode counts and durations, recording
+metadata, and axis/conduction marker counts and presence. All normalized burden
+features have equal objective treatment; model outputs and waveform-derived
+features are prohibited. The manifest separately records assignment, source
+metadata, and generator-code hashes.
+
 Once a test subject list is established it is immutable for that study. Test
 subjects must not influence model selection, thresholds, calibration strategy,
 or personalization hyperparameters. The reusable leakage validator rejects a
