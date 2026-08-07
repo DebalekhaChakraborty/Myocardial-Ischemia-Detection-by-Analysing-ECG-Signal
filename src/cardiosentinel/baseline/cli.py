@@ -40,7 +40,19 @@ def add_baseline_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     materialize.add_argument("--records", help="Optional comma-separated record IDs.")
     materialize.add_argument("--chunk-seconds", type=float, default=300.0)
+    materialize.add_argument("--workers", type=int, default=1)
     materialize.add_argument("--force", action="store_true")
+    preflight = commands.add_parser(
+        "preflight", help="Report full-run data, storage, memory, and time readiness."
+    )
+    preflight.add_argument("--source", required=True, type=Path)
+    preflight.add_argument("--feature-root", required=True, type=Path)
+    preflight.add_argument("--workers", type=int, default=1)
+    preflight.add_argument(
+        "--split",
+        type=Path,
+        default=Path("protocols/splits/ltstdb_v1.json"),
+    )
     smoke = commands.add_parser(
         "smoke-remote",
         help="Validate bounded waveform features on one record per partition.",
@@ -117,10 +129,19 @@ def run_baseline_command(args: argparse.Namespace) -> int:
             args.split,
             records=records,
             chunk_seconds=args.chunk_seconds,
+            workers=args.workers,
             force=args.force,
             command="cardiosentinel baseline materialize",
         )
         print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
+    if args.baseline_command == "preflight":
+        from cardiosentinel.baseline.preflight import baseline_preflight
+
+        report = baseline_preflight(
+            args.source, args.feature_root, args.split, workers=args.workers
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
         return 0
     if args.baseline_command == "smoke-remote":
         from cardiosentinel.baseline.smoke import run_remote_smoke

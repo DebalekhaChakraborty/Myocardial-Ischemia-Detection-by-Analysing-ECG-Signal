@@ -84,6 +84,13 @@ frozen deterministic subject-aware sampler for at most three background
 windows per positive. Rate, axis, conduction, boundary, unreadable, and
 source-censored windows do not train these models.
 
+Training selection uses two metadata-only passes over per-record caches. The
+first derives the exact frozen group quotas; the second retains the same
+seeded stable-ID choices as the canonical `WindowTarget` reference sampler.
+Only selected B1/B2/B3 rows are then loaded into one numeric training matrix.
+B0 reads unsampled primary label counts and calculates its scalar prior without
+loading or copying the training feature matrix.
+
 Validation and test primary metrics use all eligible ischemic-positive and
 background-negative rows without sampling. Fit reads train and validation only.
 Each model selects its threshold from validation predictions, serializes the
@@ -96,8 +103,11 @@ and schema, and artifact hashes. It refuses a second evaluation for the lock.
 Report pooled-window and subject-macro AUPRC, AUROC, F1, sensitivity,
 specificity, PPV, NPV, balanced accuracy, and MCC. A mathematically undefined
 subject metric remains undefined and includes contributing and
-non-contributing subject counts. Test confidence intervals resample subjects,
-not windows, and retain undefined or degenerate replicate counts.
+non-contributing subject counts. Subject-level AUPRC and AUROC require both
+classes; all-positive and all-negative subjects do not establish discrimination.
+The same rule applies to subject-bootstrap replicates. Test confidence intervals
+resample subjects, not windows, and retain undefined or degenerate replicate
+counts.
 
 At the validation-frozen threshold, rate-related and axis-shift false-positive
 fractions are `quantitative_secondary` with subject/window/FP denominators and
@@ -111,9 +121,20 @@ and point-noise context strata with subject and window denominators.
 
 Waveforms and derived rows live outside Git. Materialization reads deterministic
 bounded chunks, applies raw identity processing, emits existing causal windows,
-and writes atomic compressed per-record caches. A record resumes only when its
-source, split, schema, geometry, annotation definition, and processing profile
-match. `--force` is required to replace stale output.
+and writes atomic compressed per-record caches. Record-level processes own
+disjoint records, limit nested numerical thread pools, and return completed
+metadata to the parent, which alone updates the manifest. A record resumes only
+when its source, split, schema, geometry, annotation definition, processing
+profile, and actual cache-file SHA-256 match. `--force` is required to replace
+stale output. Worker count does not alter scientific output.
+
+Once all 86 record caches are complete, `feature_corpus_sha256` canonically
+binds dataset/version, split and combined schema hashes, processing profile,
+window/stride, annotation definition, and every sorted record's identity,
+source hash, row and target counts, and exact cache-file hash. Runtime,
+timestamps, and resume bookkeeping are excluded. Fit records this corpus hash
+in the experiment lock; sealed-test evaluation re-hashes every cache and rejects
+any changed corpus before loading test rows.
 
 Runs remain external and contain machine-readable configuration, environment,
 feature and training manifests, model and transform artifacts, validation and
@@ -137,9 +158,15 @@ and available disk without downloading. Full acquisition occurs only with
 ## Execution stages
 
 ```bash
+python -m cardiosentinel baseline preflight \
+  --source /external/data/ltstdb/1.0.0 \
+  --feature-root /external/features/ltstdb-baseline-v1 \
+  --workers 2
+
 python -m cardiosentinel baseline materialize \
   --source /external/data/ltstdb/1.0.0 \
-  --feature-root /external/features/ltstdb-baseline-v1
+  --feature-root /external/features/ltstdb-baseline-v1 \
+  --workers 2
 
 python -m cardiosentinel baseline smoke-remote \
   --output-root /external/runs/phase-3b-smoke
@@ -153,6 +180,11 @@ python -m cardiosentinel baseline evaluate-test \
   --feature-root /external/features/ltstdb-baseline-v1 \
   --run-dir /external/runs/b1-signal-v1
 ```
+
+Materialization defaults to one worker. Preflight reports host CPU and disk,
+source/cache readiness, frozen counts, conservative matrix-memory estimates,
+and an engineering-only projected runtime. It does not read waveform samples,
+load sealed-test features, or train models.
 
 EDB performance is outside this phase. B4 belongs to Phase 3B-2 and is not
 implemented here.

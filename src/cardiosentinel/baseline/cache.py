@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -11,6 +12,13 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from cardiosentinel.data.provenance import sha256_file
+from cardiosentinel.evaluation.protocol import (
+    LTSTDB_V1_SPLIT_SHA256,
+    PRIMARY_ANNOTATION_DEFINITION,
+    PRIMARY_STRIDE_SECONDS,
+    PRIMARY_WINDOW_SECONDS,
+)
 from cardiosentinel.features.schema import COMBINED_V1
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
@@ -40,6 +48,137 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def read_cache_metadata(path: Path) -> dict[str, Any]:
+    """Read only embedded cache metadata, never the numeric feature matrix."""
+    with np.load(path, allow_pickle=False) as cached:
+        return json.loads(str(cached["metadata_json"]))
+
+
+def feature_corpus_payload(manifest: dict[str, Any]) -> dict[str, Any]:
+    """Return only immutable scientific identities in canonical record order."""
+    combined = manifest["feature_schemas"]["combined_v1"]
+    records = []
+    for entry in sorted(manifest["records"], key=lambda item: item["record_id"]):
+        records.append(
+            {
+                "record_id": entry["record_id"],
+                "subject_id": entry["subject_id"],
+                "partition": entry["partition"],
+                "source_sha256": entry["source_sha256"],
+                "row_count": entry["row_count"],
+                "target_counts": entry["target_counts"],
+                "cache_sha256": entry["cache_sha256"],
+            }
+        )
+    return {
+        "dataset": manifest["dataset"],
+        "dataset_version": manifest["dataset_version"],
+        "split_sha256": manifest["split_sha256"],
+        "feature_schema_sha256": combined["feature_schema_sha256"],
+        "processing_profile": manifest["processing_profile"],
+        "window_seconds": manifest["window_seconds"],
+        "stride_seconds": manifest["stride_seconds"],
+        "annotation_definition": manifest["annotation_definition"],
+        "records": records,
+    }
+
+
+def compute_feature_corpus_sha256(manifest: dict[str, Any]) -> str:
+    """Fingerprint the exact cache corpus without mutable runtime bookkeeping."""
+    return _canonical_sha256(feature_corpus_payload(manifest))
+
+
+def validate_feature_corpus(feature_root: Path, expected_record_ids: set[str]) -> str:
+    """Validate every exact cache artifact and the persisted corpus fingerprint."""
+    root = require_external_path(feature_root, "Feature root")
+    manifest = read_json(root / FEATURE_MANIFEST_NAME)
+    frozen_identity = {
+        "dataset": "ltstdb",
+        "dataset_version": "1.0.0",
+        "split_sha256": LTSTDB_V1_SPLIT_SHA256,
+        "processing_profile": "raw",
+        "window_seconds": PRIMARY_WINDOW_SECONDS,
+        "stride_seconds": PRIMARY_STRIDE_SECONDS,
+        "annotation_definition": PRIMARY_ANNOTATION_DEFINITION,
+    }
+    if any(manifest.get(key) != value for key, value in frozen_identity.items()):
+        raise ValueError(
+            "Feature corpus does not match the frozen scientific identity."
+        )
+    if (
+        manifest.get("feature_schemas", {})
+        .get("combined_v1", {})
+        .get("feature_schema_sha256")
+        != COMBINED_V1.sha256
+    ):
+        raise ValueError("Feature corpus does not use the frozen combined_v1 schema.")
+    completed = [
+        entry for entry in manifest["records"] if entry.get("status") == "complete"
+    ]
+    entries = {entry["record_id"]: entry for entry in completed}
+    if len(entries) != len(completed) or set(entries) != expected_record_ids:
+        raise ValueError("Feature corpus does not contain all required records.")
+    for record_id in sorted(expected_record_ids):
+        entry = entries[record_id]
+        cache_path = (root / entry["cache_path"]).resolve()
+        try:
+            cache_path.relative_to(root)
+        except ValueError as error:
+            raise ValueError("Feature cache path escapes the feature root.") from error
+        recorded_digest = entry.get("cache_sha256")
+        if not cache_path.is_file() or recorded_digest != sha256_file(cache_path):
+            raise ValueError(f"Feature cache digest validation failed for {record_id}.")
+        metadata = read_cache_metadata(cache_path)
+        expected_metadata = {
+            "dataset": manifest["dataset"],
+            "dataset_version": manifest["dataset_version"],
+            "record_id": entry["record_id"],
+            "subject_id": entry["subject_id"],
+            "partition": entry["partition"],
+            "source_sha256": entry["source_sha256"],
+            "split_sha256": manifest["split_sha256"],
+            "feature_schema_sha256": manifest["feature_schemas"]["combined_v1"][
+                "feature_schema_sha256"
+            ],
+            "processing_profile": manifest["processing_profile"],
+            "window_seconds": manifest["window_seconds"],
+            "stride_seconds": manifest["stride_seconds"],
+            "annotation_definition": manifest["annotation_definition"],
+            "row_count": entry["row_count"],
+            "target_counts": entry["target_counts"],
+        }
+        if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+            raise ValueError(
+                f"Feature cache metadata validation failed for {record_id}."
+            )
+    computed = compute_feature_corpus_sha256(manifest)
+    if manifest.get("feature_corpus_sha256") != computed:
+        raise ValueError("Feature corpus SHA-256 validation failed.")
+    return computed
+
+
+def finalize_feature_corpus(feature_root: Path, expected_record_ids: set[str]) -> str:
+    """Persist corpus identity only after all required caches are complete."""
+    root = require_external_path(feature_root, "Feature root")
+    manifest_path = root / FEATURE_MANIFEST_NAME
+    manifest = read_json(manifest_path)
+    complete_ids = {
+        entry["record_id"]
+        for entry in manifest["records"]
+        if entry.get("status") == "complete" and entry.get("cache_sha256")
+    }
+    if complete_ids != expected_record_ids:
+        raise ValueError("Cannot finalize an incomplete feature corpus.")
+    manifest["feature_corpus_sha256"] = compute_feature_corpus_sha256(manifest)
+    write_json_atomic(manifest_path, manifest)
+    return validate_feature_corpus(root, expected_record_ids)
 
 
 @dataclass(frozen=True)

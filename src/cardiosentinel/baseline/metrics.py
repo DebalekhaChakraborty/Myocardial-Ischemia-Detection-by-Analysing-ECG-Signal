@@ -76,7 +76,7 @@ def binary_metrics(
         "positive_prevalence": float(np.mean(positive)),
         "auprc": (
             None
-            if not positive.any()
+            if class_count < 2
             else float(average_precision_score(labels_array, scores_array))
         ),
         "auroc": (

@@ -1,20 +1,23 @@
-"""Sequential local LTSTDB waveform-to-feature materialization."""
+"""Deterministic record-parallel LTSTDB waveform-to-feature materialization."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import time
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import numpy as np
 
 from cardiosentinel.baseline.cache import (
     FEATURE_MANIFEST_NAME,
     FeatureTable,
-    read_feature_table,
+    finalize_feature_corpus,
+    read_cache_metadata,
     require_external_path,
     write_feature_table_atomic,
     write_json_atomic,
@@ -48,6 +51,19 @@ from cardiosentinel.signal.windows import CausalWindowGenerator, seconds_to_samp
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CHUNK_SECONDS = 300.0
+
+
+@dataclass(frozen=True)
+class MaterializationJob:
+    """One independent record cache owned by exactly one worker process."""
+
+    source: Path
+    destination: Path
+    record: DatasetRecord
+    parsed: ParsedAnnotations
+    partition: str
+    metadata: dict[str, Any]
+    chunk_seconds: float
 
 
 def _partition_map(split: dict[str, Any]) -> dict[str, str]:
@@ -218,6 +234,110 @@ def _materialize_record(
     return completed_metadata
 
 
+def _run_materialization_job(job: MaterializationJob) -> dict[str, Any]:
+    """Execute one record while preventing nested numerical thread pools."""
+    from threadpoolctl import threadpool_limits
+
+    with threadpool_limits(limits=1):
+        return _materialize_record(
+            job.source,
+            job.destination,
+            job.record,
+            job.parsed,
+            job.partition,
+            job.metadata,
+            job.chunk_seconds,
+        )
+
+
+def _materialization_results(
+    jobs: list[MaterializationJob], workers: int
+) -> Iterator[tuple[MaterializationJob, dict[str, Any]]]:
+    """Yield completed jobs; callers alone decide when a record is manifested."""
+    if workers < 1:
+        raise ValueError("Materialization workers must be at least 1.")
+    if workers == 1:
+        for job in jobs:
+            try:
+                yield job, _run_materialization_job(job)
+            except Exception as error:
+                raise RuntimeError(
+                    f"Materialization failed for record {job.record.record_id}."
+                ) from error
+        return
+
+    pool = multiprocessing.get_context("spawn").Pool(processes=workers)
+    pending = [
+        (job, pool.apply_async(_run_materialization_job, (job,))) for job in jobs
+    ]
+    try:
+        while pending:
+            progressed = False
+            for job, result in tuple(pending):
+                if not result.ready():
+                    continue
+                pending.remove((job, result))
+                progressed = True
+                try:
+                    yield job, result.get()
+                except Exception as error:
+                    raise RuntimeError(
+                        f"Materialization failed for record {job.record.record_id}."
+                    ) from error
+            if not progressed:
+                time.sleep(0.05)
+    except BaseException:
+        pool.terminate()
+        pool.join()
+        raise
+    else:
+        pool.close()
+        pool.join()
+
+
+def _manifest_payload(
+    prior_records: dict[str, dict[str, Any]],
+    provenance: dict[str, object],
+    command: str,
+) -> dict[str, Any]:
+    return {
+        "feature_cache_schema_version": "1",
+        "dataset": "ltstdb",
+        "dataset_version": "1.0.0",
+        "split_sha256": LTSTDB_V1_SPLIT_SHA256,
+        "expected_split_sha256": LTSTDB_V1_SPLIT_SHA256,
+        "feature_schemas": {
+            "signal_v1": SIGNAL_V1.as_dict(),
+            "morphology_v1": MORPHOLOGY_V1.as_dict(),
+            "combined_v1": COMBINED_V1.as_dict(),
+        },
+        "processing_profile": "raw",
+        "window_seconds": PRIMARY_WINDOW_SECONDS,
+        "stride_seconds": PRIMARY_STRIDE_SECONDS,
+        "annotation_definition": PRIMARY_ANNOTATION_DEFINITION,
+        "generation": {**provenance, "command": command},
+        "records": [prior_records[key] for key in sorted(prior_records)],
+    }
+
+
+def _completed_manifest_entry(
+    job: MaterializationJob, completed: dict[str, Any], *, resumed: bool
+) -> dict[str, Any]:
+    return {
+        "record_id": job.record.record_id,
+        "subject_id": job.record.subject_id,
+        "partition": job.partition,
+        "cache_path": (Path(job.partition) / job.destination.name).as_posix(),
+        "status": "complete",
+        "resumed": resumed,
+        "row_count": completed["row_count"],
+        "target_counts": completed["target_counts"],
+        "morphology_quality": completed["morphology_quality"],
+        "source_sha256": job.metadata["source_sha256"],
+        "cache_sha256": sha256_file(job.destination),
+    }
+
+
 def materialize_features(
     source: Path,
     feature_root: Path,
@@ -225,10 +345,13 @@ def materialize_features(
     *,
     records: Iterable[str] | None = None,
     chunk_seconds: float = DEFAULT_CHUNK_SECONDS,
+    workers: int = 1,
     force: bool = False,
     command: str = "cardiosentinel baseline materialize",
 ) -> dict[str, Any]:
     """Materialize selected records and resume only matching complete caches."""
+    if workers < 1:
+        raise ValueError("Materialization workers must be at least 1.")
     source = require_external_path(source, "Waveform source")
     root = require_external_path(feature_root, "Feature root")
     split = load_split_manifest(split_path)
@@ -266,19 +389,38 @@ def materialize_features(
         if prior.get("expected_split_sha256") != LTSTDB_V1_SPLIT_SHA256:
             raise ValueError("Existing feature root belongs to a different split.")
         prior_records = {item["record_id"]: item for item in prior.get("records", [])}
+    jobs: list[MaterializationJob] = []
+    resumed_jobs: list[tuple[MaterializationJob, dict[str, Any]]] = []
     for record, parsed in zip(all_records, all_parsed, strict=True):
         if requested is not None and record.record_id not in requested:
             continue
         partition = partition_by_subject[record.subject_id]
-        cache_relative = Path(partition) / f"{record.record_id}.npz"
-        cache_path = root / cache_relative
+        cache_path = root / partition / f"{record.record_id}.npz"
         source_sha256 = _source_digest(source, record.record_id)
         expected = _expected_cache_metadata(
             record, partition, source_sha256, provenance, command
         )
-        resumed = False
+        job = MaterializationJob(
+            source,
+            cache_path,
+            record,
+            parsed,
+            partition,
+            expected,
+            chunk_seconds,
+        )
         if cache_path.is_file() and not force:
-            _, cached_metadata = read_feature_table(cache_path)
+            prior_entry = prior_records.get(record.record_id)
+            if prior_entry is None or not prior_entry.get("cache_sha256"):
+                raise ValueError(
+                    f"Cache for {record.record_id} is not bound to its manifest; "
+                    "pass --force to replace it."
+                )
+            if sha256_file(cache_path) != prior_entry["cache_sha256"]:
+                raise ValueError(
+                    f"Cache digest for {record.record_id} differs from its manifest."
+                )
+            cached_metadata = read_cache_metadata(cache_path)
             comparison_keys = (
                 "record_id",
                 "subject_id",
@@ -295,53 +437,45 @@ def materialize_features(
                 cached_metadata.get(key) == expected[key] for key in comparison_keys
             ):
                 completed = cached_metadata
-                resumed = True
+                resumed_jobs.append((job, completed))
             else:
                 raise ValueError(
                     f"Cache for {record.record_id} is stale; "
                     "pass --force to replace it."
                 )
-        if not resumed:
-            completed = _materialize_record(
-                source,
-                cache_path,
-                record,
-                parsed,
-                partition,
-                expected,
-                chunk_seconds,
-            )
-        prior_records[record.record_id] = {
-            "record_id": record.record_id,
-            "subject_id": record.subject_id,
-            "partition": partition,
-            "cache_path": cache_relative.as_posix(),
-            "status": "complete",
-            "resumed": resumed,
-            "row_count": completed["row_count"],
-            "target_counts": completed["target_counts"],
-            "morphology_quality": completed["morphology_quality"],
-            "source_sha256": source_sha256,
-        }
-        manifest = {
-            "feature_cache_schema_version": "1",
-            "dataset": "ltstdb",
-            "dataset_version": "1.0.0",
-            "split_sha256": LTSTDB_V1_SPLIT_SHA256,
-            "expected_split_sha256": LTSTDB_V1_SPLIT_SHA256,
-            "feature_schemas": {
-                "signal_v1": SIGNAL_V1.as_dict(),
-                "morphology_v1": MORPHOLOGY_V1.as_dict(),
-                "combined_v1": COMBINED_V1.as_dict(),
-            },
-            "processing_profile": "raw",
-            "window_seconds": PRIMARY_WINDOW_SECONDS,
-            "stride_seconds": PRIMARY_STRIDE_SECONDS,
-            "annotation_definition": PRIMARY_ANNOTATION_DEFINITION,
-            "generation": {**provenance, "command": command},
-            "records": [prior_records[key] for key in sorted(prior_records)],
-        }
-        write_json_atomic(manifest_path, manifest)
+        else:
+            prior_records.pop(record.record_id, None)
+            jobs.append(job)
+    if jobs:
+        initial_manifest = _manifest_payload(prior_records, provenance, command)
+        write_json_atomic(manifest_path, initial_manifest)
+    for job, completed in resumed_jobs:
+        prior_records[job.record.record_id] = _completed_manifest_entry(
+            job, completed, resumed=True
+        )
+    if resumed_jobs:
+        write_json_atomic(
+            manifest_path, _manifest_payload(prior_records, provenance, command)
+        )
+    for job, completed in _materialization_results(jobs, workers):
+        prior_records[job.record.record_id] = _completed_manifest_entry(
+            job, completed, resumed=False
+        )
+        write_json_atomic(
+            manifest_path, _manifest_payload(prior_records, provenance, command)
+        )
     if not manifest_path.is_file():
         raise ValueError("No records were selected for materialization.")
+    expected_record_ids = {
+        record_id
+        for subject_records in split["records_by_subject"].values()
+        for record_id in subject_records
+    }
+    completed_ids = {
+        item["record_id"]
+        for item in json.loads(manifest_path.read_text(encoding="utf-8"))["records"]
+        if item.get("status") == "complete" and item.get("cache_sha256")
+    }
+    if completed_ids == expected_record_ids:
+        finalize_feature_corpus(root, expected_record_ids)
     return json.loads(manifest_path.read_text(encoding="utf-8"))

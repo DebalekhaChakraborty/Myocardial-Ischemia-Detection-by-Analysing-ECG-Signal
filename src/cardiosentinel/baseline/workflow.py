@@ -24,6 +24,7 @@ from cardiosentinel.baseline.cache import (
     load_partition,
     read_json,
     require_external_path,
+    validate_feature_corpus,
     write_json_atomic,
 )
 from cardiosentinel.baseline.metrics import (
@@ -34,15 +35,17 @@ from cardiosentinel.baseline.metrics import (
     subject_bootstrap_confidence_intervals,
     subject_macro_metrics,
 )
+from cardiosentinel.baseline.sampling import (
+    build_training_selection_plan,
+    load_selected_training_table,
+)
 from cardiosentinel.data.provenance import git_provenance, sha256_file
 from cardiosentinel.evaluation.metrics import select_validation_f1_threshold
-from cardiosentinel.evaluation.models import WindowTarget
 from cardiosentinel.evaluation.protocol import (
     DEFAULT_SEED,
     LTSTDB_V1_SPLIT_SHA256,
     TRAIN_NEGATIVE_RATIO,
 )
-from cardiosentinel.evaluation.sampling import sample_training_targets
 from cardiosentinel.evaluation.splits import (
     load_split_manifest,
     validate_split_manifest,
@@ -87,6 +90,24 @@ def _expected_partition_identity(
     return subjects, records
 
 
+def _expected_record_ids(split: dict[str, Any]) -> set[str]:
+    return {
+        record
+        for subject_records in split["records_by_subject"].values()
+        for record in subject_records
+    }
+
+
+def validate_locked_feature_corpus(
+    feature_root: Path, lock: dict[str, Any], split: dict[str, Any]
+) -> str:
+    """Reject any corpus that differs from the fitted experiment lock."""
+    corpus_sha256 = validate_feature_corpus(feature_root, _expected_record_ids(split))
+    if corpus_sha256 != lock["feature_corpus_sha256"]:
+        raise ValueError("Feature corpus differs from the frozen experiment lock.")
+    return corpus_sha256
+
+
 def _validate_partition(
     table: FeatureTable, split: dict[str, Any], partition: str
 ) -> None:
@@ -112,56 +133,19 @@ def _validate_manifest_completeness(
     feature_root: Path, split: dict[str, Any], partition: str
 ) -> None:
     manifest = read_json(feature_root / FEATURE_MANIFEST_NAME)
-    _, expected_records = _expected_partition_identity(split, partition)
-    completed = {
-        item["record_id"]
+    expected_subjects, expected_records = _expected_partition_identity(split, partition)
+    completed_entries = [
+        item
         for item in manifest["records"]
         if item["partition"] == partition and item["status"] == "complete"
-    }
-    if completed != expected_records:
+    ]
+    completed_records = {item["record_id"] for item in completed_entries}
+    completed_subjects = {item["subject_id"] for item in completed_entries}
+    if completed_records != expected_records or completed_subjects != expected_subjects:
         raise ValueError(f"Feature manifest is incomplete for {partition}.")
-
-
-def _targets_for_primary(table: FeatureTable) -> tuple[WindowTarget, ...]:
-    targets = []
-    for index in np.flatnonzero(_primary(table)):
-        family = str(table.target_families[index])
-        targets.append(
-            WindowTarget(
-                dataset="ltstdb",
-                record_id=str(table.record_ids[index]),
-                subject_id=str(table.subject_ids[index]),
-                channel_index=int(table.channel_indices[index]),
-                lead_name=str(table.lead_names[index]) or None,
-                window_start_sample=int(table.window_start_samples[index]),
-                window_end_sample=int(table.window_end_samples[index]),
-                target_family=family,
-                target_subtype=None,
-                eligible_for_training=True,
-                eligible_for_primary_evaluation=True,
-                eligible_for_confounder_evaluation=False,
-                annotation_definition="ltstdb.stb",
-                overlapping_event_ids=(),
-                overlapping_marker_ids=(),
-                context_flags=tuple(
-                    flag for flag in str(table.context_flags[index]).split("|") if flag
-                ),
-                quality_state=None,
-                exclusion_reason=None,
-            )
-        )
-    return tuple(targets)
-
-
-def _training_selection(table: FeatureTable, baseline_name: str) -> NDArray[np.bool_]:
-    primary = _primary(table)
-    if baseline_name == "B0_constant_prior":
-        return primary
-    sampled = sample_training_targets(
-        _targets_for_primary(table), partition="train", seed=DEFAULT_SEED
-    )
-    selected_ids = {target.stable_id for target in sampled}
-    return np.asarray([stable_id in selected_ids for stable_id in table.stable_ids])
+    for entry in completed_entries:
+        if entry["record_id"] not in split["records_by_subject"][entry["subject_id"]]:
+            raise ValueError(f"Feature manifest identity is invalid for {partition}.")
 
 
 def _model_matrix(table: FeatureTable, baseline_name: str) -> NDArray[np.float64]:
@@ -234,20 +218,38 @@ def fit_and_lock(
         expected_subject_count=80,
         expected_record_count=86,
     )
+    feature_corpus_sha256 = validate_feature_corpus(
+        feature_root, _expected_record_ids(split)
+    )
     _validate_manifest_completeness(feature_root, split, "train")
     _validate_manifest_completeness(feature_root, split, "validation")
-    train = load_partition(feature_root, "train")
+    sampled_training = baseline_name != "B0_constant_prior"
+    selection_plan = build_training_selection_plan(
+        feature_root, sampled=sampled_training, seed=DEFAULT_SEED
+    )
+    expected_train = FROZEN_PRIMARY_COUNTS["train"]
+    if (
+        selection_plan.unsampled_positive_count != expected_train["ischemic_positive"]
+        or selection_plan.unsampled_negative_count
+        != expected_train["background_negative"]
+    ):
+        raise ValueError("Training metadata counts differ from Benchmark V1.")
     validation = load_partition(feature_root, "validation")
-    _validate_partition(train, split, "train")
     _validate_partition(validation, split, "validation")
-    if set(train.subject_ids.tolist()) & set(validation.subject_ids.tolist()):
-        raise ValueError("Train and validation subjects overlap.")
-    selected_train = _training_selection(train, baseline_name)
-    train_labels = _labels(train)[selected_train]
-    train_matrix = _model_matrix(train, baseline_name)[selected_train]
     estimator = build_estimator(baseline_name)
     training_started = time.monotonic()
-    estimator.fit(train_matrix, train_labels)
+    if baseline_name == "B0_constant_prior":
+        estimator.fit_from_counts(
+            selection_plan.unsampled_positive_count,
+            selection_plan.unsampled_primary_count,
+        )
+    else:
+        train = load_selected_training_table(
+            feature_root, selection_plan.selected_stable_ids
+        )
+        train_labels = _labels(train)
+        train_matrix = _model_matrix(train, baseline_name)
+        estimator.fit(train_matrix, train_labels)
     training_seconds = time.monotonic() - training_started
     validation_started = time.monotonic()
     validation_scores = positive_scores(
@@ -298,11 +300,11 @@ def fit_and_lock(
     training_manifest = {
         "sampling_seed": DEFAULT_SEED,
         "negative_ratio": TRAIN_NEGATIVE_RATIO,
-        "unsampled_primary_rows": int(np.sum(_primary(train))),
-        "selected_rows": int(np.sum(selected_train)),
-        "positive_rows": int(np.sum(train_labels == 1)),
-        "negative_rows": int(np.sum(train_labels == 0)),
-        "subject_count": len(set(train.subject_ids[selected_train].tolist())),
+        "unsampled_primary_rows": selection_plan.unsampled_primary_count,
+        "selected_rows": selection_plan.selected_count,
+        "positive_rows": selection_plan.selected_positive_count,
+        "negative_rows": selection_plan.selected_negative_count,
+        "subject_count": selection_plan.selected_subject_count,
     }
     write_json_atomic(run_dir / "training_manifest.json", training_manifest)
     write_json_atomic(run_dir / "metrics_validation.json", validation_metrics)
@@ -320,6 +322,7 @@ def fit_and_lock(
         "split_sha256": LTSTDB_V1_SPLIT_SHA256,
         "feature_schema_version": schema.version,
         "feature_schema_sha256": schema.sha256,
+        "feature_corpus_sha256": feature_corpus_sha256,
         "model_parameters": model_parameters(baseline_name),
         "processing_profile": "raw",
     }
@@ -390,6 +393,7 @@ def evaluate_test(
         expected_subject_count=80,
         expected_record_count=86,
     )
+    validate_locked_feature_corpus(feature_root, lock, split)
     _validate_manifest_completeness(feature_root, split, "test")
     test_started_at = datetime.now(timezone.utc).isoformat()
     write_json_atomic(

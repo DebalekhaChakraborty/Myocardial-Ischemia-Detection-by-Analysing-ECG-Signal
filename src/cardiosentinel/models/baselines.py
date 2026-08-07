@@ -47,7 +47,15 @@ class ConstantPriorClassifier:
         del features
         if labels.size == 0 or not np.isin(labels, (0, 1)).all():
             raise ValueError("B0 requires non-empty binary training labels.")
-        self.positive_prior_ = float(np.mean(labels))
+        return self.fit_from_counts(int(np.sum(labels)), int(labels.size))
+
+    def fit_from_counts(
+        self, positive_count: int, total_count: int
+    ) -> ConstantPriorClassifier:
+        """Fit the same prior without allocating unsampled training arrays."""
+        if total_count <= 0 or not 0 <= positive_count <= total_count:
+            raise ValueError("B0 requires valid unsampled primary training counts.")
+        self.positive_prior_ = positive_count / total_count
         return self
 
     def predict_proba(self, features: NDArray[np.float64]) -> NDArray[np.float64]:

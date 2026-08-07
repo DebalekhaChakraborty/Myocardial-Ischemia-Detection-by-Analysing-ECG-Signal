@@ -28,6 +28,13 @@ def write_experiment_lock(run_dir: Path, payload: dict[str, Any]) -> dict[str, A
     valid_schemas = {SIGNAL_V1.sha256, COMBINED_V1.sha256}
     if payload.get("feature_schema_sha256") not in valid_schemas:
         raise ValueError("Experiment lock has an unknown feature schema.")
+    corpus_sha256 = payload.get("feature_corpus_sha256")
+    if (
+        not isinstance(corpus_sha256, str)
+        or len(corpus_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in corpus_sha256)
+    ):
+        raise ValueError("Experiment lock requires feature_corpus_sha256.")
     locked = dict(payload)
     locked["experiment_lock_sha256"] = canonical_sha256(locked)
     write_json_atomic(run_dir / LOCK_NAME, locked)
@@ -46,6 +53,13 @@ def validate_experiment_lock(run_dir: Path) -> dict[str, Any]:
     lock["experiment_lock_sha256"] = recorded_hash
     if lock["split_sha256"] != LTSTDB_V1_SPLIT_SHA256:
         raise ValueError("Experiment lock split hash is not frozen LTSTDB V1.")
+    corpus_sha256 = lock.get("feature_corpus_sha256")
+    if (
+        not isinstance(corpus_sha256, str)
+        or len(corpus_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in corpus_sha256)
+    ):
+        raise ValueError("Experiment lock requires feature_corpus_sha256.")
     for path_key, hash_key in (
         ("model_artifact", "trained_model_artifact_sha256"),
         ("transform_artifact", "transform_artifact_sha256"),

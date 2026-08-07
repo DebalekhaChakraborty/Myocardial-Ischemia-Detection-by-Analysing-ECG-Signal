@@ -23,6 +23,14 @@ def test_b0_is_constant_and_uses_training_labels_only() -> None:
     assert estimator.positive_prior_ == 0.25
 
 
+def test_b0_count_only_fit_is_exactly_equivalent() -> None:
+    from_labels = ConstantPriorClassifier().fit(
+        np.full((8, 40), 1e12), np.asarray([0, 0, 0, 0, 0, 0, 1, 1])
+    )
+    from_counts = ConstantPriorClassifier().fit_from_counts(2, 8)
+    assert from_counts.positive_prior_ == from_labels.positive_prior_ == 0.25
+
+
 def test_b1_and_b2_use_the_same_fixed_logistic_pipeline() -> None:
     for name in ("B1_signal_logreg", "B2_morphology_logreg"):
         estimator = build_estimator(name)
