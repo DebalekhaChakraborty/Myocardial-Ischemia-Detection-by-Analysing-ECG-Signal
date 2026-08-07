@@ -8,24 +8,36 @@ from numpy.typing import NDArray
 from cardiosentinel.signal.models import SignalValidationError, WaveformSegment
 
 CANONICAL_PHYSICAL_UNIT = "mV"
-_MILLIVOLT_FACTORS = {
+_CANONICAL_SOURCE_UNITS = {
+    "V": "V",
+    "mV": "mV",
+    "mv": "mV",
+    "uV": "uV",
+    "µV": "uV",
+    "μV": "uV",
+}
+_CANONICAL_MILLIVOLT_FACTORS = {
     "V": 1000.0,
     "mV": 1.0,
     "uV": 0.001,
-    "µV": 0.001,
-    "μV": 0.001,
 }
+
+
+def canonical_source_unit(unit: str) -> str:
+    """Map an explicitly supported source spelling to its dimensional unit."""
+    source_spelling = unit.strip()
+    try:
+        return _CANONICAL_SOURCE_UNITS[source_spelling]
+    except KeyError as error:
+        raise SignalValidationError(
+            f"Unsupported physical ECG unit {unit!r}; expected V, mV, mv, uV, or µV."
+        ) from error
 
 
 def millivolt_factor(unit: str) -> float:
     """Return an explicit physical conversion factor; never guess unknown units."""
-    normalized = unit.strip()
-    try:
-        return _MILLIVOLT_FACTORS[normalized]
-    except KeyError as error:
-        raise SignalValidationError(
-            f"Unsupported physical ECG unit {unit!r}; expected V, mV, uV, or µV."
-        ) from error
+    canonical_unit = canonical_source_unit(unit)
+    return _CANONICAL_MILLIVOLT_FACTORS[canonical_unit]
 
 
 def convert_to_millivolts(

@@ -107,7 +107,9 @@ def _verify_source_against_manifest(
         raise ValueError("Source verification requires expected record IDs.")
     manifest_path = root / OFFICIAL_MANIFEST_NAME
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"Official checksum manifest is absent: {manifest_path}")
+        raise FileNotFoundError(
+            f"Official checksum manifest is absent: {manifest_path}"
+        )
     actual_manifest_sha256 = sha256_file(manifest_path)
     if actual_manifest_sha256 != official_manifest_sha256:
         raise ValueError(
