@@ -12,9 +12,30 @@ data:
   require_record_metadata: true
   subject_id_field: subject_id
 
-window:
+signal:
+  canonical_unit: mV
+
+preprocessing:
+  profile: raw
+  highpass:
+    enabled: false
+    cutoff_hz: null
+    order: null
+  lowpass:
+    enabled: false
+    cutoff_hz: null
+    order: null
+  notch:
+    enabled: false
+    frequency_hz: null
+    quality_factor: null
+
+windowing:
   length_seconds: null
-  overlap_seconds: null
+  stride_seconds: null
+
+signal_quality:
+  enabled: true
 
 random_seed: 2026
 
@@ -23,10 +44,6 @@ split:
   train_fraction: 0.70
   validation_fraction: 0.15
   test_fraction: 0.15
-
-signal_preprocessing:
-  enabled: false
-  filter_profile: null
 
 training:
   enabled: false
@@ -44,4 +61,3 @@ episodes:
 edge:
   benchmark_enabled: false
   hardware_target: null
-

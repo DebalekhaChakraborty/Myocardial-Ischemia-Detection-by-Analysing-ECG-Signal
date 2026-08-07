@@ -8,8 +8,10 @@ contract.
    strict WFDB metadata inspection, annotation preservation, manifest
    generation, leakage validation, remote header/annotation validation, and
    synthetic tests are available.
-2. **Signal-processing pipeline:** deterministic loading, quality checks, and
-   documented preprocessing.
+2. **Signal-processing pipeline:** causal implementation and bounded waveform
+   integration validation complete. Includes physical-unit loading, raw and
+   optional stateful SOS profiles, causal windows, descriptive quality metrics,
+   response audits, and provenance.
 3. **Reproducible baselines:** non-neural and simple learned baselines with
    subject-wise evaluation.
 4. **Patient-adaptive memory:** contamination-safe short- and long-term baseline

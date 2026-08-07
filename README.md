@@ -49,11 +49,14 @@ research changes.
 ## Development status
 
 Phase 1 implementation and annotation-semantic validation are complete for
-header and annotation metadata from EDB and LTSTDB. CardioSentinel preserves
-subject identity, episode semantics, unknown-form accounting, and provenance;
-it does not download ECG waveforms during remote probes or validation. Signal
-processing, models, personalization, calibration, episode reasoning, and edge
-benchmarking remain planned work. No results are reported.
+header and annotation metadata from EDB and LTSTDB. Phase 2 implements a bounded
+physical-waveform reader, canonical mV representation, raw identity profile,
+optional stateful causal filters, causal windows, descriptive signal-quality
+metrics, and filter audits. Bounded physical-waveform integration validation is
+complete for the first 60 seconds of EDB `e0113`, EDB `e0161`, and LTSTDB
+`s20011`. Models, personalization, calibration, episode reasoning, and edge
+benchmarking remain planned work. No performance or clinical results are
+reported.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
@@ -62,6 +65,17 @@ data during import or tests:
 python -m pip install -e ".[dev,data]"
 python -m cardiosentinel data --help
 ```
+
+Signal commands require the optional `signal` dependency group. High-pass,
+low-pass, and notch filtering are disabled by default:
+
+```bash
+python -m pip install -e ".[dev,data,signal]"
+python -m cardiosentinel signal --help
+```
+
+See [`docs/SIGNAL_PROCESSING_CONTRACT.md`](docs/SIGNAL_PROCESSING_CONTRACT.md)
+for the causality, physical-unit, filtering, quality, and ground-truth boundary.
 
 ## License and attribution
 

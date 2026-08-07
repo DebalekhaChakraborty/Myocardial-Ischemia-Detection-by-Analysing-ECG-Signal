@@ -12,8 +12,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - name: Install lightweight development dependencies
-        run: python -m pip install -e ".[dev]"
+      - name: Install development and signal dependencies
+        run: python -m pip install -e ".[dev,signal]"
       - name: Lint
         run: python -m ruff check .
       - name: Test

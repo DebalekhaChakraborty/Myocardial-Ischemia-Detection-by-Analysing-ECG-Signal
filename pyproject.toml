@@ -20,11 +20,16 @@ dev = [
   "pytest>=8.0,<9",
   "ruff>=0.6,<1",
 ]
-# Reserved groups; no ML or documentation framework is required yet.
+# Reserved groups; no ML framework is required yet.
 ml = []
 docs = []
 data = [
   "numpy>=1.26,<3",
+  "wfdb>=4.1,<5",
+]
+signal = [
+  "numpy>=1.26,<3",
+  "scipy>=1.13,<2",
   "wfdb>=4.1,<5",
 ]
 

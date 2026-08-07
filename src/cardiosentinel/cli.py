@@ -65,11 +65,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remote_validate_parser.add_argument("dataset", choices=("edb", "ltstdb"))
     remote_validate_parser.add_argument("--annotation-set")
+    signal_parser = subparsers.add_parser(
+        "signal", help="Inspect physical ECG and audit causal preprocessing."
+    )
+    signal_commands = signal_parser.add_subparsers(dest="signal_command", required=True)
+    waveform_probe = signal_commands.add_parser(
+        "probe-remote", help="Read one bounded remote physical waveform interval."
+    )
+    waveform_probe.add_argument("dataset", choices=("edb", "ltstdb"))
+    waveform_probe.add_argument("--record", required=True)
+    waveform_probe.add_argument("--start-seconds", type=float, required=True)
+    waveform_probe.add_argument("--duration-seconds", type=float, required=True)
+    waveform_probe.add_argument(
+        "--channels",
+        type=lambda value: tuple(int(item) for item in value.split(",")),
+        help="Optional comma-separated zero-based channel indices.",
+    )
+    audit_parser = signal_commands.add_parser(
+        "filter-audit", help="Print causal filter coefficients and response as JSON."
+    )
+    audit_parser.add_argument("--sampling-frequency-hz", type=float, required=True)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run a metadata-only command and return its process status."""
+    """Run one bounded research utility and return its process status."""
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -129,6 +149,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         write_manifest(manifest, args.output)
         print(f"Manifest: {args.output}")
+        return 0
+
+    if args.command == "signal":
+        if args.signal_command == "probe-remote":
+            from cardiosentinel.signal.io import (
+                read_remote_seconds,
+                waveform_summary,
+            )
+
+            segment = read_remote_seconds(
+                args.dataset,
+                args.record,
+                args.start_seconds,
+                args.duration_seconds,
+                args.channels,
+            )
+            print(json.dumps(waveform_summary(segment), indent=2, sort_keys=True))
+            return 0
+        from cardiosentinel.signal.preprocessing import filter_audit
+
+        config = load_config(args.config)
+        print(
+            json.dumps(
+                filter_audit(config.preprocessing, args.sampling_frequency_hz),
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
 
     parser.print_help()
