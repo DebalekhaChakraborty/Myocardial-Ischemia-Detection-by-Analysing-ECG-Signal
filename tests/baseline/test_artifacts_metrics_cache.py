@@ -1,6 +1,7 @@
 """SYNTHETIC cache, lock, pooled, macro, bootstrap, and reporting tests."""
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,7 @@ from cardiosentinel.baseline.cache import (
     write_json_atomic,
 )
 from cardiosentinel.baseline.metrics import (
+    _matthews_correlation,
     binary_metrics,
     challenge_bootstrap_confidence_intervals,
     challenge_metrics,
@@ -62,6 +64,7 @@ def test_primary_metrics_and_subject_macro_keep_undefined_values() -> None:
     assert pooled["auprc"] == 1.0
     assert pooled["auroc"] == 1.0
     assert pooled["f1"] == 1.0
+    assert pooled["mcc"] == 1.0
 
     subjects = np.asarray(["negative-only", "mixed", "mixed", "positive-only"])
     macro = subject_macro_metrics(labels, scores, subjects, 0.5)
@@ -70,6 +73,65 @@ def test_primary_metrics_and_subject_macro_keep_undefined_values() -> None:
     assert macro["auprc"]["contributing_subject_count"] == 1
     assert macro["auprc"]["non_contributing_subject_count"] == 2
     assert macro["specificity"]["contributing_subject_count"] == 2
+
+
+def test_mcc_handles_benchmark_scale_python_integer_denominator() -> None:
+    true_positive = 93_613
+    true_negative = 452_269
+    false_positive = 24_512
+    false_negative = 21_628
+    denominator = (
+        (true_positive + false_positive)
+        * (true_positive + false_negative)
+        * (true_negative + false_positive)
+        * (true_negative + false_negative)
+    )
+
+    assert denominator > np.iinfo(np.int64).max
+    assert _matthews_correlation(
+        true_positive, true_negative, false_positive, false_negative
+    ) == pytest.approx(
+        (true_positive * true_negative - false_positive * false_negative)
+        / math.sqrt(denominator)
+    )
+
+
+def test_mcc_matches_sklearn_on_a_manageable_confusion_matrix() -> None:
+    from sklearn.metrics import matthews_corrcoef
+
+    labels = np.asarray([1, 1, 1, 0, 0, 0, 0, 0])
+    scores = np.asarray([0.9, 0.8, 0.1, 0.7, 0.6, 0.2, 0.1, 0.0])
+    threshold = 0.5
+
+    metrics = binary_metrics(labels, scores, threshold)
+
+    assert metrics["mcc"] == pytest.approx(
+        matthews_corrcoef(labels, (scores >= threshold).astype(np.int64))
+    )
+
+
+@pytest.mark.parametrize(
+    ("labels", "scores"),
+    (
+        ([0, 0], [0.1, 0.2]),
+        ([1, 1], [0.8, 0.9]),
+    ),
+)
+def test_mcc_zero_denominator_remains_undefined(
+    labels: list[int], scores: list[float]
+) -> None:
+    assert binary_metrics(np.asarray(labels), np.asarray(scores), 0.5)["mcc"] is None
+
+
+def test_mcc_perfect_and_inverted_classifiers_have_expected_values() -> None:
+    labels = np.asarray([0, 0, 1, 1])
+
+    assert binary_metrics(labels, np.asarray([0.1, 0.2, 0.8, 0.9]), 0.5)[
+        "mcc"
+    ] == 1.0
+    assert binary_metrics(labels, np.asarray([0.9, 0.8, 0.2, 0.1]), 0.5)[
+        "mcc"
+    ] == -1.0
 
 
 @pytest.mark.parametrize(

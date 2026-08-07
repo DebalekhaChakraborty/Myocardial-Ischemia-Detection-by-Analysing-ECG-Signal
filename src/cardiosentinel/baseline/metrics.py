@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -29,6 +30,25 @@ METRIC_NAMES = (
 
 def _ratio(numerator: int, denominator: int) -> float | None:
     return None if denominator == 0 else numerator / denominator
+
+
+def _matthews_correlation(
+    true_positive: int,
+    true_negative: int,
+    false_positive: int,
+    false_negative: int,
+) -> float | None:
+    """Compute exact MCC count algebra with a Python-integer-safe square root."""
+    denominator = (
+        (true_positive + false_positive)
+        * (true_positive + false_negative)
+        * (true_negative + false_positive)
+        * (true_negative + false_negative)
+    )
+    if denominator == 0:
+        return None
+    numerator = true_positive * true_negative - false_positive * false_negative
+    return numerator / math.sqrt(denominator)
 
 
 def binary_metrics(
@@ -62,12 +82,7 @@ def binary_metrics(
         if sensitivity is None or specificity is None
         else (sensitivity + specificity) / 2.0
     )
-    mcc_denominator = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
-    mcc = (
-        None
-        if mcc_denominator == 0
-        else (tp * tn - fp * fn) / float(np.sqrt(mcc_denominator))
-    )
+    mcc = _matthews_correlation(tp, tn, fp, fn)
     class_count = np.unique(labels_array).size
     return {
         "window_count": int(labels_array.size),
