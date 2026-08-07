@@ -221,6 +221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         from cardiosentinel.evaluation.protocol import (
             DEFAULT_SEED,
+            LTSTDB_V1_GENERATOR_CODE_SHA256,
             LTSTDB_V1_SPLIT_SHA256,
         )
         from cardiosentinel.evaluation.splits import (
@@ -249,6 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             validate_split_manifest(
                 manifest,
                 expected_hash=LTSTDB_V1_SPLIT_SHA256,
+                expected_generator_code_hash=LTSTDB_V1_GENERATOR_CODE_SHA256,
                 expected_subject_count=80,
                 expected_record_count=86,
             )

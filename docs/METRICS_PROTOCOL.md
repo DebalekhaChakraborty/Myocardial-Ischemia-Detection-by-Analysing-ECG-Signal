@@ -47,9 +47,10 @@ is prohibited because overlapping windows from one subject are correlated.
 
 At the frozen validation-selected threshold, separately report:
 
-- false-positive rate on rate-related ST windows;
-- false-positive rate in the plus/minus 30-second axis-marker vicinity; and
-- false-positive rate in the plus/minus 30-second conduction-marker vicinity.
+- rate-related FPR as a `quantitative_secondary` challenge metric;
+- axis-shift FPR in the plus/minus 30-second marker vicinity as a
+  `quantitative_secondary` challenge metric; and
+- conduction-change `FP = x / N` as an `exploratory_descriptive` stress test.
 
 Do not merge these challenge results into clean-background specificity without
 also reporting the components. They are not the primary positive target.
@@ -58,16 +59,34 @@ enter a challenge false-positive-rate denominator. An `ischemic_positive` with
 axis or conduction context remains a positive and is excluded from that
 denominator.
 
-Future descriptive/error analysis also reports ischemic positives with no axis
-or conduction marker context, with axis context, with conduction context, and
-with point-noise context. These strata may overlap and are not new disease
-classes, headline metrics, or threshold-selection inputs.
+Every challenge report must include its evidence level, contributing-subject
+count, challenge-window count, false-positive count, and denominator. A fraction
+may be shown only as `FP / N`, never without those counts. Conduction-change
+evidence has one held-out subject in V1, so it is not bootstrapped, does not
+receive an inferential confidence interval, is not a headline or model-selection
+criterion, and is never included in an overall confounder-robustness score.
+
+Descriptive/error-analysis strata report ischemic positives with no axis or
+conduction marker context, with axis context, with conduction context, and with
+point-noise context. These strata may overlap and are not new disease classes,
+headline metrics, threshold-selection inputs, or formal FPR challenges. Every
+context report includes contributing-subject and window counts; it must not show
+an aggregate percentage without those denominators.
 
 ## Test composition
 
 Headline validation and test metrics use every eligible ischemic-positive and
 background-negative window. The test set is not artificially balanced or
 negative-sampled. Training sampling has no effect on evaluation prevalence.
+
+## Metric hierarchy
+
+- Primary metric: AUPRC.
+- Secondary model metrics: AUROC, F1, sensitivity, specificity, PPV, NPV,
+  balanced accuracy, and MCC.
+- Quantitative challenge metrics: rate-related FPR and axis-shift FPR.
+- Exploratory challenge: conduction-change descriptive `FP / N`.
+- Descriptive positive-context strata: axis, conduction, and point noise.
 
 ## Deferred metrics
 

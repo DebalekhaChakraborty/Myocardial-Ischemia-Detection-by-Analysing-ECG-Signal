@@ -42,7 +42,9 @@ deterministic subject-stratification objective. Marker presence is balanced as
 well as count because challenge analysis requires contributing subjects, not
 only aggregate marker volume. No waveform feature, model prediction, error, or
 performance metric was available or used. The corrected split in this document
-is the final V1 split and becomes immutable when Phase 3A is merged.
+is the final V1 split. It was frozen after this pre-model review correction and
+before any model training or model-result inspection; its subjects, assignment
+hash, source-metadata hash, and generator-code hash must not change again.
 
 Only four subjects contain conduction-change markers. The corrected split puts
 two in train, one in validation, and one in test, but the two train subjects
@@ -134,6 +136,23 @@ training participation remains a Phase-3B decision; V1 marks them ineligible
 for training by default. Ischemic positives carrying marker context never enter
 challenge false-positive-rate denominators.
 
+Challenge evidence is intentionally asymmetric:
+
+| Challenge | Evidence level | V1 interpretation |
+|---|---|---|
+| Rate-related | `quantitative_secondary` | Secondary FPR metric with subject/window denominators. |
+| Axis shift | `quantitative_secondary` | Secondary FPR metric with subject/window denominators. |
+| Conduction change | `exploratory_descriptive` | Descriptive stress test only: report `FP = x / N`, contributing subjects, and challenge windows. |
+
+The conduction test subset has one contributing subject and 10 windows. It is a
+source-cohort limitation, not a split bug. It cannot have a bootstrap confidence
+interval, cannot be an inferential or model-selection result, and cannot be
+combined with other challenges into an overall confounder-robustness score.
+Benchmark summaries attach the typed evidence level and bootstrap eligibility to
+every challenge composition entry so downstream reports cannot erase this
+distinction. Point-noise context is descriptive only, remains neither an
+exclusion nor an FPR challenge, and never receives an invented duration.
+
 ## Training sampling
 
 No training occurs in Phase 3A. The frozen V1 sampler interface retains all
@@ -214,4 +233,5 @@ canonical object containing the exact assignment constants and marker subtype
 names. Frozen result hashes are excluded from generator inputs to avoid
 self-reference. `generation_git_sha` and `generation_git_dirty` independently
 record the checkout state used for generation; no timestamp enters assignment
-identity.
+identity. V1 validation compares the manifest's generator digest to this frozen
+V1 value, not to subsequently evolved reporting code.

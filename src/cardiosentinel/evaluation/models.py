@@ -23,6 +23,11 @@ ContextFlag = Literal[
 ]
 
 EDBSecondaryCohortName = Literal["full", "overlap_clean"]
+ChallengeName = Literal["rate_related", "axis_shift", "conduction_change"]
+ChallengeEvidenceLevel = Literal[
+    "quantitative_secondary",
+    "exploratory_descriptive",
+]
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,50 @@ class EDBSecondaryCohort:
     known_overlap_record_ids: tuple[str, ...]
     contains_known_source_overlap: bool
     fully_independent_external_validation: Literal[False] = False
+
+
+@dataclass(frozen=True)
+class ChallengeEvidencePolicy:
+    """Fixed interpretation rules for one non-ischemic challenge subset."""
+
+    challenge: ChallengeName
+    target_family: Literal[
+        "rate_related_confounder",
+        "axis_shift_confounder",
+        "conduction_change_confounder",
+    ]
+    evidence_level: ChallengeEvidenceLevel
+    is_headline_metric: Literal[False]
+    supports_inferential_bootstrap: bool
+
+
+@dataclass(frozen=True)
+class ChallengeReport:
+    """Count-based challenge result with its evidence interpretation attached."""
+
+    challenge: ChallengeName
+    evidence_level: ChallengeEvidenceLevel
+    contributing_subject_count: int
+    challenge_window_count: int
+    false_positive_count: int
+    false_positive_fraction: float | None
+    is_headline_metric: Literal[False]
+    inference_available: bool
+
+    def __post_init__(self) -> None:
+        if min(
+            self.contributing_subject_count,
+            self.challenge_window_count,
+            self.false_positive_count,
+        ) < 0:
+            raise ValueError("Challenge report counts cannot be negative.")
+        if self.false_positive_count > self.challenge_window_count:
+            raise ValueError("False positives cannot exceed challenge windows.")
+        if (
+            self.challenge_window_count == 0
+            and self.false_positive_fraction is not None
+        ):
+            raise ValueError("An empty challenge subset cannot have a fraction.")
 
 
 @dataclass(frozen=True)

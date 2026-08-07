@@ -11,7 +11,10 @@ from cardiosentinel.data.models import (
     ParsedAnnotations,
 )
 from cardiosentinel.evaluation.models import SubjectBurden
-from cardiosentinel.evaluation.protocol import LTSTDB_V1_SPLIT_SHA256
+from cardiosentinel.evaluation.protocol import (
+    LTSTDB_V1_GENERATOR_CODE_SHA256,
+    LTSTDB_V1_SPLIT_SHA256,
+)
 from cardiosentinel.evaluation.provenance import (
     conservative_edb_overlap_exclusions,
     edb_secondary_cohort,
@@ -162,13 +165,20 @@ def test_edb_secondary_cohorts_and_ltstdb_training_policy() -> None:
 def test_committed_v1_split_hash_is_stable() -> None:
     path = Path(__file__).resolve().parents[2] / "protocols/splits/ltstdb_v1.json"
     manifest = load_split_manifest(path)
-    validate_split_manifest(manifest, expected_hash=LTSTDB_V1_SPLIT_SHA256)
+    validate_split_manifest(
+        manifest,
+        expected_hash=LTSTDB_V1_SPLIT_SHA256,
+        expected_generator_code_hash=LTSTDB_V1_GENERATOR_CODE_SHA256,
+    )
     assert manifest["split_sha256"] == LTSTDB_V1_SPLIT_SHA256
     assert [
         len(manifest["partitions"][partition]["subjects"])
         for partition in PARTITIONS
     ] == [56, 12, 12]
-    assert manifest["generator_code_sha256"] == generator_code_sha256()
+    assert manifest["generator_code_sha256"] == LTSTDB_V1_GENERATOR_CODE_SHA256
+    assert manifest["source_metadata_sha256"] == (
+        "2ccd1908f3fb1887aef25273bf8039e48e478c751693394da4ad72d155970913"
+    )
     assert isinstance(manifest["generation_git_dirty"], bool)
 
 

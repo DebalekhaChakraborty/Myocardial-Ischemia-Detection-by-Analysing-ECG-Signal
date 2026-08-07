@@ -4,11 +4,14 @@ import pytest
 
 from cardiosentinel.evaluation.metrics import (
     challenge_false_positive_rate,
+    challenge_report,
+    challenge_subject_bootstrap_plan,
     ischemic_positive_context_strata,
     select_validation_f1_threshold,
     subject_bootstrap_plan,
 )
 from cardiosentinel.evaluation.models import WindowTarget
+from cardiosentinel.evaluation.protocol import challenge_evidence_policy
 from cardiosentinel.evaluation.sampling import (
     primary_evaluation_targets,
     sample_training_targets,
@@ -108,10 +111,10 @@ def test_mixed_positives_do_not_enter_challenge_fpr_denominators() -> None:
     axis_challenge = target("axis_shift_confounder", 1, "subject-b", "record-b")
     targets = (mixed_positive, axis_challenge)
     assert challenge_false_positive_rate(
-        targets, (0.99, 0.10), 0.5, "axis_shift_confounder"
+        targets, (0.99, 0.10), 0.5, "axis_shift"
     ) == 0.0
     assert challenge_false_positive_rate(
-        targets, (0.99, 0.10), 0.5, "conduction_change_confounder"
+        targets, (0.99, 0.10), 0.5, "conduction_change"
     ) is None
 
 
@@ -132,3 +135,50 @@ def test_positive_context_strata_are_descriptive_and_overlapping() -> None:
     assert strata["axis_shift_context"] == (mixed,)
     assert strata["conduction_change_context"] == (mixed,)
     assert strata["point_noise_context"] == (mixed,)
+
+
+def test_challenge_evidence_policy_bounds_conduction_claims() -> None:
+    rate = challenge_evidence_policy("rate_related")
+    axis = challenge_evidence_policy("axis_shift")
+    conduction = challenge_evidence_policy("conduction_change")
+    assert rate.evidence_level == "quantitative_secondary"
+    assert axis.evidence_level == "quantitative_secondary"
+    assert conduction.evidence_level == "exploratory_descriptive"
+    assert all(
+        policy.is_headline_metric is False for policy in (rate, axis, conduction)
+    )
+    assert conduction.supports_inferential_bootstrap is False
+
+
+def test_conduction_report_keeps_fp_numerator_and_denominator() -> None:
+    targets = (
+        target("conduction_change_confounder", 0, "subject-a", "record-a"),
+        target("conduction_change_confounder", 1, "subject-a", "record-a"),
+    )
+    report = challenge_report(targets, (0.9, 0.1), 0.5, "conduction_change")
+    assert report.contributing_subject_count == 1
+    assert report.challenge_window_count == 2
+    assert report.false_positive_count == 1
+    assert report.false_positive_fraction == 0.5
+    assert report.evidence_level == "exploratory_descriptive"
+    assert report.is_headline_metric is False
+    assert report.inference_available is False
+    with pytest.raises(ValueError, match="exploratory descriptive"):
+        challenge_subject_bootstrap_plan(targets, "conduction_change")
+
+
+def test_quantitative_challenge_bootstrap_requires_two_subjects() -> None:
+    one_subject = (
+        target("axis_shift_confounder", 0, "subject-a", "record-a"),
+    )
+    with pytest.raises(ValueError, match="at least two"):
+        challenge_subject_bootstrap_plan(one_subject, "axis_shift")
+
+    two_subjects = one_subject + (
+        target("axis_shift_confounder", 1, "subject-b", "record-b"),
+    )
+    plan = challenge_subject_bootstrap_plan(
+        two_subjects, "axis_shift", replicates=5, seed=7
+    )
+    assert len(plan) == 5
+    assert all(len(replicate) == 2 for replicate in plan)

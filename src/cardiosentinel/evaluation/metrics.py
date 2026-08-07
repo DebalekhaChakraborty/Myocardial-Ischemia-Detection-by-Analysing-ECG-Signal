@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterable, Sequence
-from typing import Literal
 
-from cardiosentinel.evaluation.models import WindowTarget
-from cardiosentinel.evaluation.protocol import BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED
-
-ChallengeFamily = Literal[
-    "rate_related_confounder",
-    "axis_shift_confounder",
-    "conduction_change_confounder",
-]
+from cardiosentinel.evaluation.models import (
+    ChallengeName,
+    ChallengeReport,
+    WindowTarget,
+)
+from cardiosentinel.evaluation.protocol import (
+    BOOTSTRAP_REPLICATES,
+    BOOTSTRAP_SEED,
+    challenge_evidence_policy,
+)
 
 
 def subject_bootstrap_plan(
@@ -68,20 +69,72 @@ def challenge_false_positive_rate(
     targets: Sequence[WindowTarget],
     scores: Sequence[float],
     threshold: float,
-    challenge_family: ChallengeFamily,
+    challenge: ChallengeName,
 ) -> float | None:
-    """Compute FPR over one explicitly non-ischemic challenge family only."""
+    """Return the count-based false-positive fraction for one challenge."""
+    return challenge_report(
+        targets, scores, threshold, challenge
+    ).false_positive_fraction
+
+
+def challenge_report(
+    targets: Sequence[WindowTarget],
+    scores: Sequence[float],
+    threshold: float,
+    challenge: ChallengeName,
+) -> ChallengeReport:
+    """Attach V1 evidence policy and denominators to a challenge result."""
     if len(targets) != len(scores):
         raise ValueError("Challenge targets and scores must be aligned.")
-    selected_scores = tuple(
-        float(score)
+    policy = challenge_evidence_policy(challenge)
+    selected = tuple(
+        (target, float(score))
         for target, score in zip(targets, scores, strict=True)
-        if target.target_family == challenge_family
+        if target.target_family == policy.target_family
         and target.eligible_for_confounder_evaluation
     )
-    if not selected_scores:
-        return None
-    return sum(score >= threshold for score in selected_scores) / len(selected_scores)
+    window_count = len(selected)
+    false_positive_count = sum(score >= threshold for _, score in selected)
+    subject_count = len({target.subject_id for target, _ in selected})
+    return ChallengeReport(
+        challenge=challenge,
+        evidence_level=policy.evidence_level,
+        contributing_subject_count=subject_count,
+        challenge_window_count=window_count,
+        false_positive_count=false_positive_count,
+        false_positive_fraction=(
+            None if window_count == 0 else false_positive_count / window_count
+        ),
+        is_headline_metric=policy.is_headline_metric,
+        inference_available=(
+            policy.supports_inferential_bootstrap and subject_count >= 2
+        ),
+    )
+
+
+def challenge_subject_bootstrap_plan(
+    targets: Iterable[WindowTarget],
+    challenge: ChallengeName,
+    replicates: int = BOOTSTRAP_REPLICATES,
+    seed: int = BOOTSTRAP_SEED,
+) -> tuple[tuple[str, ...], ...]:
+    """Return a plan only for sufficiently supported quantitative challenges."""
+    policy = challenge_evidence_policy(challenge)
+    if not policy.supports_inferential_bootstrap:
+        raise ValueError(
+            f"{challenge} is exploratory descriptive and cannot be bootstrapped."
+        )
+    subjects = tuple(
+        target.subject_id
+        for target in targets
+        if target.target_family == policy.target_family
+        and target.eligible_for_confounder_evaluation
+    )
+    if len(set(subjects)) < 2:
+        raise ValueError(
+            "Challenge bootstrap inference requires at least two contributing subjects."
+        )
+    return subject_bootstrap_plan(subjects, replicates=replicates, seed=seed)
 
 
 def ischemic_positive_context_strata(

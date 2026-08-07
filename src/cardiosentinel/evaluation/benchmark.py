@@ -17,9 +17,13 @@ from cardiosentinel.data.validation import validate_dataset
 from cardiosentinel.evaluation.models import EDBSecondaryCohort, EDBSecondaryCohortName
 from cardiosentinel.evaluation.protocol import (
     BENCHMARK_SCHEMA_VERSION,
+    CHALLENGE_EVIDENCE_POLICIES,
     DEFAULT_SEED,
     LABEL_POLICY_VERSION,
+    LTSTDB_V1_GENERATOR_CODE_SHA256,
     LTSTDB_V1_SPLIT_SHA256,
+    POSITIVE_CONTEXT_EVIDENCE_LEVEL,
+    POSITIVE_CONTEXT_FLAGS,
     PRIMARY_ANNOTATION_DEFINITION,
     PRIMARY_STRIDE_SECONDS,
     PRIMARY_WINDOW_SECONDS,
@@ -144,6 +148,21 @@ def _serialize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
             key: len(value)
             for key, value in sorted(bucket["target_subjects"].items())
         },
+        "challenge_composition": {
+            challenge: {
+                "challenge": policy.challenge,
+                "evidence_level": policy.evidence_level,
+                "subject_count": len(
+                    bucket["target_subjects"].get(policy.target_family, set())
+                ),
+                "window_count": bucket["window_counts"][policy.target_family],
+                "is_headline_metric": policy.is_headline_metric,
+                "supports_inferential_bootstrap": (
+                    policy.supports_inferential_bootstrap
+                ),
+            }
+            for challenge, policy in CHALLENGE_EVIDENCE_POLICIES.items()
+        },
         "primary_composition": {
             "positive_windows": positive_count,
             "background_windows": background_count,
@@ -157,6 +176,17 @@ def _serialize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
         "positive_context_subject_counts": {
             key: len(value)
             for key, value in sorted(bucket["positive_context_subjects"].items())
+        },
+        "positive_context_composition": {
+            context_flag: {
+                "context_flag": context_flag,
+                "evidence_level": POSITIVE_CONTEXT_EVIDENCE_LEVEL,
+                "subject_count": len(
+                    bucket["positive_context_subjects"].get(context_flag, set())
+                ),
+                "window_count": bucket["positive_context_counts"][context_flag],
+            }
+            for context_flag in POSITIVE_CONTEXT_FLAGS
         },
     }
 
@@ -247,6 +277,11 @@ def summarize_benchmark(
             split,
             records=records,
             expected_hash=expected_split_hash,
+            expected_generator_code_hash=(
+                LTSTDB_V1_GENERATOR_CODE_SHA256
+                if expected_split_hash == LTSTDB_V1_SPLIT_SHA256
+                else None
+            ),
             expected_subject_count=expected_subject_count,
             expected_record_count=expected_record_count,
         )

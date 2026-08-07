@@ -437,6 +437,7 @@ def validate_split_manifest(
     manifest: Mapping[str, Any],
     records: Iterable[DatasetRecord] | None = None,
     expected_hash: str | None = None,
+    expected_generator_code_hash: str | None = None,
     expected_subject_count: int | None = None,
     expected_record_count: int | None = None,
 ) -> None:
@@ -453,8 +454,11 @@ def validate_split_manifest(
         raise ValueError("Split must record generation_git_sha.")
     if not isinstance(manifest.get("generation_git_dirty"), bool):
         raise ValueError("Split must record generation_git_dirty.")
-    if manifest.get("generator_code_sha256") != generator_code_sha256():
-        raise ValueError("Generator code hash differs from the current implementation.")
+    if (
+        expected_generator_code_hash is not None
+        and manifest.get("generator_code_sha256") != expected_generator_code_hash
+    ):
+        raise ValueError("Generator code hash differs from the frozen protocol.")
     if not isinstance(manifest.get("source_metadata_sha256"), str):
         raise ValueError("Split must record source_metadata_sha256.")
     partitions = manifest.get("partitions")

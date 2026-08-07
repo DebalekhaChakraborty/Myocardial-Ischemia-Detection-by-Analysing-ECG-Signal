@@ -114,6 +114,38 @@ def test_summary_has_protocol_provenance_and_all_partitions() -> None:
         bucket["target_subject_counts"]["conduction_change_confounder"] == 1
         for bucket in summary["partitions"].values()
     )
+    assert all(
+        bucket["challenge_composition"]["conduction_change"]
+        == {
+            "challenge": "conduction_change",
+            "evidence_level": "exploratory_descriptive",
+            "subject_count": 1,
+            "window_count": bucket["window_counts"]["conduction_change_confounder"],
+            "is_headline_metric": False,
+            "supports_inferential_bootstrap": False,
+        }
+        for bucket in summary["partitions"].values()
+    )
+    assert all(
+        set(report) >= {"subject_count", "window_count", "evidence_level"}
+        for bucket in summary["partitions"].values()
+        for report in bucket["challenge_composition"].values()
+    )
+    assert all(
+        bucket["positive_context_composition"]["point_noise_context"]
+        == {
+            "context_flag": "point_noise_context",
+            "evidence_level": "descriptive_error_analysis",
+            "subject_count": 0,
+            "window_count": 0,
+        }
+        for bucket in summary["partitions"].values()
+    )
+    assert all(
+        set(report) >= {"subject_count", "window_count", "evidence_level"}
+        for bucket in summary["partitions"].values()
+        for report in bucket["positive_context_composition"].values()
+    )
     provenance = summary["provenance"]
     assert provenance["benchmark_schema_version"] == "3.0"
     assert provenance["benchmark_protocol_version"] == "1"
