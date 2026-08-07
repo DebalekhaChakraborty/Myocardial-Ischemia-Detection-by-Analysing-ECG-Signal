@@ -128,6 +128,17 @@ To inspect a different external feature root:
 python scripts/monitor_phase3b.py --feature-root /path/to/features
 ```
 
+### Auditing a completed Phase 3B corpus
+
+The read-only corpus audit validates every cache and the persisted corpus hash
+before reporting frozen primary counts, descriptive challenge/exclusion families,
+and algorithmic morphology-feature validity:
+
+```bash
+python scripts/audit_phase3b_corpus.py \
+  --feature-root /path/to/ltstdb-baseline-v1
+```
+
 ## License and attribution
 
 The repository code is licensed under the MIT License. See `NOTICE.md` before
