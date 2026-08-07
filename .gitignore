@@ -28,6 +28,9 @@ secrets/
 !/data/README.md
 /artifacts/*
 !/artifacts/README.md
+/cardiosentinel-data/
+/cardiosentinel-features/
+/cardiosentinel-runs/
 models/checkpoints/
 *.ckpt
 *.pt
