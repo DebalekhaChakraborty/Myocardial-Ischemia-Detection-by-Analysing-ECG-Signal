@@ -108,6 +108,23 @@ The acquisition command is plan-only unless `--execute` is supplied. The frozen
 feature, model, preprocessing, sampling, test-access, and artifact rules are in
 [`docs/BASELINE_PROTOCOL_V1.md`](docs/BASELINE_PROTOCOL_V1.md).
 
+### Monitoring Phase 3B materialization
+
+The read-only Phase 3B monitor reports progress from an existing external
+feature root. It does not access waveform source data, run models, or change
+feature caches or manifests:
+
+```bash
+python scripts/monitor_phase3b.py
+watch -n 30 python scripts/monitor_phase3b.py
+```
+
+To inspect a different external feature root:
+
+```bash
+python scripts/monitor_phase3b.py --feature-root /path/to/features
+```
+
 ## License and attribution
 
 The repository code is licensed under the MIT License. See `NOTICE.md` before
