@@ -56,10 +56,12 @@ metrics, and filter audits. Bounded physical-waveform integration validation is
 complete for the first 60 seconds of EDB `e0113`, EDB `e0161`, and LTSTDB
 `s20011`. Phase 3A freezes the LTSTDB `.stb` benchmark protocol, 56/12/12
 subject split, causal 10-second/5-second window targets, leakage controls,
-training-sampling policy, and metrics protocol. Phase 3B-1 adds versioned
-waveform-only features, resumable external caches, fixed B0--B3 global classical
-baselines, validation-frozen experiment locks, and sealed-test reporting. No
-benchmark or clinical performance result is committed here.
+training-sampling policy, and metrics protocol. Phase 3B-1 is complete: each
+frozen B0--B3 global classical baseline received one sealed-test evaluation,
+with no test-guided tuning. The compact evidence and limitations are recorded in
+[`docs/PHASE3B1_CLASSICAL_BASELINE_RESULTS.md`](docs/PHASE3B1_CLASSICAL_BASELINE_RESULTS.md).
+The next planned baseline is B4, a prospective compact raw-waveform neural
+baseline whose contract must be frozen before training or testing.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
