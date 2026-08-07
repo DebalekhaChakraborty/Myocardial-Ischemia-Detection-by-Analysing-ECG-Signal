@@ -25,6 +25,13 @@ A subject-level metric requiring both classes is undefined for a subject lacking
 one class. Do not replace it with zero; report the number of contributing and
 non-contributing subjects for each macro metric.
 
+Subject-level AUPRC and AUROC are discrimination metrics and require both a
+positive and a negative window. An all-positive subject does not receive an
+artificial AUPRC of 1.0, and an all-negative subject does not receive an
+artificial AUPRC of 0.0; both are undefined and excluded from the corresponding
+subject-macro mean. The same rule applies to single-class subject-bootstrap
+replicates, which are counted as undefined discrimination replicates.
+
 ## Binary threshold
 
 Choose a binary threshold using validation predictions only. Evaluate every

@@ -14,7 +14,10 @@ contract.
    response audits, and provenance.
 3. **Reproducible baselines:** Phase 3A benchmark protocol, frozen subject split,
    leakage-safe window targets, sampling policy, and metrics protocol complete.
-   Non-neural and simple learned baselines remain pending Phase 3B.
+   Phase 3B-1 implements frozen waveform-only signal and R-aligned morphology
+   schemas, resumable external feature materialization, B0--B3 global classical
+   baselines, validation-only threshold locks, and sealed-test reporting. Full
+   results require explicit external LTSTDB waveform acquisition and execution.
 4. **Patient-adaptive memory:** contamination-safe short- and long-term baseline
    mechanisms.
 5. **Physiology-guided model:** justified fusion of ECG representations and ST-T

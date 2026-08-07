@@ -49,6 +49,12 @@ constant segments fail hard validation. CardioSentinel does not reapply EDB's
 historical ADC scaling after WFDB has produced calibrated physical samples. It
 does not normalize, center, or z-score a patient or record.
 
+Verified WFDB sources may use explicitly supported legacy lexical aliases. The
+LTSTDB v1.0.0 spelling `mv` is mapped to dimensional `mV` with factor 1.0 at the
+reader boundary; the exact source spelling remains in `source_physical_units`
+and source files are never rewritten. Unit matching is an explicit mapping, not
+case folding, so unknown or dimensionally ambiguous spellings still fail.
+
 ## Causal filter profiles
 
 The base configuration uses the explicit `raw` profile. High-pass, low-pass,

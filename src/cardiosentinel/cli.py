@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from cardiosentinel import __version__
+from cardiosentinel.baseline.cli import add_baseline_parser, run_baseline_command
 from cardiosentinel.config import DEFAULT_CONFIG_PATH, load_config
 from cardiosentinel.data.manifest import (
     build_manifest,
@@ -118,6 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
         "split-info", help="Print frozen split counts and identity."
     )
     info_parser.add_argument("--split", type=Path, required=True)
+    add_baseline_parser(subparsers)
     return parser
 
 
@@ -287,6 +289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
+
+    if args.command == "baseline":
+        return run_baseline_command(args)
 
     parser.print_help()
     return 0

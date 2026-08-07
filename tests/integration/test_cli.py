@@ -49,6 +49,44 @@ def test_benchmark_cli_help_has_no_training_command(
     assert "\n    train " not in output
 
 
+def test_baseline_cli_help_exposes_separate_test_stage(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as result:
+        main(["baseline", "--help"])
+
+    assert result.value.code == 0
+    output = capsys.readouterr().out
+    assert "materialize" in output
+    assert "verify-source" in output
+    assert "preflight" in output
+    assert "smoke-remote" in output
+    assert "fit" in output
+    assert "evaluate-test" in output
+    assert "acquire" in output
+
+
+def test_baseline_acquisition_is_plan_only_without_execute(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    destination = tmp_path / "ltstdb" / "1.0.0"
+    assert (
+        main(
+            [
+                "baseline",
+                "acquire",
+                "--destination",
+                str(destination),
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "Long-Term ST Database v1.0.0" in output
+    assert "wget" in output
+    assert "plan only" in output
+
+
 def test_raw_filter_audit_is_machine_readable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
