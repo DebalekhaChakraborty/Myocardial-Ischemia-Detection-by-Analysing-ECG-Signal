@@ -54,9 +54,10 @@ physical-waveform reader, canonical mV representation, raw identity profile,
 optional stateful causal filters, causal windows, descriptive signal-quality
 metrics, and filter audits. Bounded physical-waveform integration validation is
 complete for the first 60 seconds of EDB `e0113`, EDB `e0161`, and LTSTDB
-`s20011`. Models, personalization, calibration, episode reasoning, and edge
-benchmarking remain planned work. No performance or clinical results are
-reported.
+`s20011`. Phase 3A freezes the LTSTDB `.stb` benchmark protocol, 56/12/12
+subject split, causal 10-second/5-second window targets, leakage controls,
+training-sampling policy, and metrics protocol. Model baselines remain pending
+Phase 3B. No performance or clinical results are reported.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
@@ -76,6 +77,20 @@ python -m cardiosentinel signal --help
 
 See [`docs/SIGNAL_PROCESSING_CONTRACT.md`](docs/SIGNAL_PROCESSING_CONTRACT.md)
 for the causality, physical-unit, filtering, quality, and ground-truth boundary.
+
+Benchmark commands inspect metadata and annotations without training or full
+waveform downloads:
+
+```bash
+python -m cardiosentinel benchmark --help
+python -m cardiosentinel benchmark split-info \
+  --split protocols/splits/ltstdb_v1.json
+```
+
+The frozen rules are in [`docs/BENCHMARK_PROTOCOL_V1.md`](docs/BENCHMARK_PROTOCOL_V1.md),
+with metrics in [`docs/METRICS_PROTOCOL.md`](docs/METRICS_PROTOCOL.md) and known
+EDB/LTSTDB overlap in
+[`docs/CROSS_DATASET_PROVENANCE.md`](docs/CROSS_DATASET_PROVENANCE.md).
 
 ## License and attribution
 

@@ -1,0 +1,387 @@
+{
+  "annotation_definition": "ltstdb.stb",
+  "assignment_algorithm": "deterministic greedy subject-level burden balancing over record count, recording duration, .stb ischemic episode count/duration, rate-related episode count/duration, and channel count; exact 70/15/15 capacities; deterministic improving pairwise-swap refinement; SHA-256 seed tie-breaking",
+  "dataset": "ltstdb",
+  "dataset_version": "1.0.0",
+  "generation_git_sha": "f93047a0d167669656d3072881a23ef862e6e654",
+  "partition_summaries": {
+    "test": {
+      "ischemic_episode_count": 160,
+      "ischemic_episode_seconds": 106914.0,
+      "rate_related_episode_count": 35,
+      "rate_related_episode_seconds": 26764.0,
+      "record_count": 12,
+      "recording_seconds": 1094529.964,
+      "subject_count": 12
+    },
+    "train": {
+      "ischemic_episode_count": 789,
+      "ischemic_episode_seconds": 481722.0,
+      "rate_related_episode_count": 157,
+      "rate_related_episode_seconds": 121154.0,
+      "record_count": 61,
+      "recording_seconds": 5004035.84,
+      "subject_count": 56
+    },
+    "validation": {
+      "ischemic_episode_count": 169,
+      "ischemic_episode_seconds": 102298.0,
+      "rate_related_episode_count": 36,
+      "rate_related_episode_seconds": 25854.0,
+      "record_count": 13,
+      "recording_seconds": 1072082.98,
+      "subject_count": 12
+    }
+  },
+  "partitions": {
+    "test": {
+      "subjects": [
+        "ltstdb:s2002",
+        "ltstdb:s2004",
+        "ltstdb:s2007",
+        "ltstdb:s2024",
+        "ltstdb:s2030",
+        "ltstdb:s2043",
+        "ltstdb:s2061",
+        "ltstdb:s2065",
+        "ltstdb:s3068",
+        "ltstdb:s3072",
+        "ltstdb:s3079",
+        "ltstdb:s3080"
+      ]
+    },
+    "train": {
+      "subjects": [
+        "ltstdb:s2001",
+        "ltstdb:s2003",
+        "ltstdb:s2006",
+        "ltstdb:s2008",
+        "ltstdb:s2009",
+        "ltstdb:s2010",
+        "ltstdb:s2011",
+        "ltstdb:s2012",
+        "ltstdb:s2013",
+        "ltstdb:s2014",
+        "ltstdb:s2016",
+        "ltstdb:s2017",
+        "ltstdb:s2018",
+        "ltstdb:s2019",
+        "ltstdb:s2020",
+        "ltstdb:s2021",
+        "ltstdb:s2022",
+        "ltstdb:s2025",
+        "ltstdb:s2026",
+        "ltstdb:s2027",
+        "ltstdb:s2028",
+        "ltstdb:s2032",
+        "ltstdb:s2033",
+        "ltstdb:s2034",
+        "ltstdb:s2035",
+        "ltstdb:s2036",
+        "ltstdb:s2037",
+        "ltstdb:s2038",
+        "ltstdb:s2039",
+        "ltstdb:s2040",
+        "ltstdb:s2041",
+        "ltstdb:s2042",
+        "ltstdb:s2044",
+        "ltstdb:s2045",
+        "ltstdb:s2046",
+        "ltstdb:s2047",
+        "ltstdb:s2049",
+        "ltstdb:s2051",
+        "ltstdb:s2052",
+        "ltstdb:s2054",
+        "ltstdb:s2055",
+        "ltstdb:s2057",
+        "ltstdb:s2058",
+        "ltstdb:s2059",
+        "ltstdb:s2062",
+        "ltstdb:s2063",
+        "ltstdb:s2064",
+        "ltstdb:s3066",
+        "ltstdb:s3067",
+        "ltstdb:s3069",
+        "ltstdb:s3070",
+        "ltstdb:s3071",
+        "ltstdb:s3073",
+        "ltstdb:s3075",
+        "ltstdb:s3076",
+        "ltstdb:s3077"
+      ]
+    },
+    "validation": {
+      "subjects": [
+        "ltstdb:s2005",
+        "ltstdb:s2015",
+        "ltstdb:s2023",
+        "ltstdb:s2029",
+        "ltstdb:s2031",
+        "ltstdb:s2048",
+        "ltstdb:s2050",
+        "ltstdb:s2053",
+        "ltstdb:s2056",
+        "ltstdb:s2060",
+        "ltstdb:s3074",
+        "ltstdb:s3078"
+      ]
+    }
+  },
+  "protocol_version": "1",
+  "records_by_subject": {
+    "ltstdb:s2001": [
+      "s20011"
+    ],
+    "ltstdb:s2002": [
+      "s20021"
+    ],
+    "ltstdb:s2003": [
+      "s20031"
+    ],
+    "ltstdb:s2004": [
+      "s20041"
+    ],
+    "ltstdb:s2005": [
+      "s20051"
+    ],
+    "ltstdb:s2006": [
+      "s20061"
+    ],
+    "ltstdb:s2007": [
+      "s20071"
+    ],
+    "ltstdb:s2008": [
+      "s20081"
+    ],
+    "ltstdb:s2009": [
+      "s20091"
+    ],
+    "ltstdb:s2010": [
+      "s20101"
+    ],
+    "ltstdb:s2011": [
+      "s20111"
+    ],
+    "ltstdb:s2012": [
+      "s20121"
+    ],
+    "ltstdb:s2013": [
+      "s20131"
+    ],
+    "ltstdb:s2014": [
+      "s20141"
+    ],
+    "ltstdb:s2015": [
+      "s20151"
+    ],
+    "ltstdb:s2016": [
+      "s20161"
+    ],
+    "ltstdb:s2017": [
+      "s20171"
+    ],
+    "ltstdb:s2018": [
+      "s20181"
+    ],
+    "ltstdb:s2019": [
+      "s20191"
+    ],
+    "ltstdb:s2020": [
+      "s20201"
+    ],
+    "ltstdb:s2021": [
+      "s20211"
+    ],
+    "ltstdb:s2022": [
+      "s20221"
+    ],
+    "ltstdb:s2023": [
+      "s20231"
+    ],
+    "ltstdb:s2024": [
+      "s20241"
+    ],
+    "ltstdb:s2025": [
+      "s20251"
+    ],
+    "ltstdb:s2026": [
+      "s20261"
+    ],
+    "ltstdb:s2027": [
+      "s20271",
+      "s20272",
+      "s20273",
+      "s20274"
+    ],
+    "ltstdb:s2028": [
+      "s20281"
+    ],
+    "ltstdb:s2029": [
+      "s20291"
+    ],
+    "ltstdb:s2030": [
+      "s20301"
+    ],
+    "ltstdb:s2031": [
+      "s20311"
+    ],
+    "ltstdb:s2032": [
+      "s20321"
+    ],
+    "ltstdb:s2033": [
+      "s20331"
+    ],
+    "ltstdb:s2034": [
+      "s20341"
+    ],
+    "ltstdb:s2035": [
+      "s20351"
+    ],
+    "ltstdb:s2036": [
+      "s20361"
+    ],
+    "ltstdb:s2037": [
+      "s20371"
+    ],
+    "ltstdb:s2038": [
+      "s20381"
+    ],
+    "ltstdb:s2039": [
+      "s20391"
+    ],
+    "ltstdb:s2040": [
+      "s20401"
+    ],
+    "ltstdb:s2041": [
+      "s20411"
+    ],
+    "ltstdb:s2042": [
+      "s20421"
+    ],
+    "ltstdb:s2043": [
+      "s20431"
+    ],
+    "ltstdb:s2044": [
+      "s20441"
+    ],
+    "ltstdb:s2045": [
+      "s20451"
+    ],
+    "ltstdb:s2046": [
+      "s20461"
+    ],
+    "ltstdb:s2047": [
+      "s20471"
+    ],
+    "ltstdb:s2048": [
+      "s20481"
+    ],
+    "ltstdb:s2049": [
+      "s20491"
+    ],
+    "ltstdb:s2050": [
+      "s20501"
+    ],
+    "ltstdb:s2051": [
+      "s20511"
+    ],
+    "ltstdb:s2052": [
+      "s20521"
+    ],
+    "ltstdb:s2053": [
+      "s20531"
+    ],
+    "ltstdb:s2054": [
+      "s20541"
+    ],
+    "ltstdb:s2055": [
+      "s20551"
+    ],
+    "ltstdb:s2056": [
+      "s20561"
+    ],
+    "ltstdb:s2057": [
+      "s20571"
+    ],
+    "ltstdb:s2058": [
+      "s20581"
+    ],
+    "ltstdb:s2059": [
+      "s20591"
+    ],
+    "ltstdb:s2060": [
+      "s20601"
+    ],
+    "ltstdb:s2061": [
+      "s20611"
+    ],
+    "ltstdb:s2062": [
+      "s20621"
+    ],
+    "ltstdb:s2063": [
+      "s20631"
+    ],
+    "ltstdb:s2064": [
+      "s20641"
+    ],
+    "ltstdb:s2065": [
+      "s20651"
+    ],
+    "ltstdb:s3066": [
+      "s30661"
+    ],
+    "ltstdb:s3067": [
+      "s30671"
+    ],
+    "ltstdb:s3068": [
+      "s30681"
+    ],
+    "ltstdb:s3069": [
+      "s30691"
+    ],
+    "ltstdb:s3070": [
+      "s30701"
+    ],
+    "ltstdb:s3071": [
+      "s30711"
+    ],
+    "ltstdb:s3072": [
+      "s30721"
+    ],
+    "ltstdb:s3073": [
+      "s30731",
+      "s30732"
+    ],
+    "ltstdb:s3074": [
+      "s30741",
+      "s30742"
+    ],
+    "ltstdb:s3075": [
+      "s30751",
+      "s30752"
+    ],
+    "ltstdb:s3076": [
+      "s30761"
+    ],
+    "ltstdb:s3077": [
+      "s30771"
+    ],
+    "ltstdb:s3078": [
+      "s30781"
+    ],
+    "ltstdb:s3079": [
+      "s30791"
+    ],
+    "ltstdb:s3080": [
+      "s30801"
+    ]
+  },
+  "sealed_test_partition": true,
+  "seed": 2026,
+  "source_metadata_sha256": "4f61e2162b11bd4849542d77cbf05979367512fc6e343ca7aca3b3f5b9267aa9",
+  "split_sha256": "a1255294fb3a7509e880e0c75290958521edfc255b9099b73a85fffaf4e63093",
+  "window": {
+    "length_seconds": 10.0,
+    "stride_seconds": 5.0
+  }
+}

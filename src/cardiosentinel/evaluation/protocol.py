@@ -1,0 +1,24 @@
+"""Pre-specified constants for benchmark protocol V1."""
+
+from __future__ import annotations
+
+from typing import Final
+
+BENCHMARK_SCHEMA_VERSION: Final = "3.0"
+PROTOCOL_VERSION: Final = "1"
+LABEL_POLICY_VERSION: Final = "1"
+PRIMARY_DATASET: Final = "ltstdb"
+PRIMARY_DATASET_VERSION: Final = "1.0.0"
+PRIMARY_ANNOTATION_DEFINITION: Final = "ltstdb.stb"
+PRIMARY_WINDOW_SECONDS: Final = 10.0
+PRIMARY_STRIDE_SECONDS: Final = 5.0
+MARKER_VICINITY_SECONDS: Final = 30.0
+DEFAULT_SEED: Final = 2026
+TRAIN_NEGATIVE_RATIO: Final = 3
+NO_POSITIVE_SUBJECT_NEGATIVE_CAP: Final = 30
+BOOTSTRAP_REPLICATES: Final = 1000
+BOOTSTRAP_SEED: Final = 2026
+
+LTSTDB_V1_SPLIT_SHA256: Final = (
+    "a1255294fb3a7509e880e0c75290958521edfc255b9099b73a85fffaf4e63093"
+)

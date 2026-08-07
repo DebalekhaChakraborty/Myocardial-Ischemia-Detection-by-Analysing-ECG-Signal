@@ -14,6 +14,7 @@ from cardiosentinel.data.models import (
     DatasetRecord,
     ParsedAnnotations,
     SignalQualityInterval,
+    SourceCensoredInterval,
     STEvent,
 )
 
@@ -134,6 +135,7 @@ def parse_annotations(
     events: list[STEvent] = []
     markers: list[AnnotationMarker] = []
     intervals: list[SignalQualityInterval] = []
+    censored_intervals: list[SourceCensoredInterval] = []
     open_events: dict[tuple[int, str], list[AnnotationSample]] = {}
     left_censored_peaks: dict[tuple[int, str], AnnotationSample] = {}
     open_unreadable: dict[int, AnnotationSample] = {}
@@ -189,6 +191,18 @@ def parse_annotations(
             if sequence is None or len(sequence) != 2:
                 left_censored_peak = left_censored_peaks.pop(key, None)
                 if left_censored_peak is not None:
+                    censored_intervals.append(
+                        SourceCensoredInterval(
+                            record.record_id,
+                            record.subject_id,
+                            key[0],
+                            0,
+                            annotation.sample,
+                            f"left_censored_{key[1]}_episode",
+                            annotation_set,
+                            (left_censored_peak, annotation),
+                        )
+                    )
                     warnings.append(
                         f"{record.record_id} has a left-censored LTSTDB {key[1]} "
                         f"episode on lead {key[0]} ending at {annotation.sample}."
@@ -304,12 +318,40 @@ def parse_annotations(
         warnings.append(
             f"{record.record_id} ends with source-censored LTSTDB annotations."
         )
+    for (lead, subtype), sequence in sorted(open_events.items()):
+        onset = sequence[0]
+        censored_intervals.append(
+            SourceCensoredInterval(
+                record.record_id,
+                record.subject_id,
+                lead,
+                onset.sample,
+                record.sample_count,
+                f"right_censored_{subtype}_episode",
+                annotation_set,
+                tuple(sequence),
+            )
+        )
+    for lead, onset in sorted(open_unreadable.items()):
+        censored_intervals.append(
+            SourceCensoredInterval(
+                record.record_id,
+                record.subject_id,
+                lead,
+                onset.sample,
+                record.sample_count,
+                "right_censored_unreadable_interval",
+                annotation_set,
+                (onset,),
+            )
+        )
     return ParsedAnnotations(
         tuple(events),
         tuple(intervals),
         tuple(markers),
         classifications,
         tuple(warnings),
+        tuple(censored_intervals),
     )
 
 

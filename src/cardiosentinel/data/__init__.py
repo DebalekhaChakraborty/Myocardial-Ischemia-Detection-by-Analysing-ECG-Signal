@@ -3,7 +3,13 @@
 from cardiosentinel.data.models import (
     DatasetRecord,
     SignalQualityInterval,
+    SourceCensoredInterval,
     STEvent,
 )
 
-__all__ = ["DatasetRecord", "STEvent", "SignalQualityInterval"]
+__all__ = [
+    "DatasetRecord",
+    "STEvent",
+    "SignalQualityInterval",
+    "SourceCensoredInterval",
+]

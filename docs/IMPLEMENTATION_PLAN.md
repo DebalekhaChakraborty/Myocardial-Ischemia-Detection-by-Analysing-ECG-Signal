@@ -12,8 +12,9 @@ contract.
    integration validation complete. Includes physical-unit loading, raw and
    optional stateful SOS profiles, causal windows, descriptive quality metrics,
    response audits, and provenance.
-3. **Reproducible baselines:** non-neural and simple learned baselines with
-   subject-wise evaluation.
+3. **Reproducible baselines:** Phase 3A benchmark protocol, frozen subject split,
+   leakage-safe window targets, sampling policy, and metrics protocol complete.
+   Non-neural and simple learned baselines remain pending Phase 3B.
 4. **Patient-adaptive memory:** contamination-safe short- and long-term baseline
    mechanisms.
 5. **Physiology-guided model:** justified fusion of ECG representations and ST-T

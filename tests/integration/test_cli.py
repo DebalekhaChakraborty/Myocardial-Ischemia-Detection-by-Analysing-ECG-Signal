@@ -35,6 +35,20 @@ def test_signal_cli_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "filter-audit" in output
 
 
+def test_benchmark_cli_help_has_no_training_command(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(SystemExit) as result:
+        main(["benchmark", "--help"])
+
+    assert result.value.code == 0
+    output = capsys.readouterr().out
+    assert "summarize" in output
+    assert "validate-split" in output
+    assert "split-info" in output
+    assert "\n    train " not in output
+
+
 def test_raw_filter_audit_is_machine_readable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

@@ -22,6 +22,13 @@ dataset and annotation provenance, split-manifest digest, command, and timing.
 The test partition is fixed before model selection and never changes during a
 study.
 
+For benchmark protocol V1, `sealed_test_partition = true`. The committed test
+subject list and canonical split hash are immutable after any model result is
+observed. Poor performance, unexpected prevalence, hyperparameter or calibration
+behavior, and presentation preferences are never reasons to alter it. A change
+requires a new versioned benchmark protocol, a new split hash, and a documented
+scientific justification; it must not silently replace V1.
+
 Use subject-wise partitions. Use deterministic execution where technically
 possible and explicitly record exceptions. Report calibration metrics before
 confidence-driven routing. Report window and episode metrics separately,
@@ -29,4 +36,3 @@ including false alarms per hour and event-onset delay when applicable.
 
 Every novelty claim requires error analysis and ablation evidence. Preserve
 predictions and artefacts outside Git according to dataset access conditions.
-

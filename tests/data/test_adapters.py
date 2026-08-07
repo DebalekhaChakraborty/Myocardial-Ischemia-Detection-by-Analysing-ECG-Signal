@@ -215,6 +215,26 @@ def test_ltstdb_left_censored_peak_and_end_are_warned_not_fabricated() -> None:
     )
     assert parsed.events == ()
     assert "left-censored" in parsed.warnings[0]
+    censored = parsed.source_censored_intervals[0]
+    assert censored.start_sample == 0
+    assert censored.end_sample == 20
+    assert censored.reason == "left_censored_ischemic_episode"
+
+
+def test_ltstdb_right_censored_event_preserves_unknown_region() -> None:
+    parsed = ltstdb.parse_annotations(
+        synthetic_record("ltstdb", 2),
+        (
+            AnnotationSample(100, "s", aux_note="(st0-100"),
+            AnnotationSample(200, "s", aux_note="ast0-200"),
+        ),
+        "stb",
+    )
+    assert parsed.events == ()
+    censored = parsed.source_censored_intervals[0]
+    assert censored.start_sample == 100
+    assert censored.end_sample == 10_000
+    assert censored.reason == "right_censored_ischemic_episode"
 
 
 def test_ltstdb_unmatched_peak_remains_a_blocking_error() -> None:

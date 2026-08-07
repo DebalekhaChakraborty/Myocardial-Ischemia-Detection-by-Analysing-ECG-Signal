@@ -22,8 +22,8 @@ def test_base_configuration_loads() -> None:
     assert config.preprocessing.highpass.enabled is False
     assert config.preprocessing.lowpass.enabled is False
     assert config.preprocessing.notch.enabled is False
-    assert config.windowing.length_seconds is None
-    assert config.windowing.stride_seconds is None
+    assert config.windowing.length_seconds == 10.0
+    assert config.windowing.stride_seconds == 5.0
 
 
 def test_invalid_sampling_frequency_is_rejected(tmp_path: Path) -> None:
@@ -70,7 +70,10 @@ def test_st_preserving_configuration_rejects_aggressive_highpass(
 def test_window_length_and_stride_must_be_set_together(tmp_path: Path) -> None:
     invalid_config = tmp_path / "invalid.yaml"
     invalid_config.write_text(
-        f"extends: {DEFAULT_CONFIG_PATH}\nwindowing:\n  length_seconds: 10\n",
+        f"extends: {DEFAULT_CONFIG_PATH}\n"
+        "windowing:\n"
+        "  length_seconds: 10\n"
+        "  stride_seconds: null\n",
         encoding="utf-8",
     )
 

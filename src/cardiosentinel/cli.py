@@ -85,6 +85,33 @@ def build_parser() -> argparse.ArgumentParser:
         "filter-audit", help="Print causal filter coefficients and response as JSON."
     )
     audit_parser.add_argument("--sampling-frequency-hz", type=float, required=True)
+    benchmark_parser = subparsers.add_parser(
+        "benchmark", help="Generate and validate frozen benchmark metadata."
+    )
+    benchmark_commands = benchmark_parser.add_subparsers(
+        dest="benchmark_command", required=True
+    )
+    summarize_parser = benchmark_commands.add_parser(
+        "summarize", help="Aggregate deterministic window targets without training."
+    )
+    summarize_parser.add_argument("--dataset", choices=("ltstdb", "edb"), required=True)
+    summarize_parser.add_argument("--annotation-set")
+    summarize_parser.add_argument("--source", type=Path)
+    summarize_parser.add_argument("--split", type=Path)
+    summarize_parser.add_argument("--output", type=Path)
+    generate_parser = benchmark_commands.add_parser(
+        "generate-split", help="Generate the pre-model LTSTDB V1 subject split."
+    )
+    generate_parser.add_argument("--source", type=Path)
+    generate_parser.add_argument("--output", type=Path, required=True)
+    validate_parser = benchmark_commands.add_parser(
+        "validate-split", help="Validate split integrity and its canonical hash."
+    )
+    validate_parser.add_argument("--split", type=Path, required=True)
+    info_parser = benchmark_commands.add_parser(
+        "split-info", help="Print frozen split counts and identity."
+    )
+    info_parser.add_argument("--split", type=Path, required=True)
     return parser
 
 
@@ -177,6 +204,75 @@ def main(argv: Sequence[str] | None = None) -> int:
                 sort_keys=True,
             )
         )
+        return 0
+
+    if args.command == "benchmark":
+        from cardiosentinel.data.provenance import git_provenance
+        from cardiosentinel.evaluation.benchmark import (
+            REPOSITORY_ROOT,
+            load_benchmark_metadata,
+            summarize_from_sources,
+        )
+        from cardiosentinel.evaluation.protocol import (
+            DEFAULT_SEED,
+            LTSTDB_V1_SPLIT_SHA256,
+        )
+        from cardiosentinel.evaluation.splits import (
+            generate_split_manifest,
+            load_split_manifest,
+            validate_split_manifest,
+            write_json,
+        )
+
+        if args.benchmark_command == "generate-split":
+            records, parsed = load_benchmark_metadata("ltstdb", "stb", args.source)
+            git_sha = git_provenance(REPOSITORY_ROOT)["git_sha"]
+            manifest = generate_split_manifest(
+                records, parsed, str(git_sha), seed=DEFAULT_SEED
+            )
+            write_json(args.output, manifest)
+            print(f"Split: {args.output}")
+            print(f"SHA-256: {manifest['split_sha256']}")
+            return 0
+        if args.benchmark_command in {"validate-split", "split-info"}:
+            manifest = load_split_manifest(args.split)
+            validate_split_manifest(
+                manifest,
+                expected_hash=LTSTDB_V1_SPLIT_SHA256,
+                expected_subject_count=80,
+                expected_record_count=86,
+            )
+            if args.benchmark_command == "validate-split":
+                print("Validation: passed")
+                print(f"SHA-256: {manifest['split_sha256']}")
+            else:
+                payload = {
+                    "dataset": manifest["dataset"],
+                    "annotation_definition": manifest["annotation_definition"],
+                    "sealed_test_partition": manifest["sealed_test_partition"],
+                    "split_sha256": manifest["split_sha256"],
+                    "partition_summaries": manifest["partition_summaries"],
+                }
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            return 0
+        split_path = args.split
+        if args.dataset == "ltstdb" and split_path is None:
+            from cardiosentinel.evaluation.benchmark import DEFAULT_SPLIT_PATH
+
+            split_path = DEFAULT_SPLIT_PATH
+        command = "cardiosentinel benchmark summarize"
+        summary = summarize_from_sources(
+            args.dataset,
+            args.annotation_set,
+            split_path,
+            args.source,
+            command,
+        )
+        if args.output:
+            write_json(args.output, summary)
+            print(f"Summary: {args.output}")
+        else:
+            print(json.dumps(summary, indent=2, sort_keys=True))
         return 0
 
     parser.print_help()
