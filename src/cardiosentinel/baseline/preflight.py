@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from cardiosentinel.baseline.cache import FEATURE_MANIFEST_NAME, read_json
+from cardiosentinel.baseline.source import source_checksum_receipt_is_valid
 from cardiosentinel.data.provenance import sha256_file
 from cardiosentinel.evaluation.protocol import LTSTDB_V1_SPLIT_SHA256
 from cardiosentinel.evaluation.splits import (
@@ -156,9 +157,15 @@ def baseline_preflight(
     disk = shutil.disk_usage(_nearest_existing(feature_root))
     selected_rows = PRIMARY_COUNTS["train"]["ischemic_positive"] * 4
     source_data = _source_presence(source, expected)
+    source_present = source_data["complete_record_count"] == len(expected)
+    source_checksum_verified = source_checksum_receipt_is_valid(source, expected)
     blocking_reasons = []
-    if source_data["complete_record_count"] != len(expected):
+    if not source_present:
         blocking_reasons.append("Pinned LTSTDB source data is incomplete.")
+    if not source_checksum_verified:
+        blocking_reasons.append(
+            "Pinned LTSTDB source checksum verification is absent or invalid."
+        )
     return {
         "cpu_count": os.cpu_count(),
         "requested_workers": workers,
@@ -166,6 +173,8 @@ def baseline_preflight(
         "feature_root": str(feature_root),
         "expected_record_count": len(expected),
         "source_data": source_data,
+        "source_present": source_present,
+        "source_checksum_verified": source_checksum_verified,
         "feature_cache": _cache_presence(feature_root, expected),
         "expected_primary_benchmark_counts": PRIMARY_COUNTS,
         "conservative_memory_estimates": {

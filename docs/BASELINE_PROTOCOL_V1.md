@@ -142,17 +142,25 @@ test predictions, the experiment lock, metrics, challenge/context reports, and
 `RESULTS_SUMMARY.json`. Predictions are derived physiological research data.
 No waveform, cache, prediction, checkpoint, or run artifact is committed.
 
-The pinned acquisition is explicit and resumable through `wget --continue`:
+The pinned acquisition is explicit and resumable through `wget --continue`. It
+downloads only `SHA256SUMS.txt`, `RECORDS`, and the frozen benchmark records'
+`.hea`, `.dat`, and `.stb` files. Before full materialization,
+`verify-source` requires the local manifest to match PhysioNet's pinned V1
+manifest hash, verifies all required source bytes, validates the `RECORDS` set,
+and writes an external `source_verification.json` receipt.
 
 ```bash
 python -m cardiosentinel baseline acquire \
   --destination /external/data/ltstdb/1.0.0
 python -m cardiosentinel baseline acquire \
   --destination /external/data/ltstdb/1.0.0 --execute
+
+python -m cardiosentinel baseline verify-source \
+  --source /external/data/ltstdb/1.0.0
 ```
 
-The first command reports the source, destination, resumable `wget` command,
-and available disk without downloading. Full acquisition occurs only with
+The first command reports the source, destination, exact pinned file count, and
+available disk without downloading. Full acquisition occurs only with
 `--execute`; import, tests, and help never initiate it.
 
 ## Execution stages
@@ -184,7 +192,8 @@ python -m cardiosentinel baseline evaluate-test \
 Materialization defaults to one worker. Preflight reports host CPU and disk,
 source/cache readiness, frozen counts, conservative matrix-memory estimates,
 and an engineering-only projected runtime. It does not read waveform samples,
-load sealed-test features, or train models.
+load sealed-test features, or train models. It blocks full execution unless all
+86 source records are present and the matching official checksum receipt exists.
 
 EDB performance is outside this phase. B4 belongs to Phase 3B-2 and is not
 implemented here.

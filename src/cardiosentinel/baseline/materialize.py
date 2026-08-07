@@ -22,6 +22,7 @@ from cardiosentinel.baseline.cache import (
     write_feature_table_atomic,
     write_json_atomic,
 )
+from cardiosentinel.baseline.source import verify_pinned_source
 from cardiosentinel.data.manifest import inspect_dataset
 from cardiosentinel.data.models import DatasetRecord, ParsedAnnotations
 from cardiosentinel.data.provenance import git_provenance, sha256_file
@@ -361,6 +362,21 @@ def materialize_features(
         expected_subject_count=80,
         expected_record_count=86,
     )
+    expected_record_ids = {
+        record_id
+        for subject_records in split["records_by_subject"].values()
+        for record_id in subject_records
+    }
+    requested = None if records is None else set(records)
+    unknown = set() if requested is None else requested - expected_record_ids
+    if unknown:
+        raise ValueError(
+            f"Requested records are not in frozen LTSTDB V1: {sorted(unknown)}"
+        )
+    if len(expected_record_ids) == 86 and (
+        requested is None or requested == expected_record_ids
+    ):
+        verify_pinned_source(source, expected_record_ids)
     all_records, all_parsed = inspect_dataset("ltstdb", source, "stb")
     validate_split_manifest(
         split,
@@ -369,16 +385,6 @@ def materialize_features(
         expected_subject_count=80,
         expected_record_count=86,
     )
-    requested = None if records is None else set(records)
-    unknown = (
-        set()
-        if requested is None
-        else requested - {record.record_id for record in all_records}
-    )
-    if unknown:
-        raise ValueError(
-            f"Requested records are not in frozen LTSTDB V1: {sorted(unknown)}"
-        )
     partition_by_subject = _partition_map(split)
     provenance = git_provenance(REPOSITORY_ROOT)
     root.mkdir(parents=True, exist_ok=True)
@@ -466,11 +472,6 @@ def materialize_features(
         )
     if not manifest_path.is_file():
         raise ValueError("No records were selected for materialization.")
-    expected_record_ids = {
-        record_id
-        for subject_records in split["records_by_subject"].values()
-        for record_id in subject_records
-    }
     completed_ids = {
         item["record_id"]
         for item in json.loads(manifest_path.read_text(encoding="utf-8"))["records"]

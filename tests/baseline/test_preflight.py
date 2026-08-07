@@ -26,8 +26,13 @@ def test_preflight_reports_frozen_counts_and_resource_estimates(
     assert report["expected_record_count"] == 86
     assert report["requested_workers"] == 2
     assert report["source_data"]["complete_record_count"] == 0
+    assert report["source_present"] is False
+    assert report["source_checksum_verified"] is False
     assert report["blocks_execution"] is True
-    assert report["blocking_reasons"] == ["Pinned LTSTDB source data is incomplete."]
+    assert report["blocking_reasons"] == [
+        "Pinned LTSTDB source data is incomplete.",
+        "Pinned LTSTDB source checksum verification is absent or invalid.",
+    ]
     assert report["feature_cache"]["digest_valid_resumable_records"] == 0
     assert report["expected_primary_benchmark_counts"]["train"] == {
         "ischemic_positive": 93_613,

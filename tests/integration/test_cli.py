@@ -58,6 +58,7 @@ def test_baseline_cli_help_exposes_separate_test_stage(
     assert result.value.code == 0
     output = capsys.readouterr().out
     assert "materialize" in output
+    assert "verify-source" in output
     assert "preflight" in output
     assert "smoke-remote" in output
     assert "fit" in output
