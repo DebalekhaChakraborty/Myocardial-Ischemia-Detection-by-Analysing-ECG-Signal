@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import Final
 
 from cardiosentinel.data import edb
-from cardiosentinel.evaluation.models import CrossDatasetProvenance
+from cardiosentinel.evaluation.models import (
+    CrossDatasetProvenance,
+    EDBSecondaryCohort,
+    EDBSecondaryCohortName,
+)
 
 _PHYSIONET_LTSTDB = "https://physionet.org/content/ltstdb/1.0.0/"
 _PISA_SOURCE = "Pisa group collection used in the European ST-T Database"
@@ -59,3 +63,51 @@ def conservative_edb_overlap_exclusions() -> tuple[str, ...]:
         for record_id in edb.EDB_RECORD_IDS
         if edb.subject_id_for_record(record_id) in affected_subjects
     )
+
+
+def edb_secondary_cohort(name: EDBSecondaryCohortName) -> EDBSecondaryCohort:
+    """Return an explicit descriptive or overlap-clean secondary EDB cohort."""
+    exclusions = conservative_edb_overlap_exclusions()
+    if name == "full":
+        return EDBSecondaryCohort(
+            name=name,
+            record_ids=tuple(edb.EDB_RECORD_IDS),
+            known_overlap_record_ids=exclusions,
+            contains_known_source_overlap=True,
+        )
+    if name == "overlap_clean":
+        excluded = set(exclusions)
+        return EDBSecondaryCohort(
+            name=name,
+            record_ids=tuple(
+                record_id
+                for record_id in edb.EDB_RECORD_IDS
+                if record_id not in excluded
+            ),
+            known_overlap_record_ids=exclusions,
+            contains_known_source_overlap=False,
+        )
+    raise ValueError(f"Unknown EDB secondary cohort: {name}")
+
+
+def recommended_edb_secondary_cohort(
+    training_datasets: tuple[str, ...],
+) -> EDBSecondaryCohort:
+    """Require overlap-clean EDB evaluation after any LTSTDB model training."""
+    normalized = {dataset.lower() for dataset in training_datasets}
+    name: EDBSecondaryCohortName = (
+        "overlap_clean" if "ltstdb" in normalized else "full"
+    )
+    return edb_secondary_cohort(name)
+
+
+def validate_edb_secondary_evaluation_policy(
+    cohort_name: EDBSecondaryCohortName,
+    training_datasets: tuple[str, ...],
+) -> None:
+    """Reject known-overlap EDB evaluation for models trained with LTSTDB."""
+    recommended = recommended_edb_secondary_cohort(training_datasets)
+    if recommended.name == "overlap_clean" and cohort_name != "overlap_clean":
+        raise ValueError(
+            "LTSTDB-trained models must use the overlap-clean EDB secondary cohort."
+        )

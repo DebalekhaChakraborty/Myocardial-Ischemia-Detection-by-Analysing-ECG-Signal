@@ -4,8 +4,16 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterable, Sequence
+from typing import Literal
 
+from cardiosentinel.evaluation.models import WindowTarget
 from cardiosentinel.evaluation.protocol import BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED
+
+ChallengeFamily = Literal[
+    "rate_related_confounder",
+    "axis_shift_confounder",
+    "conduction_change_confounder",
+]
 
 
 def subject_bootstrap_plan(
@@ -54,3 +62,55 @@ def select_validation_f1_threshold(
         return 0.0 if denominator == 0 else 2 * true_positive / denominator
 
     return max(candidates, key=lambda threshold: (f1(threshold), threshold))
+
+
+def challenge_false_positive_rate(
+    targets: Sequence[WindowTarget],
+    scores: Sequence[float],
+    threshold: float,
+    challenge_family: ChallengeFamily,
+) -> float | None:
+    """Compute FPR over one explicitly non-ischemic challenge family only."""
+    if len(targets) != len(scores):
+        raise ValueError("Challenge targets and scores must be aligned.")
+    selected_scores = tuple(
+        float(score)
+        for target, score in zip(targets, scores, strict=True)
+        if target.target_family == challenge_family
+        and target.eligible_for_confounder_evaluation
+    )
+    if not selected_scores:
+        return None
+    return sum(score >= threshold for score in selected_scores) / len(selected_scores)
+
+
+def ischemic_positive_context_strata(
+    targets: Iterable[WindowTarget],
+) -> dict[str, tuple[WindowTarget, ...]]:
+    """Return overlapping descriptive strata without creating disease classes."""
+    positives = tuple(
+        target for target in targets if target.target_family == "ischemic_positive"
+    )
+    return {
+        "no_axis_or_conduction_context": tuple(
+            target
+            for target in positives
+            if "axis_shift_context" not in target.context_flags
+            and "conduction_change_context" not in target.context_flags
+        ),
+        "axis_shift_context": tuple(
+            target
+            for target in positives
+            if "axis_shift_context" in target.context_flags
+        ),
+        "conduction_change_context": tuple(
+            target
+            for target in positives
+            if "conduction_change_context" in target.context_flags
+        ),
+        "point_noise_context": tuple(
+            target
+            for target in positives
+            if "point_noise_context" in target.context_flags
+        ),
+    }

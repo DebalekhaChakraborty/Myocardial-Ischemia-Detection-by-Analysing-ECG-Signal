@@ -83,6 +83,14 @@ def target_at(
     )
 
 
+def marker(subtype: str, sample: int = 1_500) -> AnnotationMarker:
+    raw = AnnotationSample(sample, "s", aux_note="SYNTHETIC")
+    category = "noise" if subtype == "point_noise" else "st_shift"
+    return AnnotationMarker(
+        "s00001", "ltstdb:s0000", 0, sample, category, subtype, "stb", raw
+    )
+
+
 def test_positive_requires_full_containment_and_boundary_is_ambiguous() -> None:
     ischemic = event("ischemic", 500, 2_500)
     positive = target_at(1_000, events=(ischemic,))
@@ -132,25 +140,42 @@ def test_edb_reference_and_apparent_st_events_map_to_compatible_states() -> None
 
 
 def test_marker_vicinities_are_challenges_not_invented_episode_durations() -> None:
-    raw = AnnotationSample(1_500, "s", aux_note="SYNTHETIC")
-    axis = AnnotationMarker(
-        "s00001", "ltstdb:s0000", 0, 1_500, "st_shift", "axis_related", "stb", raw
+    axis = marker("axis_related")
+    conduction = marker("conduction_related")
+    axis_target = target_at(1_000, markers=(axis,))
+    conduction_target = target_at(1_000, markers=(conduction,))
+    assert axis_target.target_family == "axis_shift_confounder"
+    assert axis_target.context_flags == ("axis_shift_context",)
+    assert conduction_target.target_family == "conduction_change_confounder"
+    assert conduction_target.context_flags == ("conduction_change_context",)
+
+
+def test_ischemic_positive_retains_axis_and_conduction_context() -> None:
+    ischemic = event("ischemic", 500, 2_500)
+    axis = target_at(1_000, events=(ischemic,), markers=(marker("axis_related"),))
+    conduction = target_at(
+        1_000, events=(ischemic,), markers=(marker("conduction_related"),)
     )
-    conduction = AnnotationMarker(
-        "s00001",
-        "ltstdb:s0000",
-        0,
-        1_500,
-        "st_shift",
-        "conduction_related",
-        "stb",
-        raw,
-    )
-    assert target_at(1_000, markers=(axis,)).target_family == "axis_shift_confounder"
-    assert (
-        target_at(1_000, markers=(conduction,)).target_family
-        == "conduction_change_confounder"
-    )
+    assert axis.target_family == "ischemic_positive"
+    assert axis.context_flags == ("axis_shift_context",)
+    assert conduction.target_family == "ischemic_positive"
+    assert conduction.context_flags == ("conduction_change_context",)
+    assert axis.eligible_for_confounder_evaluation is False
+    assert conduction.eligible_for_confounder_evaluation is False
+    assert axis.overlapping_marker_ids
+    assert conduction.overlapping_marker_ids
+
+
+def test_point_noise_context_is_retained_without_an_invented_interval() -> None:
+    point_noise = marker("point_noise")
+    target = target_at(1_000, markers=(point_noise,))
+    assert target.target_family == "background_negative"
+    assert target.context_flags == ("point_noise_context",)
+    assert target.overlapping_marker_ids
+    assert target.exclusion_reason is None
+
+    outside_window = target_at(0, markers=(point_noise,))
+    assert outside_window.context_flags == ()
 
 
 def test_unreadable_and_source_censored_regions_are_ineligible() -> None:

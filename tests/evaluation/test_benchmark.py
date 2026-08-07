@@ -1,13 +1,14 @@
 """SYNTHETIC aggregate benchmark provenance and validator tests."""
 
 from cardiosentinel.data.models import (
+    AnnotationMarker,
     AnnotationSample,
     DatasetRecord,
     ParsedAnnotations,
     STEvent,
 )
 from cardiosentinel.evaluation.benchmark import summarize_benchmark
-from cardiosentinel.evaluation.splits import split_sha256
+from cardiosentinel.evaluation.splits import generator_code_sha256, split_sha256
 
 
 def synthetic_record(index: int) -> DatasetRecord:
@@ -20,8 +21,8 @@ def synthetic_record(index: int) -> DatasetRecord:
         ("I",),
         ("I",),
         1,
-        300,
-        30.0,
+        1_000,
+        100.0,
         "SYNTHETIC",
     )
 
@@ -35,12 +36,12 @@ def synthetic_annotations(record: DatasetRecord) -> ParsedAnnotations:
         0,
         "st_episode",
         "ischemic",
-        0,
-        150,
+        200,
         300,
-        0.0,
-        15.0,
+        400,
+        20.0,
         30.0,
+        40.0,
         100.0,
         "elevation",
         "stb",
@@ -48,7 +49,17 @@ def synthetic_annotations(record: DatasetRecord) -> ParsedAnnotations:
         True,
         (raw,),
     )
-    return ParsedAnnotations((event,), (), ())
+    marker = AnnotationMarker(
+        record.record_id,
+        record.subject_id,
+        0,
+        800,
+        "st_shift",
+        "conduction_related",
+        "stb",
+        raw,
+    )
+    return ParsedAnnotations((event,), (), (marker,))
 
 
 def synthetic_split(records: tuple[DatasetRecord, ...]) -> dict[str, object]:
@@ -58,6 +69,10 @@ def synthetic_split(records: tuple[DatasetRecord, ...]) -> dict[str, object]:
         "dataset_version": "1.0.0",
         "annotation_definition": "ltstdb.stb",
         "sealed_test_partition": True,
+        "generation_git_sha": "synthetic-sha",
+        "generation_git_dirty": False,
+        "generator_code_sha256": generator_code_sha256(),
+        "source_metadata_sha256": "synthetic-source-sha",
         "partitions": {
             "train": {"subjects": [records[0].subject_id]},
             "validation": {"subjects": [records[1].subject_id]},
@@ -89,6 +104,14 @@ def test_summary_has_protocol_provenance_and_all_partitions() -> None:
     assert set(summary["partitions"]) == {"train", "validation", "test"}
     assert all(
         bucket["window_counts"]["ischemic_positive"] > 0
+        for bucket in summary["partitions"].values()
+    )
+    assert all(
+        bucket["primary_composition"]["background_windows"] > 0
+        for bucket in summary["partitions"].values()
+    )
+    assert all(
+        bucket["target_subject_counts"]["conduction_change_confounder"] == 1
         for bucket in summary["partitions"].values()
     )
     provenance = summary["provenance"]

@@ -25,10 +25,15 @@ from cardiosentinel.evaluation.protocol import (
 
 PARTITIONS = ("train", "validation", "test")
 SPLIT_FRACTIONS = {"train": 0.70, "validation": 0.15, "test": 0.15}
+GENERATOR_SOURCE_PATHS = (
+    "src/cardiosentinel/evaluation/models.py",
+    "src/cardiosentinel/evaluation/splits.py",
+)
 ASSIGNMENT_ALGORITHM = (
     "deterministic greedy subject-level burden balancing over record count, "
     "recording duration, .stb ischemic episode count/duration, rate-related "
-    "episode count/duration, and channel count; exact 70/15/15 capacities; "
+    "episode count/duration, channel count, axis-shift marker count/presence, "
+    "and conduction-change marker count/presence; exact 70/15/15 capacities; "
     "deterministic improving pairwise-swap refinement; SHA-256 seed tie-breaking"
 )
 
@@ -39,6 +44,34 @@ def canonical_json(value: object) -> str:
 
 def sha256_canonical(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("ascii")).hexdigest()
+
+
+def generator_code_sha256(repository_root: Path | None = None) -> str:
+    """Hash stable assignment sources and configuration in deterministic order."""
+    root = repository_root or Path(__file__).resolve().parents[3]
+    source_payload = []
+    for relative_path in GENERATOR_SOURCE_PATHS:
+        content = (root / relative_path).read_text(encoding="utf-8")
+        source_payload.append(
+            {
+                "path": relative_path,
+                "content": content.replace("\r\n", "\n").replace("\r", "\n"),
+            }
+        )
+    payload = {
+        "sources": source_payload,
+        "assignment_configuration": {
+            "partitions": PARTITIONS,
+            "split_fractions": SPLIT_FRACTIONS,
+            "default_seed": DEFAULT_SEED,
+            "primary_dataset": PRIMARY_DATASET,
+            "primary_dataset_version": PRIMARY_DATASET_VERSION,
+            "primary_annotation_definition": PRIMARY_ANNOTATION_DEFINITION,
+            "axis_marker_subtype": "axis_related",
+            "conduction_marker_subtype": "conduction_related",
+        },
+    }
+    return sha256_canonical(payload)
 
 
 def build_subject_burdens(
@@ -58,11 +91,15 @@ def build_subject_burdens(
             "rate_related_episode_count": 0,
             "rate_related_episode_seconds": 0.0,
             "signal_channel_count": 0,
+            "axis_shift_marker_count": 0,
+            "conduction_change_marker_count": 0,
         }
     )
     for record, parsed_item in zip(records, parsed, strict=True):
         if any(event.record_id != record.record_id for event in parsed_item.events):
             raise ValueError("Parsed events do not match their record metadata.")
+        if any(marker.record_id != record.record_id for marker in parsed_item.markers):
+            raise ValueError("Parsed markers do not match their record metadata.")
         bucket = by_subject[record.subject_id]
         bucket["records"].append(record.record_id)
         bucket["recording_seconds"] += record.duration_seconds
@@ -75,6 +112,11 @@ def build_subject_burdens(
             elif event.event_subtype == "heart_rate_related":
                 bucket["rate_related_episode_count"] += 1
                 bucket["rate_related_episode_seconds"] += duration
+        for marker in parsed_item.markers:
+            if marker.subtype == "axis_related":
+                bucket["axis_shift_marker_count"] += 1
+            elif marker.subtype == "conduction_related":
+                bucket["conduction_change_marker_count"] += 1
     return tuple(
         SubjectBurden(
             subject_id=subject,
@@ -87,6 +129,10 @@ def build_subject_burdens(
                 bucket["rate_related_episode_seconds"], 9
             ),
             signal_channel_count=bucket["signal_channel_count"],
+            axis_shift_marker_count=bucket["axis_shift_marker_count"],
+            conduction_change_marker_count=bucket[
+                "conduction_change_marker_count"
+            ],
         )
         for subject, bucket in sorted(by_subject.items())
     )
@@ -120,6 +166,10 @@ def _feature_values(burden: SubjectBurden) -> tuple[float, ...]:
         float(burden.rate_related_episode_count),
         burden.rate_related_episode_seconds,
         float(burden.signal_channel_count),
+        float(burden.axis_shift_marker_count),
+        float(burden.axis_shift_marker_count > 0),
+        float(burden.conduction_change_marker_count),
+        float(burden.conduction_change_marker_count > 0),
     )
 
 
@@ -297,6 +347,7 @@ def generate_split_manifest(
     records: Iterable[DatasetRecord],
     parsed: Iterable[ParsedAnnotations],
     generation_git_sha: str,
+    generation_git_dirty: bool,
     seed: int = DEFAULT_SEED,
 ) -> dict[str, object]:
     records = tuple(records)
@@ -327,6 +378,18 @@ def generate_split_manifest(
             ),
             "rate_related_episode_seconds": round(
                 sum(item.rate_related_episode_seconds for item in selected), 9
+            ),
+            "axis_shift_marker_count": sum(
+                item.axis_shift_marker_count for item in selected
+            ),
+            "axis_shift_subject_count": sum(
+                item.axis_shift_marker_count > 0 for item in selected
+            ),
+            "conduction_change_marker_count": sum(
+                item.conduction_change_marker_count for item in selected
+            ),
+            "conduction_change_subject_count": sum(
+                item.conduction_change_marker_count > 0 for item in selected
             ),
         }
     source_payload = {
@@ -361,6 +424,8 @@ def generate_split_manifest(
         "records_by_subject": records_by_subject,
         "partition_summaries": partition_summaries,
         "generation_git_sha": generation_git_sha,
+        "generation_git_dirty": generation_git_dirty,
+        "generator_code_sha256": generator_code_sha256(),
         "source_metadata_sha256": sha256_canonical(source_payload),
     }
     manifest["split_sha256"] = split_sha256(manifest)
@@ -384,6 +449,14 @@ def validate_split_manifest(
         raise ValueError("The V1 split must use the unmixed .stb definition.")
     if manifest.get("sealed_test_partition") is not True:
         raise ValueError("The V1 test partition must be sealed.")
+    if not isinstance(manifest.get("generation_git_sha"), str):
+        raise ValueError("Split must record generation_git_sha.")
+    if not isinstance(manifest.get("generation_git_dirty"), bool):
+        raise ValueError("Split must record generation_git_dirty.")
+    if manifest.get("generator_code_sha256") != generator_code_sha256():
+        raise ValueError("Generator code hash differs from the current implementation.")
+    if not isinstance(manifest.get("source_metadata_sha256"), str):
+        raise ValueError("Split must record source_metadata_sha256.")
     partitions = manifest.get("partitions")
     records_by_subject = manifest.get("records_by_subject")
     if not isinstance(partitions, Mapping) or set(partitions) != set(PARTITIONS):

@@ -14,6 +14,7 @@ from cardiosentinel.data.models import DatasetRecord, ParsedAnnotations
 from cardiosentinel.data.provenance import git_provenance
 from cardiosentinel.data.remote import parse_remote_record
 from cardiosentinel.data.validation import validate_dataset
+from cardiosentinel.evaluation.models import EDBSecondaryCohort, EDBSecondaryCohortName
 from cardiosentinel.evaluation.protocol import (
     BENCHMARK_SCHEMA_VERSION,
     DEFAULT_SEED,
@@ -24,6 +25,7 @@ from cardiosentinel.evaluation.protocol import (
     PRIMARY_WINDOW_SECONDS,
     PROTOCOL_VERSION,
 )
+from cardiosentinel.evaluation.provenance import edb_secondary_cohort
 from cardiosentinel.evaluation.splits import (
     PARTITIONS,
     load_split_manifest,
@@ -100,6 +102,9 @@ def _new_bucket() -> dict[str, Any]:
         "rate_related_episode_count": 0,
         "rate_related_episode_seconds": 0.0,
         "window_counts": Counter(),
+        "target_subjects": {},
+        "positive_context_counts": Counter(),
+        "positive_context_subjects": {},
     }
 
 
@@ -120,6 +125,9 @@ def _add_record_burden(
 
 
 def _serialize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    positive_count = bucket["window_counts"]["ischemic_positive"]
+    background_count = bucket["window_counts"]["background_negative"]
+    primary_count = positive_count + background_count
     return {
         "subject_count": len(bucket["subjects"]),
         "record_count": len(bucket["records"]),
@@ -132,7 +140,51 @@ def _serialize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
             bucket["rate_related_episode_seconds"], 9
         ),
         "window_counts": dict(sorted(bucket["window_counts"].items())),
+        "target_subject_counts": {
+            key: len(value)
+            for key, value in sorted(bucket["target_subjects"].items())
+        },
+        "primary_composition": {
+            "positive_windows": positive_count,
+            "background_windows": background_count,
+            "positive_prevalence": (
+                None if primary_count == 0 else positive_count / primary_count
+            ),
+        },
+        "positive_context_counts": dict(
+            sorted(bucket["positive_context_counts"].items())
+        ),
+        "positive_context_subject_counts": {
+            key: len(value)
+            for key, value in sorted(bucket["positive_context_subjects"].items())
+        },
     }
+
+
+def select_edb_secondary_cohort(
+    records: tuple[DatasetRecord, ...],
+    parsed: tuple[ParsedAnnotations, ...],
+    cohort_name: EDBSecondaryCohortName,
+) -> tuple[
+    tuple[DatasetRecord, ...],
+    tuple[ParsedAnnotations, ...],
+    EDBSecondaryCohort,
+]:
+    """Select a named EDB secondary cohort while retaining overlap policy metadata."""
+    if len(records) != len(parsed):
+        raise ValueError("EDB records and annotations are not aligned.")
+    cohort = edb_secondary_cohort(cohort_name)
+    selected_ids = set(cohort.record_ids)
+    selected = tuple(
+        (record, parsed_item)
+        for record, parsed_item in zip(records, parsed, strict=True)
+        if record.record_id in selected_ids
+    )
+    return (
+        tuple(record for record, _ in selected),
+        tuple(parsed_item for _, parsed_item in selected),
+        cohort,
+    )
 
 
 def _validate_target(
@@ -183,6 +235,7 @@ def summarize_benchmark(
     expected_split_hash: str | None = LTSTDB_V1_SPLIT_SHA256,
     expected_subject_count: int | None = 80,
     expected_record_count: int | None = 86,
+    secondary_cohort: EDBSecondaryCohort | None = None,
 ) -> dict[str, Any]:
     """Enumerate targets lazily and retain aggregate composition only."""
     if len(records) != len(parsed):
@@ -258,6 +311,15 @@ def summarize_benchmark(
             _validate_target(target, record, events_by_lead[lead])
             for bucket in (partition_bucket, subject_bucket, record_bucket):
                 bucket["window_counts"][target.target_family] += 1
+                bucket["target_subjects"].setdefault(
+                    target.target_family, set()
+                ).add(target.subject_id)
+                if target.target_family == "ischemic_positive":
+                    for context_flag in target.context_flags:
+                        bucket["positive_context_counts"][context_flag] += 1
+                        bucket["positive_context_subjects"].setdefault(
+                            context_flag, set()
+                        ).add(target.subject_id)
 
     if dataset_id == "ltstdb":
         for partition in PARTITIONS:
@@ -284,6 +346,19 @@ def summarize_benchmark(
             "python_version": sys.version.split()[0],
         }
     )
+    if dataset_id == "edb":
+        cohort = secondary_cohort or edb_secondary_cohort("full")
+        provenance["edb_secondary_cohort"] = {
+            "name": cohort.name,
+            "full_record_count": len(edb.EDB_RECORD_IDS),
+            "cohort_record_count": len(records),
+            "known_overlap_exclusion_count": len(cohort.known_overlap_record_ids),
+            "known_overlap_record_ids": list(cohort.known_overlap_record_ids),
+            "contains_known_source_overlap": cohort.contains_known_source_overlap,
+            "fully_independent_external_validation": (
+                cohort.fully_independent_external_validation
+            ),
+        }
     return {
         "provenance": provenance,
         "partitions": {
@@ -307,8 +382,14 @@ def summarize_from_sources(
     split_path: Path | None,
     source: Path | None,
     command: str,
+    edb_cohort_name: EDBSecondaryCohortName = "full",
 ) -> dict[str, Any]:
     records, parsed = load_benchmark_metadata(dataset_id, annotation_set, source)
+    secondary_cohort = None
+    if dataset_id == "edb":
+        records, parsed, secondary_cohort = select_edb_secondary_cohort(
+            records, parsed, edb_cohort_name
+        )
     split = load_split_manifest(split_path) if split_path else None
     definition = (
         PRIMARY_ANNOTATION_DEFINITION if dataset_id == "ltstdb" else "edb.reference"
@@ -320,4 +401,5 @@ def summarize_from_sources(
         annotation_definition=definition,
         command=command,
         split=split,
+        secondary_cohort=secondary_cohort,
     )

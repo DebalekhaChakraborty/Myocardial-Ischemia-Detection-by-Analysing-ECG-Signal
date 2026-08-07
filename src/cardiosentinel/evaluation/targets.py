@@ -11,7 +11,12 @@ from cardiosentinel.data.models import (
     SourceCensoredInterval,
     STEvent,
 )
-from cardiosentinel.evaluation.models import BenchmarkWindow, TargetFamily, WindowTarget
+from cardiosentinel.evaluation.models import (
+    BenchmarkWindow,
+    ContextFlag,
+    TargetFamily,
+    WindowTarget,
+)
 from cardiosentinel.evaluation.protocol import MARKER_VICINITY_SECONDS
 from cardiosentinel.signal.windows import seconds_to_samples
 
@@ -72,6 +77,8 @@ def _target(
     subtype: str | None,
     annotation_definition: str,
     overlapping_ids: Iterable[str],
+    overlapping_marker_ids: Iterable[str] = (),
+    context_flags: Iterable[ContextFlag] = (),
     quality_state: str | None = None,
     exclusion_reason: str | None = None,
 ) -> WindowTarget:
@@ -96,6 +103,8 @@ def _target(
         eligible_for_confounder_evaluation=confounder,
         annotation_definition=annotation_definition,
         overlapping_event_ids=tuple(sorted(set(overlapping_ids))),
+        overlapping_marker_ids=tuple(sorted(set(overlapping_marker_ids))),
+        context_flags=tuple(sorted(set(context_flags))),
         quality_state=quality_state,
         exclusion_reason=exclusion_reason,
     )
@@ -112,6 +121,58 @@ def assign_window_target(
     marker_vicinity_samples: int | None = None,
 ) -> WindowTarget:
     """Assign one semantic target after annotation-independent geometry exists."""
+    radius = marker_vicinity_samples
+    if radius is None:
+        radius = seconds_to_samples(
+            marker_vicinity_seconds,
+            window.sampling_frequency_hz,
+            "marker challenge vicinity",
+        )
+    record_markers = tuple(
+        marker
+        for marker in markers
+        if marker.record_id == window.record_id and _same_lead(window, marker.lead)
+    )
+    nearby_challenge_markers = tuple(
+        marker
+        for marker in record_markers
+        if marker.subtype in {"axis_related", "conduction_related"}
+        and _overlaps(
+            window.start_sample,
+            window.end_sample,
+            max(0, marker.sample - radius),
+            marker.sample + radius,
+        )
+    )
+    point_noise_markers = tuple(
+        marker
+        for marker in record_markers
+        if marker.subtype == "point_noise"
+        and window.start_sample <= marker.sample < window.end_sample
+    )
+    contextual_markers = (*nearby_challenge_markers, *point_noise_markers)
+    marker_ids = tuple(_marker_id(marker) for marker in contextual_markers)
+    context_flags: tuple[ContextFlag, ...] = tuple(
+        flag
+        for flag, present in (
+            (
+                "axis_shift_context",
+                any(
+                    marker.subtype == "axis_related"
+                    for marker in nearby_challenge_markers
+                ),
+            ),
+            (
+                "conduction_change_context",
+                any(
+                    marker.subtype == "conduction_related"
+                    for marker in nearby_challenge_markers
+                ),
+            ),
+            ("point_noise_context", bool(point_noise_markers)),
+        )
+        if present
+    )
     events = tuple(
         event
         for event in events
@@ -145,6 +206,8 @@ def assign_window_target(
             "expert_unreadable_interval",
             annotation_definition,
             event_ids,
+            marker_ids,
+            context_flags,
             quality_state="unreadable",
             exclusion_reason="overlaps expert unreadable reference interval",
         )
@@ -169,6 +232,8 @@ def assign_window_target(
             ",".join(reasons),
             annotation_definition,
             event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
             exclusion_reason="overlaps source-censored annotation region",
         )
@@ -191,6 +256,8 @@ def assign_window_target(
             "fully_contained",
             annotation_definition,
             event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
         )
     if ischemic:
@@ -200,6 +267,8 @@ def assign_window_target(
             "partial_ischemic_overlap",
             annotation_definition,
             event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
             exclusion_reason="partially overlaps an ischemic episode boundary",
         )
@@ -219,6 +288,8 @@ def assign_window_target(
             "fully_contained" if fully_rate_related else "boundary_overlap",
             annotation_definition,
             event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
         )
 
@@ -232,46 +303,33 @@ def assign_window_target(
             "duration_bounded_apparent_st_change",
             annotation_definition,
             event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
         )
-
-    radius = marker_vicinity_samples
-    if radius is None:
-        radius = seconds_to_samples(
-            marker_vicinity_seconds,
-            window.sampling_frequency_hz,
-            "marker challenge vicinity",
-        )
-    nearby_markers = tuple(
-        marker
-        for marker in markers
-        if marker.record_id == window.record_id
-        and _same_lead(window, marker.lead)
-        and marker.subtype in {"axis_related", "conduction_related"}
-        and _overlaps(
-            window.start_sample,
-            window.end_sample,
-            max(0, marker.sample - radius),
-            marker.sample + radius,
-        )
-    )
-    marker_ids = tuple(_marker_id(marker) for marker in nearby_markers)
-    if any(marker.subtype == "conduction_related" for marker in nearby_markers):
+    if any(
+        marker.subtype == "conduction_related"
+        for marker in nearby_challenge_markers
+    ):
         return _target(
             window,
             "conduction_change_confounder",
             "marker_vicinity_30_seconds",
             annotation_definition,
-            (*event_ids, *marker_ids),
+            event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
         )
-    if nearby_markers:
+    if nearby_challenge_markers:
         return _target(
             window,
             "axis_shift_confounder",
             "marker_vicinity_30_seconds",
             annotation_definition,
-            (*event_ids, *marker_ids),
+            event_ids,
+            marker_ids,
+            context_flags,
             quality_state="noisy" if "noisy" in quality_states else None,
         )
     return _target(
@@ -280,5 +338,7 @@ def assign_window_target(
         "clean_by_v1_exclusions",
         annotation_definition,
         event_ids,
+        marker_ids,
+        context_flags,
         quality_state="noisy" if "noisy" in quality_states else None,
     )

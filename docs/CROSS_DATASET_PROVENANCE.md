@@ -54,6 +54,19 @@ prove that every remaining EDB subject is independent of every LTSTDB subject.
 Any new authoritative correspondence requires a reviewed registry update and a
 new benchmark protocol version if it changes a frozen evaluation cohort.
 
+The benchmark exposes two explicit secondary cohorts:
+
+- `full`: all 90 EDB records, for dataset description, with
+  `contains_known_source_overlap = true`;
+- `overlap_clean`: 75 EDB records after the conservative 15-record exclusion,
+  with `contains_known_source_overlap = false` for the known registry only.
+
+When model training includes LTSTDB, the recommended EDB secondary evaluation
+cohort is `overlap_clean`; policy validation rejects `full` for that use. The
+full cohort may still be enumerated descriptively. Neither cohort may be called
+fully independent external validation because independence of every remaining
+subject has not been proven.
+
 The typed registry is implemented in
 `cardiosentinel.evaluation.provenance`. Its confidence vocabulary is
 `verified`, `collection-level-risk`, or `unknown`; demographic similarity can

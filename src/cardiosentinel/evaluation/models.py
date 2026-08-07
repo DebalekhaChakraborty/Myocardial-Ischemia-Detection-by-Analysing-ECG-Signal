@@ -16,6 +16,14 @@ TargetFamily = Literal[
     "source_censored_or_unknown",
 ]
 
+ContextFlag = Literal[
+    "axis_shift_context",
+    "conduction_change_context",
+    "point_noise_context",
+]
+
+EDBSecondaryCohortName = Literal["full", "overlap_clean"]
+
 
 @dataclass(frozen=True)
 class BenchmarkWindow:
@@ -68,6 +76,8 @@ class WindowTarget:
     eligible_for_confounder_evaluation: bool
     annotation_definition: str
     overlapping_event_ids: tuple[str, ...]
+    overlapping_marker_ids: tuple[str, ...]
+    context_flags: tuple[ContextFlag, ...]
     quality_state: str | None
     exclusion_reason: str | None
 
@@ -91,6 +101,19 @@ class SubjectBurden:
     rate_related_episode_count: int
     rate_related_episode_seconds: float
     signal_channel_count: int
+    axis_shift_marker_count: int
+    conduction_change_marker_count: int
+
+
+@dataclass(frozen=True)
+class EDBSecondaryCohort:
+    """Explicit EDB secondary cohort with known-overlap limitations."""
+
+    name: EDBSecondaryCohortName
+    record_ids: tuple[str, ...]
+    known_overlap_record_ids: tuple[str, ...]
+    contains_known_source_overlap: bool
+    fully_independent_external_validation: Literal[False] = False
 
 
 @dataclass(frozen=True)

@@ -99,6 +99,12 @@ def build_parser() -> argparse.ArgumentParser:
     summarize_parser.add_argument("--source", type=Path)
     summarize_parser.add_argument("--split", type=Path)
     summarize_parser.add_argument("--output", type=Path)
+    summarize_parser.add_argument(
+        "--edb-cohort",
+        choices=("full", "overlap_clean"),
+        default="full",
+        help="Explicit EDB secondary cohort; ignored for LTSTDB.",
+    )
     generate_parser = benchmark_commands.add_parser(
         "generate-split", help="Generate the pre-model LTSTDB V1 subject split."
     )
@@ -226,9 +232,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if args.benchmark_command == "generate-split":
             records, parsed = load_benchmark_metadata("ltstdb", "stb", args.source)
-            git_sha = git_provenance(REPOSITORY_ROOT)["git_sha"]
+            generation_provenance = git_provenance(REPOSITORY_ROOT)
             manifest = generate_split_manifest(
-                records, parsed, str(git_sha), seed=DEFAULT_SEED
+                records,
+                parsed,
+                str(generation_provenance["git_sha"]),
+                bool(generation_provenance["git_dirty"]),
+                seed=DEFAULT_SEED,
             )
             write_json(args.output, manifest)
             print(f"Split: {args.output}")
@@ -267,6 +277,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             split_path,
             args.source,
             command,
+            args.edb_cohort,
         )
         if args.output:
             write_json(args.output, summary)

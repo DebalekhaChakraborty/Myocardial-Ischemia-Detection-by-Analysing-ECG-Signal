@@ -3,6 +3,8 @@
 import pytest
 
 from cardiosentinel.evaluation.metrics import (
+    challenge_false_positive_rate,
+    ischemic_positive_context_strata,
     select_validation_f1_threshold,
     subject_bootstrap_plan,
 )
@@ -21,22 +23,24 @@ def target(
 ) -> WindowTarget:
     primary = family in {"ischemic_positive", "background_negative"}
     return WindowTarget(
-        "ltstdb",
-        record,
-        subject,
-        0,
-        "I",
-        index * 10,
-        index * 10 + 10,
-        family,
-        "SYNTHETIC",
-        primary,
-        primary,
-        False,
-        "ltstdb.stb",
-        (),
-        None,
-        None,
+        dataset="ltstdb",
+        record_id=record,
+        subject_id=subject,
+        channel_index=0,
+        lead_name="I",
+        window_start_sample=index * 10,
+        window_end_sample=index * 10 + 10,
+        target_family=family,
+        target_subtype="SYNTHETIC",
+        eligible_for_training=primary,
+        eligible_for_primary_evaluation=primary,
+        eligible_for_confounder_evaluation=family.endswith("_confounder"),
+        annotation_definition="ltstdb.stb",
+        overlapping_event_ids=(),
+        overlapping_marker_ids=(),
+        context_flags=(),
+        quality_state=None,
+        exclusion_reason=None,
     )
 
 
@@ -91,3 +95,40 @@ def test_threshold_selection_is_validation_only_with_deterministic_ties() -> Non
         select_validation_f1_threshold(
             [0, 1], [0.1, 0.9], partition="test"
         )
+
+
+def test_mixed_positives_do_not_enter_challenge_fpr_denominators() -> None:
+    mixed_positive = target("ischemic_positive", 0, "subject-a", "record-a")
+    mixed_positive = WindowTarget(
+        **{
+            **mixed_positive.__dict__,
+            "context_flags": ("axis_shift_context", "conduction_change_context"),
+        }
+    )
+    axis_challenge = target("axis_shift_confounder", 1, "subject-b", "record-b")
+    targets = (mixed_positive, axis_challenge)
+    assert challenge_false_positive_rate(
+        targets, (0.99, 0.10), 0.5, "axis_shift_confounder"
+    ) == 0.0
+    assert challenge_false_positive_rate(
+        targets, (0.99, 0.10), 0.5, "conduction_change_confounder"
+    ) is None
+
+
+def test_positive_context_strata_are_descriptive_and_overlapping() -> None:
+    plain = target("ischemic_positive", 0, "subject-a", "record-a")
+    mixed = WindowTarget(
+        **{
+            **target("ischemic_positive", 1, "subject-b", "record-b").__dict__,
+            "context_flags": (
+                "axis_shift_context",
+                "conduction_change_context",
+                "point_noise_context",
+            ),
+        }
+    )
+    strata = ischemic_positive_context_strata((plain, mixed))
+    assert strata["no_axis_or_conduction_context"] == (plain,)
+    assert strata["axis_shift_context"] == (mixed,)
+    assert strata["conduction_change_context"] == (mixed,)
+    assert strata["point_noise_context"] == (mixed,)

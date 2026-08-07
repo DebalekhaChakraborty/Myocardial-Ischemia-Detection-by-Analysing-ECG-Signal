@@ -53,6 +53,15 @@ At the frozen validation-selected threshold, separately report:
 
 Do not merge these challenge results into clean-background specificity without
 also reporting the components. They are not the primary positive target.
+Only non-ischemic targets whose primary family is the corresponding confounder
+enter a challenge false-positive-rate denominator. An `ischemic_positive` with
+axis or conduction context remains a positive and is excluded from that
+denominator.
+
+Future descriptive/error analysis also reports ischemic positives with no axis
+or conduction marker context, with axis context, with conduction context, and
+with point-noise context. These strata may overlap and are not new disease
+classes, headline metrics, or threshold-selection inputs.
 
 ## Test composition
 
