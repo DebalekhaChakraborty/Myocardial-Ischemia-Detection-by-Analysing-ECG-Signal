@@ -20,8 +20,13 @@ dev = [
   "pytest>=8.0,<9",
   "ruff>=0.6,<1",
 ]
-# Reserved groups; no ML framework is required yet.
-ml = []
+# Phase 3B uses only established classical machine-learning dependencies.
+ml = [
+  "numpy>=1.26,<3",
+  "scipy>=1.13,<2",
+  "scikit-learn>=1.5,<2",
+  "wfdb>=4.1,<5",
+]
 docs = []
 data = [
   "numpy>=1.26,<3",

@@ -18,8 +18,8 @@ support the physical-system loop:
 
 `ECG acquisition or replay -> edge processing -> patient-adaptive inference -> uncertainty -> local decision or escalation -> temporal episode reasoning -> evidence-grounded alert`.
 
-No model, dataset, performance result, or clinical effectiveness claim is
-provided in Phase 0.
+No clinical effectiveness claim is made. Physiological data and experiment
+outputs remain external to this repository.
 
 ## Repository structure
 
@@ -56,8 +56,10 @@ metrics, and filter audits. Bounded physical-waveform integration validation is
 complete for the first 60 seconds of EDB `e0113`, EDB `e0161`, and LTSTDB
 `s20011`. Phase 3A freezes the LTSTDB `.stb` benchmark protocol, 56/12/12
 subject split, causal 10-second/5-second window targets, leakage controls,
-training-sampling policy, and metrics protocol. Model baselines remain pending
-Phase 3B. No performance or clinical results are reported.
+training-sampling policy, and metrics protocol. Phase 3B-1 adds versioned
+waveform-only features, resumable external caches, fixed B0--B3 global classical
+baselines, validation-frozen experiment locks, and sealed-test reporting. No
+benchmark or clinical performance result is committed here.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
@@ -91,6 +93,20 @@ The frozen rules are in [`docs/BENCHMARK_PROTOCOL_V1.md`](docs/BENCHMARK_PROTOCO
 with metrics in [`docs/METRICS_PROTOCOL.md`](docs/METRICS_PROTOCOL.md) and known
 EDB/LTSTDB overlap in
 [`docs/CROSS_DATASET_PROVENANCE.md`](docs/CROSS_DATASET_PROVENANCE.md).
+
+Classical baseline commands require the `ml` extras. Waveforms, features, and
+run artifacts must use explicit roots outside Git:
+
+```bash
+python -m pip install -e ".[dev,data,signal,ml]"
+python -m cardiosentinel baseline --help
+python -m cardiosentinel baseline acquire \
+  --destination /external/data/ltstdb/1.0.0
+```
+
+The acquisition command is plan-only unless `--execute` is supplied. The frozen
+feature, model, preprocessing, sampling, test-access, and artifact rules are in
+[`docs/BASELINE_PROTOCOL_V1.md`](docs/BASELINE_PROTOCOL_V1.md).
 
 ## License and attribution
 
