@@ -23,7 +23,7 @@ from cardiosentinel.baseline.cache import (
     FeatureTable,
     load_partition,
     read_json,
-    require_external_path,
+    require_nonversioned_path,
     validate_feature_corpus,
     write_json_atomic,
 )
@@ -203,8 +203,8 @@ def fit_and_lock(
     """Fit on train, select threshold on validation, and freeze an experiment."""
     if baseline_name not in BASELINE_NAMES:
         raise ValueError(f"Baseline must be one of {BASELINE_NAMES}.")
-    feature_root = require_external_path(feature_root, "Feature root")
-    run_root = require_external_path(run_root, "Run root")
+    feature_root = require_nonversioned_path(feature_root, "Feature root")
+    run_root = require_nonversioned_path(run_root, "Run root")
     run_dir = run_root / experiment_id
     if run_dir.exists() and any(run_dir.iterdir()):
         raise ValueError(f"Experiment directory already contains artifacts: {run_dir}")
@@ -374,8 +374,8 @@ def evaluate_test(
     require_clean: bool = True,
 ) -> dict[str, Any]:
     """Evaluate one immutable lock on the sealed test partition exactly once."""
-    feature_root = require_external_path(feature_root, "Feature root")
-    run_dir = require_external_path(run_dir, "Run directory")
+    feature_root = require_nonversioned_path(feature_root, "Feature root")
+    run_dir = require_nonversioned_path(run_dir, "Run directory")
     lock = validate_experiment_lock(run_dir)
     provenance = git_provenance(REPOSITORY_ROOT)
     if require_clean and provenance["git_dirty"]:

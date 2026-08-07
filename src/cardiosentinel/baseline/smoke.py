@@ -12,7 +12,7 @@ import numpy as np
 from cardiosentinel.baseline.cache import (
     FeatureTable,
     read_feature_table,
-    require_external_path,
+    require_nonversioned_path,
     write_feature_table_atomic,
     write_json_atomic,
 )
@@ -180,7 +180,7 @@ def run_remote_smoke(
     force: bool = False,
 ) -> dict[str, Any]:
     """Mechanically select and validate one bounded record per partition."""
-    root = require_external_path(output_root, "Smoke output root")
+    root = require_nonversioned_path(output_root, "Smoke output root")
     split = load_split_manifest(split_path)
     validate_split_manifest(
         split,

@@ -1,10 +1,11 @@
-"""External, atomic, per-record feature cache structures and validation."""
+"""Non-versioned, atomic, per-record feature cache structures and validation."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,17 +23,59 @@ from cardiosentinel.evaluation.protocol import (
 from cardiosentinel.features.schema import COMBINED_V1
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+LOCAL_NONVERSIONED_ROOTS = tuple(
+    (REPOSITORY_ROOT / name).resolve()
+    for name in (
+        "cardiosentinel-data",
+        "cardiosentinel-features",
+        "cardiosentinel-runs",
+    )
+)
 FEATURE_MANIFEST_NAME = "manifest.json"
 
 
-def require_external_path(path: Path, purpose: str) -> Path:
-    """Reject patient-derived data or experiment outputs inside this checkout."""
+def require_nonversioned_path(path: Path, purpose: str) -> Path:
+    """Allow external paths or approved Git-ignored local artifact roots only."""
     resolved = path.expanduser().resolve()
     try:
         resolved.relative_to(REPOSITORY_ROOT)
     except ValueError:
         return resolved
-    raise ValueError(f"{purpose} must be outside the Git repository: {resolved}")
+
+    approved_roots = [
+        root for root in LOCAL_NONVERSIONED_ROOTS if resolved.is_relative_to(root)
+    ]
+    if len(approved_roots) != 1:
+        raise ValueError(
+            f"{purpose} must be outside Git tracking; repository-local storage is "
+            "permitted only under approved ignored CardioSentinel artifact roots: "
+            f"{resolved}"
+        )
+    try:
+        relative_path = resolved.relative_to(REPOSITORY_ROOT)
+        git_path = str(relative_path)
+        if resolved == approved_roots[0]:
+            git_path += "/"
+        ignored = subprocess.run(
+            ["git", "check-ignore", "-q", "--", git_path],
+            cwd=REPOSITORY_ROOT,
+            check=False,
+        ).returncode == 0
+    except OSError as error:
+        raise ValueError(
+            f"{purpose} cannot establish repository-local Git ignore status: {resolved}"
+        ) from error
+    if not ignored:
+        raise ValueError(
+            f"{purpose} must be Git-ignored when stored under the repository: "
+            f"{resolved}"
+        )
+    return resolved
+
+
+def require_external_path(path: Path, purpose: str) -> Path:
+    """Compatibility alias for :func:`require_nonversioned_path`."""
+    return require_nonversioned_path(path, purpose)
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -97,7 +140,7 @@ def compute_feature_corpus_sha256(manifest: dict[str, Any]) -> str:
 
 def validate_feature_corpus(feature_root: Path, expected_record_ids: set[str]) -> str:
     """Validate every exact cache artifact and the persisted corpus fingerprint."""
-    root = require_external_path(feature_root, "Feature root")
+    root = require_nonversioned_path(feature_root, "Feature root")
     manifest = read_json(root / FEATURE_MANIFEST_NAME)
     frozen_identity = {
         "dataset": "ltstdb",
@@ -166,7 +209,7 @@ def validate_feature_corpus(feature_root: Path, expected_record_ids: set[str]) -
 
 def finalize_feature_corpus(feature_root: Path, expected_record_ids: set[str]) -> str:
     """Persist corpus identity only after all required caches are complete."""
-    root = require_external_path(feature_root, "Feature root")
+    root = require_nonversioned_path(feature_root, "Feature root")
     manifest_path = root / FEATURE_MANIFEST_NAME
     manifest = read_json(manifest_path)
     complete_ids = {
@@ -289,7 +332,7 @@ def read_feature_table(path: Path) -> tuple[FeatureTable, dict[str, Any]]:
 
 def load_partition(feature_root: Path, partition: str) -> FeatureTable:
     """Load one partition after validating every cache against its manifest."""
-    root = require_external_path(feature_root, "Feature root")
+    root = require_nonversioned_path(feature_root, "Feature root")
     manifest = read_json(root / FEATURE_MANIFEST_NAME)
     if manifest["split_sha256"] != manifest["expected_split_sha256"]:
         raise ValueError("Feature manifest does not use the frozen split hash.")

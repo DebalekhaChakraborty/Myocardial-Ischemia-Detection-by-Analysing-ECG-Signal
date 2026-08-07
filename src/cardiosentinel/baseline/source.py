@@ -9,7 +9,7 @@ from typing import Any, Iterable
 
 from cardiosentinel.baseline.cache import (
     read_json,
-    require_external_path,
+    require_nonversioned_path,
     write_json_atomic,
 )
 from cardiosentinel.data.provenance import sha256_file
@@ -101,7 +101,7 @@ def _verify_source_against_manifest(
     This lower-level function supports small offline fixtures; production callers
     use :func:`verify_pinned_source`, which always supplies the official digest.
     """
-    root = require_external_path(source, "Waveform source")
+    root = require_nonversioned_path(source, "Waveform source")
     expected_records = set(expected_record_ids)
     if not expected_records:
         raise ValueError("Source verification requires expected record IDs.")

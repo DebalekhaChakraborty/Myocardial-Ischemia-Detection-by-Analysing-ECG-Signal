@@ -18,7 +18,7 @@ from cardiosentinel.baseline.cache import (
     FeatureTable,
     finalize_feature_corpus,
     read_cache_metadata,
-    require_external_path,
+    require_nonversioned_path,
     write_feature_table_atomic,
     write_json_atomic,
 )
@@ -353,8 +353,8 @@ def materialize_features(
     """Materialize selected records and resume only matching complete caches."""
     if workers < 1:
         raise ValueError("Materialization workers must be at least 1.")
-    source = require_external_path(source, "Waveform source")
-    root = require_external_path(feature_root, "Feature root")
+    source = require_nonversioned_path(source, "Waveform source")
+    root = require_nonversioned_path(feature_root, "Feature root")
     split = load_split_manifest(split_path)
     validate_split_manifest(
         split,

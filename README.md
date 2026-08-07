@@ -94,8 +94,11 @@ with metrics in [`docs/METRICS_PROTOCOL.md`](docs/METRICS_PROTOCOL.md) and known
 EDB/LTSTDB overlap in
 [`docs/CROSS_DATASET_PROVENANCE.md`](docs/CROSS_DATASET_PROVENANCE.md).
 
-Classical baseline commands require the `ml` extras. Waveforms, features, and
-run artifacts must use explicit roots outside Git:
+Classical baseline commands require the `ml` extras. Raw and derived
+physiological data and experiment outputs are never committed to Git. They may
+use explicit roots outside the repository filesystem or the approved Git-ignored
+local roots `cardiosentinel-data/`, `cardiosentinel-features/`, and
+`cardiosentinel-runs/`:
 
 ```bash
 python -m pip install -e ".[dev,data,signal,ml]"

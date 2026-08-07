@@ -119,7 +119,7 @@ and point-noise context strata with subject and window denominators.
 
 ## Materialization and artifacts
 
-Waveforms and derived rows live outside Git. Materialization reads deterministic
+Waveforms and derived rows live outside Git tracking. Materialization reads deterministic
 bounded chunks, applies raw identity processing, emits existing causal windows,
 and writes atomic compressed per-record caches. Record-level processes own
 disjoint records, limit nested numerical thread pools, and return completed

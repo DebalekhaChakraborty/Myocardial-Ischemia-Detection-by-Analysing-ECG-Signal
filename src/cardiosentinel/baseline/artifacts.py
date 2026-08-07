@@ -1,4 +1,4 @@
-"""Canonical experiment locks and external artifact integrity helpers."""
+"""Canonical experiment locks and non-versioned artifact integrity helpers."""
 
 from __future__ import annotations
 

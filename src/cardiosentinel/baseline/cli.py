@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from cardiosentinel.baseline.cache import require_external_path
+from cardiosentinel.baseline.cache import require_nonversioned_path
 from cardiosentinel.baseline.source import (
     acquisition_urls,
     verify_pinned_source,
@@ -135,7 +135,7 @@ def add_baseline_parser(subparsers: argparse._SubParsersAction) -> None:
 
 
 def _acquire(destination: Path, split_path: Path, execute: bool) -> int:
-    destination = require_external_path(destination, "Waveform destination")
+    destination = require_nonversioned_path(destination, "Waveform destination")
     _, record_ids = _load_frozen_split(split_path)
     destination.mkdir(parents=True, exist_ok=True)
     free_bytes = shutil.disk_usage(destination).free
