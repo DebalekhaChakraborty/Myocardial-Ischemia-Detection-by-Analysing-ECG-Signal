@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 from collections.abc import Iterable, Sequence
 
@@ -36,7 +37,7 @@ def subject_bootstrap_plan(
 def select_validation_f1_threshold(
     labels: Sequence[int], scores: Sequence[float], *, partition: str
 ) -> float:
-    """Maximize validation F1; ties select the highest, more specific threshold."""
+    """Maximize validation F1 with an exact O(N log N) cumulative sweep."""
     if partition != "validation":
         raise ValueError("Threshold selection may use validation predictions only.")
     if len(labels) != len(scores) or not labels:
@@ -46,23 +47,32 @@ def select_validation_f1_threshold(
     if not any(labels):
         raise ValueError("Validation labels must contain at least one positive.")
     candidates = sorted(set(float(score) for score in scores), reverse=True)
+    positive_counts = dict.fromkeys(candidates, 0)
+    negative_counts = dict.fromkeys(candidates, 0)
+    for label, score in zip(labels, scores, strict=True):
+        score_value = float(score)
+        if math.isnan(score_value):
+            continue
+        if label == 1:
+            positive_counts[score_value] += 1
+        else:
+            negative_counts[score_value] += 1
 
-    def f1(threshold: float) -> float:
-        predicted = tuple(score >= threshold for score in scores)
-        pairs = tuple(zip(predicted, labels, strict=True))
-        true_positive = sum(
-            prediction and label == 1 for prediction, label in pairs
-        )
-        false_positive = sum(
-            prediction and label == 0 for prediction, label in pairs
-        )
-        false_negative = sum(
-            not prediction and label == 1 for prediction, label in pairs
-        )
+    total_positive = sum(labels)
+    true_positive = 0
+    false_positive = 0
+    best_f1 = -1.0
+    best_threshold = candidates[0]
+    for threshold in candidates:
+        true_positive += positive_counts[threshold]
+        false_positive += negative_counts[threshold]
+        false_negative = total_positive - true_positive
         denominator = 2 * true_positive + false_positive + false_negative
-        return 0.0 if denominator == 0 else 2 * true_positive / denominator
-
-    return max(candidates, key=lambda threshold: (f1(threshold), threshold))
+        f1 = 0.0 if denominator == 0 else 2 * true_positive / denominator
+        if f1 > best_f1:
+            best_f1 = f1
+            best_threshold = threshold
+    return best_threshold
 
 
 def challenge_false_positive_rate(

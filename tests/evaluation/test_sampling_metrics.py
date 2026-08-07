@@ -1,5 +1,8 @@
 """SYNTHETIC training-sampling and metrics-protocol tests."""
 
+import math
+import random
+
 import pytest
 
 from cardiosentinel.evaluation.metrics import (
@@ -16,6 +19,38 @@ from cardiosentinel.evaluation.sampling import (
     primary_evaluation_targets,
     sample_training_targets,
 )
+
+
+def reference_validation_f1_threshold(
+    labels: list[int], scores: list[float], *, partition: str
+) -> float:
+    """Test-only copy of the original exhaustive threshold implementation."""
+    if partition != "validation":
+        raise ValueError("Threshold selection may use validation predictions only.")
+    if len(labels) != len(scores) or not labels:
+        raise ValueError("Threshold labels and scores must be non-empty and aligned.")
+    if any(label not in {0, 1} for label in labels):
+        raise ValueError("Threshold labels must be binary.")
+    if not any(labels):
+        raise ValueError("Validation labels must contain at least one positive.")
+    candidates = sorted(set(float(score) for score in scores), reverse=True)
+
+    def f1(threshold: float) -> float:
+        predicted = tuple(score >= threshold for score in scores)
+        pairs = tuple(zip(predicted, labels, strict=True))
+        true_positive = sum(
+            prediction and label == 1 for prediction, label in pairs
+        )
+        false_positive = sum(
+            prediction and label == 0 for prediction, label in pairs
+        )
+        false_negative = sum(
+            not prediction and label == 1 for prediction, label in pairs
+        )
+        denominator = 2 * true_positive + false_positive + false_negative
+        return 0.0 if denominator == 0 else 2 * true_positive / denominator
+
+    return max(candidates, key=lambda threshold: (f1(threshold), threshold))
 
 
 def target(
@@ -98,6 +133,87 @@ def test_threshold_selection_is_validation_only_with_deterministic_ties() -> Non
         select_validation_f1_threshold(
             [0, 1], [0.1, 0.9], partition="test"
         )
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_optimized_threshold_matches_exhaustive_reference_on_random_scores(
+    seed: int,
+) -> None:
+    generator = random.Random(seed)
+    labels = [generator.randrange(2) for _ in range(97)]
+    labels[0] = 1
+    scores = [round(generator.random(), 3) for _ in labels]
+
+    assert select_validation_f1_threshold(
+        labels, scores, partition="validation"
+    ) == reference_validation_f1_threshold(labels, scores, partition="validation")
+
+
+@pytest.mark.parametrize(
+    ("labels", "scores"),
+    (
+        ([1, 0, 1, 0, 1], [0.8, 0.8, 0.5, 0.5, 0.2]),
+        ([0, 1, 0, 1], [0.4, 0.4, 0.4, 0.4]),
+        ([1, 0, 0, 0, 0, 0, 0, 0], [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2]),
+        ([1, 1, 0, 0], [0.9, 0.8, 0.8, 0.8]),
+        ([1, 0, 1, 0], [0.1, 0.4, 0.7, 0.9]),
+        ([0, 1, 0, 1], [0.9, 0.7, 0.4, 0.1]),
+    ),
+)
+def test_optimized_threshold_matches_exhaustive_reference_on_edge_cases(
+    labels: list[int], scores: list[float]
+) -> None:
+    assert select_validation_f1_threshold(
+        labels, scores, partition="validation"
+    ) == reference_validation_f1_threshold(labels, scores, partition="validation")
+
+
+def test_threshold_ties_select_the_highest_observed_score() -> None:
+    labels = [1, 1, 0, 0]
+    scores = [0.9, 0.8, 0.8, 0.8]
+
+    assert select_validation_f1_threshold(labels, scores, partition="validation") == 0.9
+
+
+def test_threshold_selection_retains_nan_score_semantics() -> None:
+    labels = [1, 0, 1]
+    scores = [float("nan"), 0.8, 0.7]
+
+    assert select_validation_f1_threshold(
+        labels, scores, partition="validation"
+    ) == reference_validation_f1_threshold(labels, scores, partition="validation")
+
+    all_nan = [float("nan")]
+    assert math.isnan(
+        select_validation_f1_threshold([1], all_nan, partition="validation")
+    )
+
+
+@pytest.mark.parametrize(
+    ("labels", "scores", "match"),
+    (
+        ([], [], "non-empty and aligned"),
+        ([1], [], "non-empty and aligned"),
+        ([2], [0.5], "binary"),
+        ([0, 0], [0.2, 0.8], "at least one positive"),
+    ),
+)
+def test_threshold_selection_retains_input_validation_contract(
+    labels: list[int], scores: list[float], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        select_validation_f1_threshold(labels, scores, partition="validation")
+
+
+def test_threshold_selection_handles_many_unique_scores_without_quadratic_sweep(
+) -> None:
+    count = 50_000
+    labels = [1 if index % 97 == 0 else 0 for index in range(count)]
+    scores = [index / count for index in range(count)]
+
+    threshold = select_validation_f1_threshold(labels, scores, partition="validation")
+
+    assert threshold in scores
 
 
 def test_mixed_positives_do_not_enter_challenge_fpr_denominators() -> None:
