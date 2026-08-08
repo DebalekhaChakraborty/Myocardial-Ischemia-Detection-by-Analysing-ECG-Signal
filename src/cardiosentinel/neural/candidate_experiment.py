@@ -294,25 +294,69 @@ class PreparedCandidateExperiment:
     report: dict[str, Any]
 
 
-def _require_no_prior_candidate_run(run_dir: Path, experiment_id: str) -> None:
-    existing = sorted(
-        name for name in PRIOR_RUN_ARTIFACTS if (run_dir / name).exists()
-    )
-    if not existing:
-        return
-    status = None
+def _describe_prior_candidate_run(run_dir: Path) -> str:
+    """Summarize an existing claim without letting corruption mask the refusal."""
+    if not run_dir.is_dir():
+        return "path_exists_but_is_not_a_directory"
     status_path = run_dir / RUN_STATUS_NAME
     if status_path.is_file():
         try:
-            status = read_json(status_path).get("status")
+            return f"status={read_json(status_path).get('status')}"
         except (OSError, ValueError):
-            status = "unreadable_or_corrupt"
-    raise ValueError(
-        f"Canonical candidate experiment {experiment_id} already has evidence in "
-        f"{run_dir} (status={status}, artifacts={existing}). Each candidate has "
-        "exactly one canonical run: a rerun, restart or fresh-seed retry is not "
-        "automatic and requires documented human review."
+            return "status=unreadable_or_corrupt"
+    try:
+        if not any(run_dir.iterdir()):
+            return "empty_directory"
+    except OSError:
+        return "unreadable_directory"
+    artifacts = sorted(
+        name for name in PRIOR_RUN_ARTIFACTS if (run_dir / name).exists()
     )
+    return f"partial_without_status, artifacts={artifacts}"
+
+
+def _require_no_prior_candidate_run(run_dir: Path, experiment_id: str) -> None:
+    """Refuse if the canonical candidate directory exists in any state.
+
+    The directory itself is the claim, so its mere existence means the one
+    canonical attempt for this experiment has been consumed. This covers an
+    empty, partial, corrupt, RUNNING, FAILED_OR_INTERRUPTED or COMPLETE
+    directory alike. Nothing is ever deleted or reset here.
+
+    This is an early, friendly check only. Exclusivity is guaranteed by the
+    atomic claim in `claim_candidate_run_directory`, not by this check.
+    """
+    if not run_dir.exists():
+        return
+    raise ValueError(
+        f"Canonical candidate experiment {experiment_id} has already been claimed "
+        f"at {run_dir} ({_describe_prior_candidate_run(run_dir)}). Automatic "
+        "rerun, restart or fresh-seed retry is prohibited and requires "
+        "documented human review."
+    )
+
+
+def claim_candidate_run_directory(run_dir: Path, experiment_id: str) -> Path:
+    """Atomically claim the one canonical attempt for this candidate.
+
+    The candidate run directory *is* the claim. `mkdir(exist_ok=False)` is atomic
+    on POSIX, so exactly one process can ever create it. A check-then-create
+    sequence could not provide that guarantee: two processes could both observe
+    an absent directory and both proceed to train.
+
+    Once created, the attempt is consumed. The directory is never removed on
+    failure, so a crash after this point still blocks any automatic rerun.
+    """
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        run_dir.mkdir(exist_ok=False)
+    except FileExistsError as error:
+        raise ValueError(
+            f"Canonical candidate experiment {experiment_id} has already been "
+            "claimed. Automatic rerun, restart or fresh-seed retry is prohibited "
+            "and requires documented human review."
+        ) from error
+    return run_dir
 
 
 def _require_finite_parameters(model: torch.nn.Module) -> None:
@@ -619,7 +663,10 @@ def run_candidate_train_validation(
     )
     prepared = prepare_candidate_experiment(execution)
     run_dir = prepared.run_dir
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # Atomically consume the one canonical attempt for this candidate. This is
+    # deliberately outside the try below: a refused claim belongs to another
+    # process, so this one must never write status into that directory.
+    claim_candidate_run_directory(run_dir, prepared.experiment_id)
     _write_status(run_dir, STATUS_RUNNING, command=command)
     write_json_atomic(
         run_dir / RUN_MANIFEST_NAME,
@@ -778,6 +825,7 @@ __all__ = [
     "PreparedCandidateExperiment",
     "build_candidate_lock",
     "candidate_scientific_preflight",
+    "claim_candidate_run_directory",
     "expected_candidate_identity",
     "prepare_candidate_experiment",
     "require_exact_scientific_environment",

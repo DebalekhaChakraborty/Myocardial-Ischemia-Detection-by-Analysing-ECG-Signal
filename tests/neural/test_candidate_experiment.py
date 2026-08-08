@@ -313,7 +313,7 @@ def test_both_candidates_complete_independently(harness) -> None:
 
 def test_duplicate_candidate_run_is_refused(harness) -> None:
     _run(harness, "b4b")
-    with pytest.raises(ValueError, match="exactly one canonical run"):
+    with pytest.raises(ValueError, match="has already been claimed"):
         _run(harness, "b4b")
     # The other candidate is unaffected.
     assert _run(harness, "b4c")["status"] == STATUS_COMPLETE
@@ -1329,3 +1329,212 @@ def test_child_validation_does_not_alter_the_payload() -> None:
         payload, "B4-A", benchmark.RESOURCE_PROTOCOL_SHA256
     )
     assert payload == original
+
+
+# --------------------------------------------------------------------------
+# Atomic canonical candidate-run claim
+# --------------------------------------------------------------------------
+
+_CLAIM_RACE_PROGRAM = """
+import sys, time
+from pathlib import Path
+from cardiosentinel.neural.candidate_experiment import claim_candidate_run_directory
+
+target = Path(sys.argv[1])
+deadline = float(sys.argv[2])
+while time.time() < deadline:      # busy-wait so both processes collide
+    pass
+try:
+    claim_candidate_run_directory(target, "B4B_cnn_transformer_v1")
+    print("claimed")
+except ValueError:
+    print("refused")
+"""
+
+
+def test_simultaneous_candidate_claims_yield_exactly_one_winner(tmp_path) -> None:
+    """Two independent OS processes race; mkdir(exist_ok=False) admits one.
+
+    Real subprocesses, not threads, so the outcome cannot be an artifact of the
+    GIL serializing the claim.
+    """
+    import subprocess
+    import sys
+    import time
+
+    parent = tmp_path / "runs"
+    parent.mkdir()
+    target = parent / "B4B_cnn_transformer_v1"
+    deadline = time.time() + 2.0
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CLAIM_RACE_PROGRAM, str(target), str(deadline)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        for _ in range(2)
+    ]
+    outputs = [process.communicate(timeout=120) for process in processes]
+
+    for (stdout, stderr), process in zip(outputs, processes, strict=True):
+        assert process.returncode == 0, stderr
+    results = sorted(stdout.strip() for stdout, _ in outputs)
+    assert results == ["claimed", "refused"], results
+    assert target.is_dir()
+    assert sorted(item.name for item in parent.iterdir()) == [
+        "B4B_cnn_transformer_v1"
+    ]
+
+
+def test_claim_is_exclusive_in_process(tmp_path) -> None:
+    from cardiosentinel.neural.candidate_experiment import (
+        claim_candidate_run_directory,
+    )
+
+    target = tmp_path / "runs" / B4B_EXPERIMENT_ID
+    assert claim_candidate_run_directory(target, B4B_EXPERIMENT_ID) == target
+    with pytest.raises(ValueError, match="has already been claimed"):
+        claim_candidate_run_directory(target, B4B_EXPERIMENT_ID)
+
+
+def test_claiming_one_candidate_does_not_block_the_other(tmp_path) -> None:
+    from cardiosentinel.neural.candidate_experiment import (
+        claim_candidate_run_directory,
+    )
+
+    root = tmp_path / "runs"
+    claim_candidate_run_directory(root / B4B_EXPERIMENT_ID, B4B_EXPERIMENT_ID)
+    # The other candidate remains independently claimable.
+    claim_candidate_run_directory(root / B4C_EXPERIMENT_ID, B4C_EXPERIMENT_ID)
+
+    assert (root / B4B_EXPERIMENT_ID).is_dir()
+    assert (root / B4C_EXPERIMENT_ID).is_dir()
+
+
+def test_claim_never_removes_a_partial_directory(tmp_path) -> None:
+    from cardiosentinel.neural.candidate_experiment import (
+        claim_candidate_run_directory,
+    )
+
+    target = tmp_path / "runs" / B4B_EXPERIMENT_ID
+    target.mkdir(parents=True)
+    (target / "partial.bin").write_bytes(b"x")
+    with pytest.raises(ValueError, match="has already been claimed"):
+        claim_candidate_run_directory(target, B4B_EXPERIMENT_ID)
+
+    assert (target / "partial.bin").read_bytes() == b"x"
+
+
+@pytest.mark.parametrize(
+    "state",
+    ["empty", "partial", "corrupt_status", "running", "failed", "complete"],
+)
+def test_any_existing_run_directory_blocks_an_automatic_rerun(
+    harness, state
+) -> None:
+    """A claimed attempt is consumed regardless of how far it progressed."""
+    run_dir = resolve_candidate_run_dir(harness["run_root"], B4B_EXPERIMENT_ID)
+    run_dir.mkdir(parents=True)
+    if state == "partial":
+        (run_dir / "EPOCH_HISTORY.json").write_text("{}", encoding="utf-8")
+    elif state == "corrupt_status":
+        (run_dir / RUN_STATUS_NAME).write_bytes(b"\x00not json")
+    elif state in {"running", "failed", "complete"}:
+        status = {"running": "RUNNING", "failed": STATUS_FAILED,
+                  "complete": STATUS_COMPLETE}[state]
+        (run_dir / RUN_STATUS_NAME).write_text(
+            json.dumps({"status": status}), encoding="utf-8"
+        )
+
+    with pytest.raises(ValueError, match="has already been claimed"):
+        _run(harness, "b4b")
+    # Nothing was deleted or reset.
+    assert run_dir.is_dir()
+    if state == "partial":
+        assert (run_dir / "EPOCH_HISTORY.json").exists()
+    # The other candidate is unaffected.
+    assert _run(harness, "b4c")["status"] == STATUS_COMPLETE
+
+
+def test_preflight_consumes_no_attempt_and_creates_no_directory(harness) -> None:
+    from cardiosentinel.neural.candidate_experiment import (
+        candidate_scientific_preflight,
+    )
+
+    for selector, experiment_id in (
+        ("b4b", B4B_EXPERIMENT_ID), ("b4c", B4C_EXPERIMENT_ID)
+    ):
+        report = candidate_scientific_preflight(
+            selector, harness["source"], harness["feature_root"],
+            harness["cache_root"], harness["run_root"],
+        )
+        assert report["status"] == "ready_for_canonical_development_run"
+        assert not resolve_candidate_run_dir(
+            harness["run_root"], experiment_id
+        ).exists()
+
+    # Preflight did not consume the attempt: the real run still succeeds.
+    assert _run(harness, "b4b")["status"] == STATUS_COMPLETE
+
+
+def test_failure_before_the_claim_consumes_no_attempt(harness, monkeypatch) -> None:
+    monkeypatch.setattr(
+        runner, "git_provenance",
+        lambda root: {"git_sha": "a" * 40, "git_dirty": True},
+    )
+    with pytest.raises(ValueError, match="clean Git checkout"):
+        _run(harness, "b4b")
+    assert not resolve_candidate_run_dir(
+        harness["run_root"], B4B_EXPERIMENT_ID
+    ).exists()
+
+    monkeypatch.setattr(
+        runner, "git_provenance",
+        lambda root: {"git_sha": "a" * 40, "git_dirty": False},
+    )
+    assert _run(harness, "b4b")["status"] == STATUS_COMPLETE
+
+
+def test_refused_claim_never_writes_into_another_process_directory(
+    harness,
+) -> None:
+    """A losing claimant must not stamp FAILED into the winner's directory."""
+    first = _run(harness, "b4c")
+    run_dir = resolve_candidate_run_dir(harness["run_root"], B4C_EXPERIMENT_ID)
+    before = json.loads((run_dir / RUN_STATUS_NAME).read_text())
+    assert before["status"] == STATUS_COMPLETE
+
+    with pytest.raises(ValueError, match="has already been claimed"):
+        _run(harness, "b4c")
+
+    after = json.loads((run_dir / RUN_STATUS_NAME).read_text())
+    assert after == before
+    assert first["experiment_lock_sha256"]
+
+
+def test_no_force_or_reset_mechanism_exists_for_candidate_runs() -> None:
+    import ast
+    import inspect
+
+    from cardiosentinel.neural.candidate_experiment import (
+        run_candidate_train_validation,
+    )
+
+    parameters = inspect.signature(run_candidate_train_validation).parameters
+    for forbidden in (
+        "force", "retry", "reset", "overwrite", "delete_attempt", "fresh_seed",
+    ):
+        assert forbidden not in parameters
+
+    tree = ast.parse(Path(runner.__file__).read_text(encoding="utf-8"))
+    names = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for forbidden in ("force", "reset", "overwrite", "delete_attempt"):
+        assert not any(forbidden in name for name in names)
+    calls = {
+        node.func.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    # Nothing may remove a claimed candidate directory.
+    assert "rmtree" not in calls and "unlink" not in calls and "rmdir" not in calls
