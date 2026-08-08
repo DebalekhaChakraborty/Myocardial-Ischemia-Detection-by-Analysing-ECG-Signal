@@ -10,6 +10,7 @@ DEFAULT_SOURCE = Path("cardiosentinel-data/ltstdb/1.0.0")
 DEFAULT_FEATURE_ROOT = Path("cardiosentinel-features/ltstdb-baseline-v1")
 DEFAULT_WAVEFORM_CACHE_ROOT = Path("cardiosentinel-features/b4-waveform-v1")
 DEFAULT_RUN_ROOT = Path("cardiosentinel-runs/phase3b2-b4-v1")
+DEFAULT_CANDIDATE_RUN_ROOT = Path("cardiosentinel-runs/phase3b2-architecture-v1")
 
 
 def _common_paths(parser: argparse.ArgumentParser) -> None:
@@ -147,6 +148,39 @@ def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
     sealed_test.add_argument("--device", choices=("cpu", "cuda"))
     sealed_test.add_argument("--workers", type=int, default=0)
 
+    # Candidate architecture runners. Only b4b and b4c are selectable, and no
+    # model, optimizer, threshold, seed or epoch override is exposed.
+    candidate = commands.add_parser(
+        "candidate",
+        help="Run the canonical B4-B/B4-C development experiments.",
+    )
+    candidate_commands = candidate.add_subparsers(
+        dest="candidate_command", required=True
+    )
+    for name, description in (
+        (
+            "run-preflight",
+            "Validate canonical B4-B/B4-C run readiness. "
+            "Does not access the test partition.",
+        ),
+        (
+            "run-train-validation",
+            "Runs one canonical B4-B/B4-C development train/validation "
+            "experiment. Does not access the test partition.",
+        ),
+    ):
+        parser = candidate_commands.add_parser(name, help=description)
+        parser.add_argument("--candidate", choices=("b4b", "b4c"), required=True)
+        parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+        parser.add_argument(
+            "--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT
+        )
+        _cache_root(parser)
+        parser.add_argument(
+            "--run-root", type=Path, default=DEFAULT_CANDIDATE_RUN_ROOT
+        )
+        parser.add_argument("--workers", type=int, default=0)
+
 
 def run_b4_command(args: argparse.Namespace) -> int:
     from cardiosentinel.neural.engineering import (
@@ -250,6 +284,38 @@ def run_b4_command(args: argparse.Namespace) -> int:
             workers=args.workers,
             save_validation_predictions=not args.no_validation_predictions,
         )
+    elif args.b4_command == "candidate":
+        from cardiosentinel.neural.candidate_experiment import (
+            DEFAULT_COMMAND as CANDIDATE_COMMAND,
+        )
+        from cardiosentinel.neural.candidate_experiment import (
+            PREFLIGHT_COMMAND as CANDIDATE_PREFLIGHT_COMMAND,
+        )
+        from cardiosentinel.neural.candidate_experiment import (
+            candidate_scientific_preflight,
+            run_candidate_train_validation,
+        )
+
+        if args.candidate_command == "run-preflight":
+            report = candidate_scientific_preflight(
+                args.candidate,
+                args.source,
+                args.feature_root,
+                args.cache_root,
+                args.run_root,
+                workers=args.workers,
+            )
+            report["command"] = CANDIDATE_PREFLIGHT_COMMAND
+        else:
+            report = run_candidate_train_validation(
+                args.candidate,
+                args.source,
+                args.feature_root,
+                args.cache_root,
+                args.run_root,
+                command=CANDIDATE_COMMAND,
+                workers=args.workers,
+            )
     elif args.b4_command == "evaluate-locked-test":
         from cardiosentinel.neural.sealed_test import (
             DEFAULT_COMMAND as SEALED_TEST_COMMAND,
