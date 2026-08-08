@@ -615,7 +615,9 @@ def test_benchmark_refuses_a_corrupt_checkpoint(locked_run) -> None:
         benchmark.validate_locked_model(locked_run)
 
 
-def test_benchmark_measures_median_and_p95(locked_run, monkeypatch) -> None:
+def test_benchmark_measures_median_and_p95(
+    locked_run, monkeypatch, conforming_env
+) -> None:
     monkeypatch.setattr(benchmark, "WARMUP_CALLS", 2)
     monkeypatch.setattr(benchmark, "MEASURED_CALLS", 5)
     result = benchmark.measure_locked_model(locked_run)
@@ -636,17 +638,54 @@ def test_benchmark_measures_median_and_p95(locked_run, monkeypatch) -> None:
     assert result["trainable_parameter_count"] == 87_089
 
 
-def test_isolated_benchmark_runs_in_a_fresh_subprocess(locked_run) -> None:
-    """Fresh-process isolation is required because ru_maxrss never decreases."""
-    result = benchmark.benchmark_locked_model_isolated(locked_run)
+def test_isolated_benchmark_spawns_a_fresh_subprocess(locked_run, monkeypatch) -> None:
+    """Fresh-process isolation is required because ru_maxrss never decreases.
 
-    assert result["experiment_id"] == "synthetic_v1"
-    assert result["measured_calls"] == 500
-    assert result["warmup_calls"] == 50
-    assert result["process_isolated"] is True
-    assert result["peak_rss"] > 0
-    assert result["peak_rss_units"] in {"kibibytes", "bytes"}
-    assert "fresh subprocess" in result["peak_rss_measurement_method"]
+    The spawn is verified deterministically so the assertion does not depend on
+    whether the host happens to satisfy the production environment gate.
+    """
+    import subprocess as subprocess_module
+
+    captured: list[list[str]] = []
+    payload = {"experiment_id": "synthetic_v1", "process_isolated": True}
+
+    class Completed:
+        returncode = 0
+        stdout = json.dumps(payload)
+        stderr = ""
+
+    def spy(command, **kwargs):
+        captured.append(command)
+        return Completed()
+
+    monkeypatch.setattr(benchmark.subprocess, "run", spy)
+    result = benchmark.benchmark_locked_model_isolated(
+        locked_run, official_model="B4-A"
+    )
+
+    assert result == payload
+    command = captured[0]
+    assert command[0].endswith("python") or "python" in command[0]
+    assert command[1:3] == ["-m", "cardiosentinel.neural.resource_benchmark"]
+    assert command[3] == str(locked_run.resolve())
+    assert command[4] == "B4-A"
+    assert subprocess_module is benchmark.subprocess
+
+
+def test_isolated_child_enforces_the_environment_gate(locked_run) -> None:
+    """A real child process must apply the gate itself, with no bypass."""
+    import inspect
+
+    source = inspect.getsource(benchmark.measure_locked_model)
+    assert "_require_exact_benchmark_environment" in source
+    assert "validate_resource_benchmark_protocol" in source
+    # No environment variable or parameter can skip either gate.
+    parameters = inspect.signature(benchmark.measure_locked_model).parameters
+    for forbidden in ("skip_environment", "allow_environment", "force"):
+        assert forbidden not in parameters
+    module_source = Path(benchmark.__file__).read_text(encoding="utf-8")
+    assert "os.environ" not in module_source
+    assert "getenv" not in module_source
 
 
 def test_isolated_benchmark_refuses_an_invalid_run(tmp_path) -> None:
@@ -657,6 +696,41 @@ def test_isolated_benchmark_refuses_an_invalid_run(tmp_path) -> None:
 # --------------------------------------------------------------------------
 # Official resource benchmark hardening
 # --------------------------------------------------------------------------
+
+
+def _conforming_environment(**overrides):
+    """A fully synthetic environment satisfying the gate.
+
+    Built from literals rather than the real host so the tests are identical on
+    any machine. The production gate itself is never relaxed.
+    """
+    environment = {
+        "python_version": "3.12.6",
+        "torch_version": "2.13.0+cpu",
+        "numpy_version": "2.3.2",
+        "platform": "synthetic-platform",
+        "cpu_model": "synthetic-cpu",
+        "device": "cpu",
+        "intra_op_threads": 1,
+        "inter_op_threads": 1,
+        "dependency_digest": B4A_DEPENDENCY_DIGEST,
+        "dependencies": {
+            "installed_packages_sha256": B4A_DEPENDENCY_DIGEST,
+            "key_dependencies": {
+                "numpy": "2.3.2", "scikit-learn": "1.9.0", "scipy": "1.18.0",
+                "torch": "2.13.0+cpu", "wfdb": "4.3.1",
+            },
+        },
+    }
+    environment.update(overrides)
+    return environment
+
+
+@pytest.fixture
+def conforming_env(monkeypatch):
+    monkeypatch.setattr(
+        benchmark, "benchmark_environment", lambda: _conforming_environment()
+    )
 
 
 def _official_lock(directory: Path, model_key: str) -> dict:
@@ -739,8 +813,7 @@ def test_environment_mismatch_refuses_before_any_forward(
     official_runs, monkeypatch
 ) -> None:
     loaded: list[int] = []
-    broken = benchmark.benchmark_environment()
-    broken["dependencies"] = dict(broken["dependencies"])
+    broken = _conforming_environment()
     broken["dependencies"]["installed_packages_sha256"] = "9" * 64
     monkeypatch.setattr(benchmark, "benchmark_environment", lambda: broken)
     monkeypatch.setattr(
@@ -755,8 +828,7 @@ def test_environment_version_mismatch_refuses_before_any_forward(
     official_runs, monkeypatch
 ) -> None:
     loaded: list[int] = []
-    broken = benchmark.benchmark_environment()
-    broken["torch_version"] = "9.9.9"
+    broken = _conforming_environment(torch_version="9.9.9")
     monkeypatch.setattr(benchmark, "benchmark_environment", lambda: broken)
     monkeypatch.setattr(
         benchmark, "load_locked_model", lambda *a, **k: loaded.append(1)
@@ -862,7 +934,9 @@ def test_p95_uses_nearest_rank_ceil() -> None:
     assert benchmark.nearest_rank_p95(list(range(1, 21))) == 19
 
 
-def test_median_remains_the_tie_break_statistic(official_runs, monkeypatch) -> None:
+def test_median_remains_the_tie_break_statistic(
+    official_runs, monkeypatch, conforming_env
+) -> None:
     monkeypatch.setattr(benchmark, "WARMUP_CALLS", 2)
     monkeypatch.setattr(benchmark, "MEASURED_CALLS", 5)
     result = benchmark.measure_locked_model(official_runs["B4-A"])
@@ -874,7 +948,9 @@ def test_median_remains_the_tie_break_statistic(official_runs, monkeypatch) -> N
     )
 
 
-def test_result_digest_covers_the_protocol_sha(official_runs, monkeypatch) -> None:
+def test_result_digest_covers_the_protocol_sha(
+    official_runs, monkeypatch, conforming_env
+) -> None:
     from cardiosentinel.neural.integrity import canonical_sha256
 
     monkeypatch.setattr(benchmark, "WARMUP_CALLS", 1)
