@@ -122,6 +122,25 @@ def harness(monkeypatch, run_dir, tmp_path):
         "verify_primary_population",
         lambda refs: {"positive": 4, "negative": 4, "total": 8, "subjects": 2},
     )
+    monkeypatch.setattr(
+        sealed_test,
+        "validate_sealed_test_feature_integrity",
+        lambda access, root: {
+            "sealed_test_feature_integrity_sha256": "f" * 64,
+            "verified_test_record_count": 3,
+            "verified_test_cache_count": 3,
+            "records": [{"record_id": "t1", "partition": "test"}],
+        },
+    )
+    monkeypatch.setattr(
+        sealed_test,
+        "validate_sealed_test_source_integrity",
+        lambda access, source, receipt: {
+            "sealed_test_source_integrity_sha256": "e" * 64,
+            "verified_test_record_count": 3,
+            "verified_test_source_file_count": 9,
+        },
+    )
     generator = np.random.default_rng(3)
 
     def reader(source, reference):
@@ -213,25 +232,59 @@ def test_attempt_receipt_is_written_before_any_test_resolver_runs(
     harness, monkeypatch, run_dir
 ) -> None:
     order: list[str] = []
-    real_writer = sealed_test.write_json_durable
+    real_claim = sealed_test.claim_attempt_exclusively
 
-    def spy_write(path, payload):
-        if path.name == TEST_ATTEMPT_NAME:
-            order.append("attempt_receipt")
-        return real_writer(path, payload)
+    def spy_claim(path, payload):
+        order.append("attempt_claim")
+        return real_claim(path, payload)
+
+    def spy_feature(access, feature_root):
+        order.append("feature_integrity")
+        assert (run_dir / TEST_ATTEMPT_NAME).is_file()
+        return {
+            "sealed_test_feature_integrity_sha256": "f" * 64,
+            "verified_test_record_count": 3,
+            "verified_test_cache_count": 3,
+            "records": [],
+        }
+
+    def spy_source(access, source, receipt):
+        order.append("source_integrity")
+        assert (run_dir / TEST_ATTEMPT_NAME).is_file()
+        return {
+            "sealed_test_source_integrity_sha256": "e" * 64,
+            "verified_test_record_count": 3,
+            "verified_test_source_file_count": 9,
+        }
 
     def spy_resolver(access, feature_root):
         order.append("test_resolution")
         assert (run_dir / TEST_ATTEMPT_NAME).is_file()
         return harness["references"]
 
-    monkeypatch.setattr(sealed_test, "write_json_durable", spy_write)
+    monkeypatch.setattr(sealed_test, "claim_attempt_exclusively", spy_claim)
+    monkeypatch.setattr(
+        sealed_test, "validate_sealed_test_feature_integrity", spy_feature
+    )
+    monkeypatch.setattr(
+        sealed_test, "validate_sealed_test_source_integrity", spy_source
+    )
     monkeypatch.setattr(sealed_test, "load_sealed_test_references", spy_resolver)
+    real_score = sealed_test.score_sealed_test
+    monkeypatch.setattr(
+        sealed_test,
+        "score_sealed_test",
+        lambda *a, **k: (order.append("scoring"), real_score(*a, **k))[1],
+    )
     _evaluate(harness)
 
-    assert order[0] == "attempt_receipt"
-    assert "test_resolution" in order
-    assert order.index("attempt_receipt") < order.index("test_resolution")
+    assert order == [
+        "attempt_claim",
+        "feature_integrity",
+        "source_integrity",
+        "test_resolution",
+        "scoring",
+    ]
 
 
 def test_test_resolvers_refuse_without_an_access_token(tmp_path) -> None:
@@ -245,7 +298,7 @@ def test_access_token_requires_the_receipt_to_still_exist(tmp_path) -> None:
     access = SealedTestAccess(
         run_dir=tmp_path,
         receipt_path=tmp_path / "absent.json",
-        receipt_sha256="0" * 64,
+        initial_attempt_receipt_sha256="0" * 64,
         experiment_lock_sha256=LOCK_SHA,
         checkpoint_sha256=CKPT_SHA_PLACEHOLDER,
         locked_threshold=THRESHOLD,
@@ -474,7 +527,7 @@ def test_scoring_refuses_a_training_mode_model(tmp_path) -> None:
     access = SealedTestAccess(
         run_dir=tmp_path,
         receipt_path=tmp_path / "receipt.json",
-        receipt_sha256="0" * 64,
+        initial_attempt_receipt_sha256="0" * 64,
         experiment_lock_sha256=LOCK_SHA,
         checkpoint_sha256=CKPT_SHA_PLACEHOLDER,
         locked_threshold=THRESHOLD,
@@ -640,7 +693,7 @@ def test_audit_binds_every_required_identity(harness, run_dir) -> None:
     assert audit["waveform_retrieval"].startswith("record-aware direct")
     assert audit["external_test_waveform_cache"] is None
     assert audit["predictions_sha256"] and audit["metrics_sha256"]
-    assert audit["test_attempt_sha256"]
+    assert audit["initial_attempt_receipt_sha256"]
     assert audit["test_audit_sha256"] == result["test_audit_sha256"] or True
     assert audit["duration_seconds"] >= 0
     assert set(audit["test_challenge_counts"]) == {
@@ -722,3 +775,484 @@ def test_test_labels_are_never_used_for_any_fitting() -> None:
     }
     for forbidden in ("fit", "backward", "step", "zero_grad", "train"):
         assert forbidden not in calls
+
+
+# --------------------------------------------------------------------------
+# One-shot atomicity under concurrency
+# --------------------------------------------------------------------------
+
+
+_RACE_PROGRAM = """
+import sys, time
+from pathlib import Path
+from cardiosentinel.neural import sealed_test as module
+
+target = Path(sys.argv[1]) / module.TEST_ATTEMPT_NAME
+deadline = float(sys.argv[2])
+while time.time() < deadline:      # busy-wait so both processes collide
+    pass
+try:
+    module.claim_attempt_exclusively(target, {"attempt_sequence": 1})
+    print("claimed")
+except module.SealedTestAttemptError:
+    print("refused")
+"""
+
+
+def test_simultaneous_claims_yield_exactly_one_success(tmp_path) -> None:
+    """Two independent OS processes race; O_EXCL must admit exactly one.
+
+    Uses real subprocesses rather than threads, so the result cannot be an
+    artifact of the GIL serializing the claim.
+    """
+    import subprocess
+    import sys
+    import time
+
+    target_dir = tmp_path / "race"
+    target_dir.mkdir()
+    deadline = time.time() + 2.0
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-c", _RACE_PROGRAM, str(target_dir), str(deadline)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(2)
+    ]
+    outputs = [process.communicate(timeout=120) for process in processes]
+
+    for (stdout, stderr), process in zip(outputs, processes, strict=True):
+        assert process.returncode == 0, stderr
+    results = sorted(stdout.strip() for stdout, _ in outputs)
+    assert results == ["claimed", "refused"], results
+    # Exactly one durable claim exists, and no stray temporary file remains.
+    assert (target_dir / TEST_ATTEMPT_NAME).is_file()
+    assert sorted(item.name for item in target_dir.iterdir()) == [TEST_ATTEMPT_NAME]
+
+
+def test_exclusive_claim_refuses_a_second_in_process_claim(tmp_path) -> None:
+    target = tmp_path / TEST_ATTEMPT_NAME
+    first = sealed_test.claim_attempt_exclusively(target, {"attempt_sequence": 1})
+
+    assert len(first) == 64
+    with pytest.raises(SealedTestAttemptError, match="already exists"):
+        sealed_test.claim_attempt_exclusively(target, {"attempt_sequence": 1})
+
+
+def test_corrupt_existing_claim_still_blocks_and_is_not_removed(tmp_path) -> None:
+    target = tmp_path / TEST_ATTEMPT_NAME
+    target.write_bytes(b"\x00not json at all")
+
+    with pytest.raises(SealedTestAttemptError, match="unreadable_or_corrupt"):
+        sealed_test.claim_attempt_exclusively(target, {"attempt_sequence": 1})
+    assert target.read_bytes() == b"\x00not json at all"
+
+
+def test_empty_partial_claim_still_blocks(tmp_path) -> None:
+    target = tmp_path / TEST_ATTEMPT_NAME
+    target.touch()
+
+    with pytest.raises(SealedTestAttemptError, match="already exists"):
+        sealed_test.claim_attempt_exclusively(target, {"attempt_sequence": 1})
+    assert target.exists()
+
+
+def test_second_claimant_never_obtains_an_access_capability(harness, run_dir) -> None:
+    access, _ = open_sealed_test_attempt(
+        harness["source"], harness["feature_root"], harness["run_root"]
+    )
+    assert isinstance(access, SealedTestAccess)
+
+    with pytest.raises(SealedTestAttemptError, match="already exists"):
+        open_sealed_test_attempt(
+            harness["source"], harness["feature_root"], harness["run_root"]
+        )
+
+
+def test_no_force_or_reset_helper_exists_in_the_module() -> None:
+    source = Path(sealed_test.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    names = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for forbidden in ("force", "reset", "retry", "overwrite", "delete_attempt"):
+        assert not any(forbidden in name for name in names)
+    # Nothing in the module ever removes the attempt claim. Checked on calls
+    # rather than raw text so explanatory comments cannot mask a real removal.
+    removals = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "unlink" not in removals
+    assert "rmtree" not in removals
+    assert "remove" not in removals
+
+
+# --------------------------------------------------------------------------
+# Sealed-test feature integrity
+# --------------------------------------------------------------------------
+
+
+def _feature_fixture(tmp_path, monkeypatch):
+    """Build a tiny synthetic feature root whose corpus digest is authoritative."""
+    from cardiosentinel.baseline.cache import compute_feature_corpus_sha256
+
+    root = tmp_path / "cardiosentinel-features" / "synthetic"
+    root.mkdir(parents=True)
+    records = []
+    for record_id, partition in (("t1", "test"), ("d1", "train")):
+        metadata = {
+            "dataset": "ltstdb",
+            "dataset_version": "1.0.0",
+            "record_id": record_id,
+            "subject_id": f"s{record_id}",
+            "partition": partition,
+            "source_sha256": f"{record_id}-source",
+            "split_sha256": "3" * 64,
+            "feature_schema_sha256": "schema-sha",
+            "processing_profile": "raw",
+            "window_seconds": 10.0,
+            "stride_seconds": 5.0,
+            "annotation_definition": "ltstdb.stb",
+            "row_count": 2,
+            "target_counts": {"background_negative": 2},
+        }
+        cache_path = root / f"{record_id}.npz"
+        np.savez_compressed(
+            cache_path,
+            metadata_json=np.str_(json.dumps(metadata)),
+            features=np.zeros((2, 3), dtype=np.float64),
+        )
+        records.append(
+            {
+                "record_id": record_id,
+                "subject_id": f"s{record_id}",
+                "partition": partition,
+                "status": "complete",
+                "cache_path": f"{record_id}.npz",
+                "cache_sha256": sealed_test.sha256_file(cache_path),
+                "source_sha256": f"{record_id}-source",
+                "row_count": 2,
+                "target_counts": {"background_negative": 2},
+            }
+        )
+    manifest = {
+        "dataset": "ltstdb",
+        "dataset_version": "1.0.0",
+        "split_sha256": "3" * 64,
+        "processing_profile": "raw",
+        "window_seconds": 10.0,
+        "stride_seconds": 5.0,
+        "annotation_definition": "ltstdb.stb",
+        "feature_schemas": {"combined_v1": {"feature_schema_sha256": "schema-sha"}},
+        "records": records,
+    }
+    manifest["feature_corpus_sha256"] = compute_feature_corpus_sha256(manifest)
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setattr(
+        sealed_test, "FEATURE_CORPUS_SHA256", manifest["feature_corpus_sha256"]
+    )
+    monkeypatch.setattr(
+        sealed_test, "_validate_manifest_identity", lambda m, expected: None
+    )
+    monkeypatch.setattr(
+        sealed_test, "require_nonversioned_path", lambda path, purpose: Path(path)
+    )
+    return root, manifest
+
+
+@pytest.fixture
+def access_token(tmp_path) -> SealedTestAccess:
+    receipt = tmp_path / TEST_ATTEMPT_NAME
+    receipt.write_text("{}", encoding="utf-8")
+    return SealedTestAccess(
+        run_dir=tmp_path,
+        receipt_path=receipt,
+        initial_attempt_receipt_sha256="0" * 64,
+        experiment_lock_sha256=LOCK_SHA,
+        checkpoint_sha256=CKPT_SHA_PLACEHOLDER,
+        locked_threshold=THRESHOLD,
+    )
+
+
+def test_feature_integrity_requires_an_access_capability(tmp_path) -> None:
+    with pytest.raises(SealedTestAttemptError, match="durable attempt receipt"):
+        sealed_test.validate_sealed_test_feature_integrity(None, tmp_path)
+
+
+def test_feature_integrity_verifies_and_digests_test_records(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, _ = _feature_fixture(tmp_path, monkeypatch)
+    receipt = sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+
+    assert receipt["verification_result"] == "passed"
+    assert receipt["verified_test_record_count"] == 1
+    assert receipt["verified_test_cache_count"] == 1
+    assert receipt["partition"] == "test"
+    assert [item["record_id"] for item in receipt["records"]] == ["t1"]
+    assert len(receipt["sealed_test_feature_integrity_sha256"]) == 64
+    # Deterministic across repeated verification of identical bytes.
+    again = sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+    assert (
+        again["sealed_test_feature_integrity_sha256"]
+        == receipt["sealed_test_feature_integrity_sha256"]
+    )
+
+
+def test_feature_integrity_rejects_a_tampered_corpus_digest(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, manifest = _feature_fixture(tmp_path, monkeypatch)
+    manifest["records"][0]["row_count"] = 99
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="canonical feature-corpus SHA-256 differs"):
+        sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+
+
+def test_feature_integrity_rejects_an_altered_test_npz_byte(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, _ = _feature_fixture(tmp_path, monkeypatch)
+    target = root / "t1.npz"
+    data = bytearray(target.read_bytes())
+    data[-1] ^= 0xFF
+    target.write_bytes(bytes(data))
+
+    with pytest.raises(ValueError, match="feature cache SHA-256 mismatch"):
+        sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+
+
+def test_feature_integrity_rejects_a_wrong_recorded_cache_hash(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, manifest = _feature_fixture(tmp_path, monkeypatch)
+    manifest["records"][0]["cache_sha256"] = "9" * 64
+    monkeypatch.setattr(
+        sealed_test, "compute_feature_corpus_sha256", lambda m: sealed_test.
+        FEATURE_CORPUS_SHA256
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="feature cache SHA-256 mismatch"):
+        sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+
+
+def test_feature_integrity_rejects_wrong_embedded_metadata(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, manifest = _feature_fixture(tmp_path, monkeypatch)
+    manifest["records"][0]["subject_id"] = "impostor"
+    monkeypatch.setattr(
+        sealed_test, "compute_feature_corpus_sha256", lambda m: sealed_test.
+        FEATURE_CORPUS_SHA256
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="feature metadata mismatch"):
+        sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+
+
+def test_feature_integrity_rejects_a_cache_path_escape(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, manifest = _feature_fixture(tmp_path, monkeypatch)
+    manifest["records"][0]["cache_path"] = "../escaped.npz"
+    monkeypatch.setattr(
+        sealed_test, "compute_feature_corpus_sha256", lambda m: sealed_test.
+        FEATURE_CORPUS_SHA256
+    )
+    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="escapes its root"):
+        sealed_test.validate_sealed_test_feature_integrity(access_token, root)
+
+
+def test_feature_integrity_never_requests_the_numeric_features() -> None:
+    from cardiosentinel.baseline import cache as cache_module
+
+    source = Path(cache_module.__file__).read_text(encoding="utf-8")
+    # read_cache_metadata is the only reader used, and it loads metadata_json.
+    assert "def read_cache_metadata" in source
+    assert 'cached["metadata_json"]' in source
+    evaluator = Path(sealed_test.__file__).read_text(encoding="utf-8")
+    assert '"features"' not in evaluator
+    assert "read_cache_metadata" in evaluator
+
+
+# --------------------------------------------------------------------------
+# Sealed-test source integrity
+# --------------------------------------------------------------------------
+
+
+def _source_fixture(tmp_path, monkeypatch):
+    """Build a synthetic pinned source tree with a matching checksum manifest."""
+    root = tmp_path / "cardiosentinel-data" / "synthetic"
+    root.mkdir(parents=True)
+    digests = {}
+    for suffix in ("hea", "dat", "stb"):
+        path = root / f"t1.{suffix}"
+        path.write_bytes(f"synthetic-{suffix}".encode())
+        digests[f"t1.{suffix}"] = sealed_test.sha256_file(path)
+    manifest_path = root / "SHA256SUMS.txt"
+    manifest_path.write_text(
+        "".join(f"{value}  {name}\n" for name, value in sorted(digests.items())),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        sealed_test, "OFFICIAL_MANIFEST_SHA256", sealed_test.sha256_file(manifest_path)
+    )
+    monkeypatch.setattr(
+        sealed_test, "require_nonversioned_path", lambda path, purpose: Path(path)
+    )
+    record_digest = sealed_test.source_record_sha256("t1", digests)
+    receipt = {
+        "records": [
+            {"record_id": "t1", "partition": "test", "source_sha256": record_digest}
+        ]
+    }
+    return root, receipt
+
+
+def test_source_integrity_requires_an_access_capability(tmp_path) -> None:
+    with pytest.raises(SealedTestAttemptError, match="durable attempt receipt"):
+        sealed_test.validate_sealed_test_source_integrity(None, tmp_path, {})
+
+
+def test_source_integrity_verifies_current_bytes(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, feature_receipt = _source_fixture(tmp_path, monkeypatch)
+    receipt = sealed_test.validate_sealed_test_source_integrity(
+        access_token, root, feature_receipt
+    )
+
+    assert receipt["verification_result"] == "passed"
+    assert receipt["verified_test_record_count"] == 1
+    assert receipt["verified_test_source_file_count"] == 3
+    assert len(receipt["sealed_test_source_integrity_sha256"]) == 64
+
+
+def test_source_integrity_rejects_an_unpinned_official_manifest(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, feature_receipt = _source_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(sealed_test, "OFFICIAL_MANIFEST_SHA256", "7" * 64)
+
+    with pytest.raises(ValueError, match="manifest digest is not pinned"):
+        sealed_test.validate_sealed_test_source_integrity(
+            access_token, root, feature_receipt
+        )
+
+
+@pytest.mark.parametrize("suffix", ["hea", "dat", "stb"])
+def test_source_integrity_rejects_any_altered_test_source_file(
+    tmp_path, monkeypatch, access_token, suffix
+) -> None:
+    root, feature_receipt = _source_fixture(tmp_path, monkeypatch)
+    (root / f"t1.{suffix}").write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="source SHA-256 mismatch"):
+        sealed_test.validate_sealed_test_source_integrity(
+            access_token, root, feature_receipt
+        )
+
+
+def test_source_integrity_rejects_a_record_digest_mismatch(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, feature_receipt = _source_fixture(tmp_path, monkeypatch)
+    feature_receipt["records"][0]["source_sha256"] = "8" * 64
+
+    with pytest.raises(ValueError, match="source record digest mismatch"):
+        sealed_test.validate_sealed_test_source_integrity(
+            access_token, root, feature_receipt
+        )
+
+
+def test_source_integrity_refuses_a_non_test_partition(
+    tmp_path, monkeypatch, access_token
+) -> None:
+    root, feature_receipt = _source_fixture(tmp_path, monkeypatch)
+    feature_receipt["records"][0]["partition"] = "train"
+
+    with pytest.raises(ValueError, match="foreign partition"):
+        sealed_test.validate_sealed_test_source_integrity(
+            access_token, root, feature_receipt
+        )
+
+
+# --------------------------------------------------------------------------
+# Integrity gates block scoring
+# --------------------------------------------------------------------------
+
+
+def test_feature_integrity_failure_prevents_scoring(
+    harness, monkeypatch, run_dir
+) -> None:
+    scored: list[int] = []
+
+    def refuse(access, feature_root):
+        raise ValueError("sealed-test feature cache SHA-256 mismatch")
+
+    monkeypatch.setattr(
+        sealed_test, "validate_sealed_test_feature_integrity", refuse
+    )
+    monkeypatch.setattr(
+        sealed_test, "score_sealed_test", lambda *a, **k: scored.append(1)
+    )
+    with pytest.raises(ValueError, match="cache SHA-256 mismatch"):
+        _evaluate(harness)
+
+    assert scored == []
+    receipt = json.loads((run_dir / TEST_ATTEMPT_NAME).read_text())
+    assert receipt["attempt_status"] == ATTEMPT_FAILED
+    assert receipt["human_review_required"] is True
+    assert receipt["repeat_attempt_permitted"] is False
+    assert not (run_dir / TEST_METRICS_NAME).exists()
+
+
+def test_source_integrity_failure_prevents_scoring(
+    harness, monkeypatch, run_dir
+) -> None:
+    scored: list[int] = []
+
+    def refuse(access, source, receipt):
+        raise ValueError("sealed-test source SHA-256 mismatch")
+
+    monkeypatch.setattr(sealed_test, "validate_sealed_test_source_integrity", refuse)
+    monkeypatch.setattr(
+        sealed_test, "score_sealed_test", lambda *a, **k: scored.append(1)
+    )
+    with pytest.raises(ValueError, match="source SHA-256 mismatch"):
+        _evaluate(harness)
+
+    assert scored == []
+    receipt = json.loads((run_dir / TEST_ATTEMPT_NAME).read_text())
+    assert receipt["attempt_status"] == ATTEMPT_FAILED
+    assert not (run_dir / TEST_PREDICTIONS_NAME).exists()
+
+
+def test_audit_binds_both_integrity_digests(harness, run_dir) -> None:
+    _evaluate(harness)
+    audit = json.loads((run_dir / TEST_AUDIT_NAME).read_text())
+
+    assert audit["sealed_test_feature_integrity_sha256"] == "f" * 64
+    assert audit["sealed_test_source_integrity_sha256"] == "e" * 64
+    assert audit["canonical_feature_corpus_sha256"]
+    assert audit["official_source_manifest_sha256"]
+    assert audit["verified_test_record_count"] == 3
+    assert audit["verified_test_cache_count"] == 3
+    assert audit["verified_test_source_file_count"] == 9
+    assert audit["initial_attempt_receipt_sha256"]
+
+    receipt = json.loads((run_dir / TEST_ATTEMPT_NAME).read_text())
+    assert receipt["sealed_test_feature_integrity_sha256"] == "f" * 64
+    assert receipt["sealed_test_source_integrity_sha256"] == "e" * 64

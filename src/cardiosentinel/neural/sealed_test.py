@@ -34,6 +34,8 @@ from numpy.typing import NDArray
 
 from cardiosentinel.baseline.cache import (
     FEATURE_MANIFEST_NAME,
+    compute_feature_corpus_sha256,
+    read_cache_metadata,
     read_json,
     require_nonversioned_path,
 )
@@ -44,6 +46,11 @@ from cardiosentinel.baseline.metrics import (
     positive_context_analysis,
     subject_bootstrap_confidence_intervals,
     subject_macro_metrics,
+)
+from cardiosentinel.baseline.source import (
+    OFFICIAL_MANIFEST_NAME,
+    OFFICIAL_MANIFEST_SHA256,
+    parse_checksum_manifest,
 )
 from cardiosentinel.data.provenance import git_provenance, sha256_file
 from cardiosentinel.evaluation.protocol import BOOTSTRAP_REPLICATES, BOOTSTRAP_SEED
@@ -56,12 +63,19 @@ from cardiosentinel.neural.experiment import (
     resolve_run_dir,
     validate_experiment_lock,
 )
-from cardiosentinel.neural.integrity import canonical_sha256
+from cardiosentinel.neural.integrity import (
+    SOURCE_SUFFIXES,
+    _expected_embedded_metadata,
+    _validate_manifest_identity,
+    canonical_sha256,
+    source_record_sha256,
+)
 from cardiosentinel.neural.metadata import _manifest_identity, _metadata_arrays
 from cardiosentinel.neural.model import B4CompactCNN
 from cardiosentinel.neural.protocol import (
     DATASET,
     DATASET_VERSION,
+    FEATURE_CORPUS_SHA256,
     PRIMARY_FAMILIES,
     REPOSITORY_ROOT,
     WINDOW_SAMPLES,
@@ -105,15 +119,20 @@ class SealedTestAttemptError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class SealedTestAccess:
-    """Capability proving the durable one-shot attempt receipt already exists.
+    """Capability proving the durable one-shot attempt claim already exists.
 
     Only `open_sealed_test_attempt` constructs this. Every function that can
     resolve, open, or read sealed-test data demands one.
+
+    `initial_attempt_receipt_sha256` hashes the exact STARTED bytes written when
+    attempt #1 was exclusively claimed. The receipt is amended later, so this
+    digest deliberately does not describe the final receipt and must never be
+    read as doing so.
     """
 
     run_dir: Path
     receipt_path: Path
-    receipt_sha256: str
+    initial_attempt_receipt_sha256: str
     experiment_lock_sha256: str
     checkpoint_sha256: str
     locked_threshold: float
@@ -176,6 +195,58 @@ def _require_access(access: SealedTestAccess) -> SealedTestAccess:
     return access
 
 
+def _fsync_directory(directory: Path) -> None:
+    handle = os.open(directory, os.O_DIRECTORY)
+    try:
+        os.fsync(handle)
+    finally:
+        os.close(handle)
+
+
+def _describe_existing_attempt(path: Path) -> str:
+    """Summarize a prior claim without letting corruption mask the refusal."""
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+        return (
+            f"status={existing.get('attempt_status')}, "
+            f"sequence={existing.get('attempt_sequence')}"
+        )
+    except (OSError, ValueError):
+        # An unreadable or truncated claim still consumed the one attempt.
+        return "status=unreadable_or_corrupt"
+
+
+def claim_attempt_exclusively(path: Path, payload: dict[str, Any]) -> str:
+    """Create the one-shot attempt claim with an atomic O_EXCL creation.
+
+    `os.open(O_CREAT | O_EXCL)` is atomic on POSIX, so exactly one process can
+    ever create this path. A check-then-write sequence could not provide that
+    guarantee: two processes could both observe an absent file and both write.
+
+    A partially written or later-corrupted claim is never removed or reused. The
+    attempt is consumed the instant the path exists, which is the conservative
+    reading of the one-shot contract.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError as error:
+        raise SealedTestAttemptError(
+            "A B4 sealed-test attempt already exists "
+            f"({_describe_existing_attempt(path)}). There is exactly one "
+            "predeclared attempt; it cannot be repeated, reset, or overridden, "
+            "and any further evaluation requires documented human review."
+        ) from error
+    # From here the claim exists on disk. It is never unlinked on failure.
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    _fsync_directory(path.parent)
+    return sha256_file(path)
+
+
 def write_json_durable(path: Path, payload: dict[str, Any]) -> str:
     """Write JSON atomically and fsync both file and directory; return its hash."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -186,11 +257,7 @@ def write_json_durable(path: Path, payload: dict[str, Any]) -> str:
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
-    directory = os.open(path.parent, os.O_DIRECTORY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
+    _fsync_directory(path.parent)
     return sha256_file(path)
 
 
@@ -279,16 +346,6 @@ def open_sealed_test_attempt(
         raise SealedTestAttemptError("The lock has no finite validation threshold.")
 
     receipt_path = run_dir / TEST_ATTEMPT_NAME
-    if receipt_path.exists():
-        existing = read_json(receipt_path) if receipt_path.is_file() else {}
-        raise SealedTestAttemptError(
-            "A B4 sealed-test attempt already exists "
-            f"(status={existing.get('attempt_status')}, "
-            f"sequence={existing.get('attempt_sequence')}). There is exactly one "
-            "predeclared attempt; it cannot be repeated, reset, or overridden, "
-            "and any further evaluation requires documented human review."
-        )
-
     determinism = initialize_determinism(requested_device=requested_device)
     environment = runtime_environment(determinism.device, workers)
     execution = _execution_payload(
@@ -320,13 +377,14 @@ def open_sealed_test_attempt(
         "test_data_access_began": False,
         "test": None,
     }
-    # The receipt reaches durable storage here. Nothing above this line has
-    # resolved or opened a single sealed-test artifact.
-    receipt_sha256 = write_json_durable(receipt_path, receipt)
+    # The claim is created atomically and durably here. Nothing above this line
+    # has resolved or opened a single sealed-test artifact, and only a process
+    # that wins the exclusive creation ever receives a capability token.
+    initial_receipt_sha256 = claim_attempt_exclusively(receipt_path, receipt)
     access = SealedTestAccess(
         run_dir=run_dir,
         receipt_path=receipt_path,
-        receipt_sha256=receipt_sha256,
+        initial_attempt_receipt_sha256=initial_receipt_sha256,
         experiment_lock_sha256=lock["experiment_lock_sha256"],
         checkpoint_sha256=lock["checkpoint_sha256"],
         locked_threshold=threshold,
@@ -344,6 +402,164 @@ def _update_attempt(
     receipt["repeat_attempt_permitted"] = False
     write_json_durable(access.receipt_path, receipt)
     return receipt
+
+
+def _safe_cache_path(root: Path, relative: str) -> Path:
+    path = (root / relative).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("Sealed-test cache path escapes its root.") from error
+    return path
+
+
+def _sealed_test_entries(manifest: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    entries = tuple(
+        sorted(
+            (
+                entry
+                for entry in manifest.get("records", ())
+                if entry.get("partition") == SEALED_TEST_PARTITION
+            ),
+            key=lambda entry: str(entry.get("record_id")),
+        )
+    )
+    record_ids = [entry.get("record_id") for entry in entries]
+    if not entries or len(set(record_ids)) != len(record_ids):
+        raise ValueError("Sealed-test feature records are absent or duplicated.")
+    if any(entry.get("status") != "complete" for entry in entries):
+        raise ValueError("The sealed-test feature corpus has an incomplete record.")
+    return entries
+
+
+def validate_sealed_test_feature_integrity(
+    access: SealedTestAccess, feature_root: Path
+) -> dict[str, Any]:
+    """Rehash the current sealed-test caches and verify their embedded metadata.
+
+    This is deliberately impossible before the durable attempt claim: it demands
+    the capability token, so no sealed-test byte is hashed until attempt #1 has
+    been consumed.
+    """
+    _require_access(access)
+    root = require_nonversioned_path(feature_root, "B4 sealed-test feature root")
+    manifest = read_json(root / FEATURE_MANIFEST_NAME)
+    # Reuse the frozen development identity check verbatim: it is partition
+    # agnostic and already binds dataset, split, geometry, schema and corpus.
+    _validate_manifest_identity(manifest, FEATURE_CORPUS_SHA256)
+    if compute_feature_corpus_sha256(manifest) != FEATURE_CORPUS_SHA256:
+        raise ValueError("Sealed-test canonical feature-corpus SHA-256 differs.")
+
+    verified: list[dict[str, Any]] = []
+    for entry in _sealed_test_entries(manifest):
+        cache_path = _safe_cache_path(root, str(entry["cache_path"]))
+        if not cache_path.is_file():
+            raise ValueError(
+                f"Sealed-test feature cache is absent: {entry['record_id']}"
+            )
+        actual = sha256_file(cache_path)
+        if actual != entry.get("cache_sha256"):
+            raise ValueError(
+                f"Sealed-test feature cache SHA-256 mismatch: {entry['record_id']}"
+            )
+        # Metadata only. The numeric `features` member is never requested.
+        metadata = read_cache_metadata(cache_path)
+        expected = _expected_embedded_metadata(manifest, entry)
+        if any(metadata.get(key) != value for key, value in expected.items()):
+            raise ValueError(
+                f"Sealed-test feature metadata mismatch: {entry['record_id']}"
+            )
+        verified.append(
+            {
+                "record_id": entry["record_id"],
+                "subject_id": entry["subject_id"],
+                "partition": entry["partition"],
+                "row_count": entry["row_count"],
+                "cache_sha256": actual,
+                "source_sha256": entry["source_sha256"],
+            }
+        )
+
+    scientific = {
+        "dataset": DATASET,
+        "dataset_version": DATASET_VERSION,
+        "split_sha256": manifest["split_sha256"],
+        "feature_corpus_sha256": FEATURE_CORPUS_SHA256,
+        "partition": SEALED_TEST_PARTITION,
+        "records": verified,
+    }
+    return {
+        **scientific,
+        "sealed_test_feature_integrity_sha256": canonical_sha256(scientific),
+        "verified_test_record_count": len(verified),
+        "verified_test_cache_count": len(verified),
+        "local_feature_root": str(root),
+        "verification_result": "passed",
+    }
+
+
+def validate_sealed_test_source_integrity(
+    access: SealedTestAccess,
+    source: Path,
+    feature_integrity_receipt: dict[str, Any],
+) -> dict[str, Any]:
+    """Hash the current sealed-test source bytes against the pinned manifest.
+
+    Requires the capability token, so no test waveform byte is read before the
+    durable attempt claim exists.
+    """
+    _require_access(access)
+    root = require_nonversioned_path(source, "B4 sealed-test waveform source")
+    manifest_path = root / OFFICIAL_MANIFEST_NAME
+    if sha256_file(manifest_path) != OFFICIAL_MANIFEST_SHA256:
+        raise ValueError("Official LTSTDB source manifest digest is not pinned.")
+    official = parse_checksum_manifest(manifest_path)
+
+    verified: list[dict[str, Any]] = []
+    for entry in feature_integrity_receipt.get("records", ()):
+        if entry.get("partition") != SEALED_TEST_PARTITION:
+            raise ValueError("Sealed-test source receipt saw a foreign partition.")
+        record_id = str(entry["record_id"])
+        if Path(record_id).name != record_id:
+            raise ValueError("Sealed-test source record ID is unsafe.")
+        digests: dict[str, str] = {}
+        for suffix in SOURCE_SUFFIXES:
+            filename = f"{record_id}.{suffix}"
+            if filename not in official:
+                raise ValueError(f"Official source entry is absent: {filename}")
+            actual = sha256_file(root / filename)
+            if actual != official[filename]:
+                raise ValueError(f"Sealed-test source SHA-256 mismatch: {filename}")
+            digests[filename] = actual
+        record_digest = source_record_sha256(record_id, digests)
+        if record_digest != entry.get("source_sha256"):
+            raise ValueError(
+                f"Sealed-test source record digest mismatch: {record_id}"
+            )
+        verified.append(
+            {
+                "record_id": record_id,
+                "partition": SEALED_TEST_PARTITION,
+                "files": digests,
+                "source_sha256": record_digest,
+            }
+        )
+
+    scientific = {
+        "dataset": DATASET,
+        "dataset_version": DATASET_VERSION,
+        "official_manifest_sha256": OFFICIAL_MANIFEST_SHA256,
+        "partition": SEALED_TEST_PARTITION,
+        "records": verified,
+    }
+    return {
+        **scientific,
+        "sealed_test_source_integrity_sha256": canonical_sha256(scientific),
+        "verified_test_record_count": len(verified),
+        "verified_test_source_file_count": len(verified) * len(SOURCE_SUFFIXES),
+        "local_source_root": str(root),
+        "verification_result": "passed",
+    }
 
 
 def load_sealed_test_references(
@@ -369,11 +585,7 @@ def load_sealed_test_references(
         raise ValueError("The sealed-test corpus has no complete records.")
     references: list[SealedTestWindowReference] = []
     for entry in entries:
-        cache_path = (root / str(entry["cache_path"])).resolve()
-        try:
-            cache_path.relative_to(root)
-        except ValueError as error:
-            raise ValueError("Sealed-test cache path escapes its root.") from error
+        cache_path = _safe_cache_path(root, str(entry["cache_path"]))
         arrays = _metadata_arrays(cache_path)
         if len({array.size for array in arrays}) != 1:
             raise ValueError("Sealed-test metadata arrays are not row-aligned.")
@@ -643,9 +855,18 @@ def evaluate_locked_test(
     device = read_json(access.receipt_path)["execution"]["resolved_device"]
     test_access_began = False
     try:
-        references = load_sealed_test_references(access, feature_root)
+        # Integrity of the sealed-test bytes is proven before any row is read
+        # and long before any score exists. Both gates require the capability.
         test_access_began = True
         _update_attempt(access, test_data_access_began=True)
+        feature_receipt = validate_sealed_test_feature_integrity(
+            access, feature_root
+        )
+        source_receipt = validate_sealed_test_source_integrity(
+            access, source, feature_receipt
+        )
+
+        references = load_sealed_test_references(access, feature_root)
         primary_counts = verify_primary_population(references)
 
         model = load_locked_model(access, run_dir, lock, device)
@@ -671,7 +892,9 @@ def evaluate_locked_test(
             "attempt_sequence": ATTEMPT_SEQUENCE,
             "repeat_attempt_permitted": False,
             "experiment_lock_sha256": access.experiment_lock_sha256,
-            "test_attempt_sha256": access.receipt_sha256,
+            "initial_attempt_receipt_sha256": (
+                access.initial_attempt_receipt_sha256
+            ),
             "development_git_sha": lock["git_sha"],
             "evaluator_git_sha": git_provenance(REPOSITORY_ROOT)["git_sha"],
             "evaluator_git_dirty": False,
@@ -684,6 +907,21 @@ def evaluate_locked_test(
             "input_contract": input_contract(),
             "waveform_retrieval": "record-aware direct canonical source reads",
             "external_test_waveform_cache": None,
+            "sealed_test_feature_integrity_sha256": feature_receipt[
+                "sealed_test_feature_integrity_sha256"
+            ],
+            "sealed_test_source_integrity_sha256": source_receipt[
+                "sealed_test_source_integrity_sha256"
+            ],
+            "canonical_feature_corpus_sha256": FEATURE_CORPUS_SHA256,
+            "official_source_manifest_sha256": OFFICIAL_MANIFEST_SHA256,
+            "verified_test_record_count": feature_receipt[
+                "verified_test_record_count"
+            ],
+            "verified_test_cache_count": feature_receipt["verified_test_cache_count"],
+            "verified_test_source_file_count": source_receipt[
+                "verified_test_source_file_count"
+            ],
             "test_primary_counts": primary_counts,
             "test_challenge_counts": {
                 family: int(
@@ -713,6 +951,12 @@ def evaluate_locked_test(
             test_audit_sha256=audit_sha256,
             test_metrics_sha256=metrics_sha256,
             test_predictions_sha256=predictions_sha256,
+            sealed_test_feature_integrity_sha256=feature_receipt[
+                "sealed_test_feature_integrity_sha256"
+            ],
+            sealed_test_source_integrity_sha256=source_receipt[
+                "sealed_test_source_integrity_sha256"
+            ],
             completed_at_utc_audit_only=time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
             ),
