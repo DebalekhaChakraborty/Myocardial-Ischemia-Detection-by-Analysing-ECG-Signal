@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import numpy as np
 import torch
@@ -189,8 +189,15 @@ def run_frozen_training(
     validation_batches: Iterable[tuple[Tensor, Tensor]],
     device: torch.device,
     checkpoint_path: Path,
+    *,
+    epoch_callback: Callable[[CompletedEpoch], None] | None = None,
 ) -> FrozenTrainingResult:
-    """Execute frozen B4 training semantics; this function has no test-data API."""
+    """Execute frozen B4 training semantics; this function has no test-data API.
+
+    `epoch_callback` is non-scientific crash-safety instrumentation. It observes
+    each completed epoch so a caller can persist evidence, and it can neither
+    change nor veto any checkpoint, threshold, or stopping decision.
+    """
     optimizer = build_optimizer(model)
     loss_function = build_loss()
     tracker = CheckpointTracker()
@@ -204,15 +211,16 @@ def run_frozen_training(
         decision = tracker.update(epoch, auprc)
         if decision.save_checkpoint:
             save_checkpoint(checkpoint_path, model, optimizer)
-        history.append(
-            CompletedEpoch(
-                epoch=epoch,
-                mean_training_loss=training_loss,
-                validation_auprc=auprc,
-                checkpoint_saved=decision.save_checkpoint,
-                early_stopping_patience=decision.patience,
-            )
+        completed = CompletedEpoch(
+            epoch=epoch,
+            mean_training_loss=training_loss,
+            validation_auprc=auprc,
+            checkpoint_saved=decision.save_checkpoint,
+            early_stopping_patience=decision.patience,
         )
+        history.append(completed)
+        if epoch_callback is not None:
+            epoch_callback(completed)
         if decision.stop_training:
             break
 
