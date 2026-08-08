@@ -83,6 +83,8 @@ EXPERIMENT_ID = "B4_raw_compact_cnn_v1"
 RUN_COLLECTION = "phase3b2-b4-v1"
 DEFAULT_RUN_ROOT = REPOSITORY_ROOT / "cardiosentinel-runs" / RUN_COLLECTION
 DEFAULT_COMMAND = "cardiosentinel b4 run-train-validation"
+PREFLIGHT_COMMAND = "cardiosentinel b4 run-preflight"
+PROGRAM_IDENTITY = "python -m cardiosentinel"
 
 RUN_STATUS_NAME = "RUN_STATUS.json"
 RUN_MANIFEST_NAME = "RUN_MANIFEST.json"
@@ -133,19 +135,48 @@ def input_contract() -> dict[str, Any]:
     }
 
 
+def _require_consistent_frozen_constants() -> None:
+    """Check frozen model arithmetic without constructing any PyTorch module."""
+    if FP32_PARAMETER_BYTES != TRAINABLE_PARAMETER_COUNT * 4:
+        raise ValueError("Frozen B4 parameter payload contradicts its parameter count.")
+    if local_receptive_field_samples() != LOCAL_RECEPTIVE_FIELD_SAMPLES:
+        raise ValueError("B4 receptive field differs from the frozen protocol.")
+    if TEMPORAL_LENGTHS != (2500, 1250, 625, 313, 157, 79):
+        raise ValueError("B4 temporal lengths differ from the frozen protocol.")
+
+
+def frozen_model_identity() -> dict[str, Any]:
+    """Report the expected model identity from committed protocol constants.
+
+    Scientific preflight uses this so it never instantiates a PyTorch module
+    before frozen seeds and deterministic settings are established. Actual
+    implementation drift is caught by `model_identity` on the canonical model.
+    """
+    _require_consistent_frozen_constants()
+    return {
+        "identity_source": "frozen_protocol_constants",
+        "verified_against_constructed_model": False,
+        "architecture": "B4CompactCNN",
+        "trainable_parameter_count": TRAINABLE_PARAMETER_COUNT,
+        "fp32_parameter_payload_bytes": FP32_PARAMETER_BYTES,
+        "local_receptive_field_samples": LOCAL_RECEPTIVE_FIELD_SAMPLES,
+        "temporal_lengths": list(TEMPORAL_LENGTHS),
+        "output": "single_raw_logit",
+    }
+
+
 def model_identity(model: torch.nn.Module) -> dict[str, Any]:
     """Describe the constructed model and fail if it drifts from the protocol."""
+    _require_consistent_frozen_constants()
     parameters = trainable_parameter_count(model)
     payload_bytes = fp32_parameter_payload_bytes(model)
     if parameters != TRAINABLE_PARAMETER_COUNT:
         raise ValueError("B4 model parameter count differs from the frozen protocol.")
     if payload_bytes != FP32_PARAMETER_BYTES:
         raise ValueError("B4 model payload differs from the frozen protocol.")
-    if local_receptive_field_samples() != LOCAL_RECEPTIVE_FIELD_SAMPLES:
-        raise ValueError("B4 receptive field differs from the frozen protocol.")
-    if TEMPORAL_LENGTHS != (2500, 1250, 625, 313, 157, 79):
-        raise ValueError("B4 temporal lengths differ from the frozen protocol.")
     return {
+        "identity_source": "constructed_model",
+        "verified_against_constructed_model": True,
         "architecture": "B4CompactCNN",
         "trainable_parameter_count": parameters,
         "fp32_parameter_payload_bytes": payload_bytes,
@@ -181,6 +212,52 @@ def training_configuration() -> dict[str, Any]:
         "hyperparameter_search": None,
         "restart_selection": None,
     }
+
+
+@dataclass(frozen=True, slots=True)
+class B4ExecutionRequest:
+    """Structured, resolved invocation arguments bound into run provenance.
+
+    Scientific provenance reads these typed fields; the rendered shell string is
+    a human convenience and is never the authoritative record.
+    """
+
+    command: str
+    source: Path
+    feature_root: Path
+    cache_root: Path
+    run_root: Path
+    requested_device: str | None = None
+    workers: int = 0
+    require_clean: bool = True
+    save_validation_predictions: bool | None = None
+
+    def payload(self, resolved_device: str) -> dict[str, Any]:
+        """Render every resolved argument actually used by this invocation."""
+        paths = {
+            name: str(Path(getattr(self, name)).expanduser().resolve())
+            for name in ("source", "feature_root", "cache_root", "run_root")
+        }
+        rendered = [PROGRAM_IDENTITY, *self.command.split()[1:]]
+        for name in ("source", "feature_root", "cache_root", "run_root"):
+            rendered += [f"--{name.replace('_', '-')}", paths[name]]
+        if self.requested_device is not None:
+            rendered += ["--device", self.requested_device]
+        rendered += ["--workers", str(self.workers)]
+        if self.save_validation_predictions is False:
+            rendered.append("--no-validation-predictions")
+        return {
+            "experiment_id": EXPERIMENT_ID,
+            "program": PROGRAM_IDENTITY,
+            "command": self.command,
+            **paths,
+            "requested_device": self.requested_device,
+            "resolved_device": resolved_device,
+            "workers": self.workers,
+            "require_clean": self.require_clean,
+            "save_validation_predictions": self.save_validation_predictions,
+            "shell_command": " ".join(rendered),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -287,38 +364,41 @@ def _require_cache_identity(
 
 
 def prepare_b4_experiment(
-    source: Path,
-    feature_root: Path,
-    cache_root: Path,
-    run_root: Path = DEFAULT_RUN_ROOT,
-    *,
-    requested_device: str | None = None,
-    require_clean: bool = True,
-    workers: int = 0,
+    execution: B4ExecutionRequest,
 ) -> PreparedB4Experiment:
-    """Validate every frozen identity and abort before any model is initialized."""
+    """Validate every frozen identity and abort before any model is initialized.
+
+    This function never instantiates `B4CompactCNN`. It reports the expected
+    model identity from committed protocol constants so that no PyTorch module
+    exists before frozen seeds and deterministic settings are established.
+    """
+    workers = execution.workers
     if workers < 0:
         raise ValueError("B4 worker count cannot be negative.")
     protocol_sha256 = validate_frozen_protocol()
     provenance = git_provenance(REPOSITORY_ROOT)
-    if require_clean and provenance["git_dirty"]:
+    if execution.require_clean and provenance["git_dirty"]:
         raise ValueError("The canonical B4 run requires a clean Git checkout.")
 
-    run_dir = resolve_run_dir(run_root)
+    run_dir = resolve_run_dir(execution.run_root)
     _require_no_prior_experiment(run_dir)
     resources = _require_output_disk(run_dir.parent)
 
-    feature_receipt = validate_development_feature_integrity(feature_root)
-    source_receipt = validate_development_source_integrity(source, feature_receipt)
-    indexes = build_development_indexes(feature_root)
+    feature_receipt = validate_development_feature_integrity(execution.feature_root)
+    source_receipt = validate_development_source_integrity(
+        execution.source, feature_receipt
+    )
+    indexes = build_development_indexes(execution.feature_root)
     _require_frozen_counts(indexes)
-    cache = validate_waveform_cache(cache_root, indexes)
+    cache = validate_waveform_cache(execution.cache_root, indexes)
     _require_cache_identity(cache.manifest, feature_receipt, source_receipt)
 
-    # Constants are checked on a disposable model; the canonical model is built
-    # only after determinism is re-established immediately before training.
-    model_config = model_identity(B4CompactCNN())
-    determinism = initialize_determinism(requested_device=requested_device)
+    # No model is constructed here. Determinism is established first, and the
+    # canonical model is built only inside run_b4_train_validation.
+    determinism = initialize_determinism(
+        requested_device=execution.requested_device
+    )
+    model_config = frozen_model_identity()
     environment = runtime_environment(determinism.device, workers)
     if environment.get("amp_enabled") is not False:
         raise ValueError("B4 forbids automatic mixed precision.")
@@ -356,6 +436,7 @@ def prepare_b4_experiment(
             "cuda_workspace_config": determinism.cuda_workspace_config,
         },
         "environment": environment,
+        "execution": execution.payload(determinism.device),
         "git": provenance,
         "partitions": {
             partition: _index_summary(indexes[partition])
@@ -385,13 +466,17 @@ def b4_scientific_preflight(
 ) -> dict[str, Any]:
     """Report canonical-run readiness without initializing or training a model."""
     prepared = prepare_b4_experiment(
-        source,
-        feature_root,
-        cache_root,
-        run_root,
-        requested_device=requested_device,
-        require_clean=require_clean,
-        workers=workers,
+        B4ExecutionRequest(
+            command=PREFLIGHT_COMMAND,
+            source=source,
+            feature_root=feature_root,
+            cache_root=cache_root,
+            run_root=run_root,
+            requested_device=requested_device,
+            workers=workers,
+            require_clean=require_clean,
+            save_validation_predictions=None,
+        )
     )
     return prepared.report
 
@@ -559,11 +644,20 @@ def build_experiment_lock(
         "validation_evidence_sha256": validation_evidence_sha256,
         "validation_predictions_sha256": validation_predictions_sha256,
         "command": command,
+        "execution": report["execution"],
         "total_duration_seconds": duration_seconds,
         "test": None,
     }
     if payload["git_dirty"]:
         raise ValueError("The B4 experiment lock requires a clean Git checkout.")
+    if payload["execution"]["require_clean"] is not True:
+        raise ValueError("The canonical B4 run must require a clean checkout.")
+    if payload["execution"]["command"] != payload["command"]:
+        raise ValueError("B4 execution provenance disagrees with the run command.")
+    if not payload["environment"]["dependencies"]["installed_packages"]:
+        raise ValueError("The B4 experiment lock requires a dependency snapshot.")
+    if not payload["model"]["verified_against_constructed_model"]:
+        raise ValueError("The B4 lock requires a verified constructed-model identity.")
     if payload["trainable_parameter_count"] != TRAINABLE_PARAMETER_COUNT:
         raise ValueError("The B4 experiment lock has the wrong parameter count.")
     if payload["test"] is not None:
@@ -600,7 +694,6 @@ def run_b4_train_validation(
     *,
     command: str = DEFAULT_COMMAND,
     requested_device: str | None = None,
-    require_clean: bool = True,
     workers: int = 0,
     save_validation_predictions: bool = True,
 ) -> dict[str, Any]:
@@ -608,18 +701,22 @@ def run_b4_train_validation(
 
     This command has no test-partition route: it builds development indexes
     only, reads the validated train/validation waveform cache, and writes a lock
-    whose `test` field is always null.
+    whose `test` field is always null. A clean Git checkout is structurally
+    mandatory: there is deliberately no parameter that can relax it.
     """
     started = time.monotonic()
-    prepared = prepare_b4_experiment(
-        source,
-        feature_root,
-        cache_root,
-        run_root,
+    execution = B4ExecutionRequest(
+        command=command,
+        source=source,
+        feature_root=feature_root,
+        cache_root=cache_root,
+        run_root=run_root,
         requested_device=requested_device,
-        require_clean=require_clean,
         workers=workers,
+        require_clean=True,
+        save_validation_predictions=save_validation_predictions,
     )
+    prepared = prepare_b4_experiment(execution)
     run_dir = prepared.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_status(run_dir, STATUS_RUNNING, command=command)
@@ -638,12 +735,17 @@ def run_b4_train_validation(
         training_loader = build_training_loader(train_dataset, workers=workers)
         validation_loader = build_validation_loader(validation_dataset, workers=workers)
 
-        # Re-establish every frozen seed so the canonical model is initialized
-        # exactly once from the protocol seed, unaffected by earlier RNG use.
+        # Re-establish every frozen seed immediately before construction so the
+        # canonical model is initialized exactly once from the protocol seed,
+        # unaffected by any earlier RNG use. Nothing may consume RNG between
+        # this call and the constructor on the next line.
         initialize_determinism(requested_device=prepared.device)
+        model = B4CompactCNN()
+        # Validate the real constructed model so implementation drift fails
+        # before a single training batch is processed.
+        prepared.report["model"] = model_identity(model)
         device = torch.device(prepared.device)
-        model = B4CompactCNN().to(device)
-        model_identity(model)
+        model = model.to(device)
 
         history: list[dict[str, Any]] = []
 

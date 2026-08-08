@@ -22,7 +22,9 @@ from cardiosentinel.neural.experiment import (
     RUN_STATUS_NAME,
     STATUS_COMPLETE,
     STATUS_FAILED,
+    B4ExecutionRequest,
     build_experiment_lock,
+    frozen_model_identity,
     prepare_b4_experiment,
     resolve_run_dir,
     run_b4_train_validation,
@@ -166,15 +168,21 @@ def _run(harness, **kwargs):
     )
 
 
+def _request(harness, **kwargs) -> B4ExecutionRequest:
+    arguments = {
+        "command": "cardiosentinel b4 run-preflight",
+        "source": harness["source"],
+        "feature_root": harness["feature_root"],
+        "cache_root": harness["cache_root"],
+        "run_root": harness["run_root"],
+        "requested_device": "cpu",
+    }
+    arguments.update(kwargs)
+    return B4ExecutionRequest(**arguments)
+
+
 def _prepare(harness, **kwargs):
-    return prepare_b4_experiment(
-        harness["source"],
-        harness["feature_root"],
-        harness["cache_root"],
-        harness["run_root"],
-        requested_device="cpu",
-        **kwargs,
-    )
+    return prepare_b4_experiment(_request(harness, **kwargs))
 
 
 def _stub_training(monkeypatch, auprc_sequence, *, threshold_scores=None):
@@ -289,15 +297,73 @@ def test_preflight_rejects_row_count_drift(harness, monkeypatch) -> None:
         _prepare(harness)
 
 
-def test_preflight_rejects_wrong_model_parameter_count(harness, monkeypatch) -> None:
-    monkeypatch.setattr(experiment, "TRAINABLE_PARAMETER_COUNT", 12345)
-    with pytest.raises(ValueError, match="parameter count differs"):
+def test_preflight_rejects_inconsistent_frozen_model_constants(
+    harness, monkeypatch
+) -> None:
+    monkeypatch.setattr(experiment, "FP32_PARAMETER_BYTES", 1)
+    with pytest.raises(ValueError, match="contradicts its parameter count"):
         _prepare(harness)
 
 
 def test_preflight_does_not_create_the_run_directory(harness) -> None:
     prepared = _prepare(harness)
     assert not prepared.run_dir.exists()
+
+
+# --------------------------------------------------------------------------
+# Preflight never initializes a model
+# --------------------------------------------------------------------------
+
+
+def test_preflight_never_constructs_the_b4_model(harness, monkeypatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Scientific preflight must not construct B4CompactCNN.")
+
+    monkeypatch.setattr(experiment, "B4CompactCNN", forbidden)
+    report = _prepare(harness).report
+
+    assert report["model"]["identity_source"] == "frozen_protocol_constants"
+    assert report["model"]["verified_against_constructed_model"] is False
+    assert report["model"]["trainable_parameter_count"] == TRAINABLE_PARAMETER_COUNT
+    assert report["model"]["fp32_parameter_payload_bytes"] == 348356
+
+
+def test_frozen_model_identity_matches_a_constructed_model() -> None:
+    frozen = frozen_model_identity()
+    constructed = experiment.model_identity(B4CompactCNN())
+
+    comparable = (
+        "architecture",
+        "trainable_parameter_count",
+        "fp32_parameter_payload_bytes",
+        "local_receptive_field_samples",
+        "temporal_lengths",
+        "output",
+    )
+    assert {key: frozen[key] for key in comparable} == {
+        key: constructed[key] for key in comparable
+    }
+    assert constructed["verified_against_constructed_model"] is True
+
+
+def test_canonical_run_rejects_actual_model_drift_before_training(
+    harness, monkeypatch
+) -> None:
+    import cardiosentinel.neural.training as training
+
+    trained: list[int] = []
+    monkeypatch.setattr(
+        training, "train_one_epoch", lambda *args: trained.append(1) or 0.25
+    )
+    # Internally consistent but wrong constants: preflight's arithmetic check
+    # passes, so only the constructed model can expose the drift.
+    monkeypatch.setattr(experiment, "TRAINABLE_PARAMETER_COUNT", 12345)
+    monkeypatch.setattr(experiment, "FP32_PARAMETER_BYTES", 12345 * 4)
+    assert _prepare(harness).report["model"]["trainable_parameter_count"] == 12345
+
+    with pytest.raises(ValueError, match="parameter count differs"):
+        _run(harness)
+    assert trained == []
 
 
 # --------------------------------------------------------------------------
@@ -446,9 +512,12 @@ def test_model_is_constructed_after_determinism_initialization(
     monkeypatch.setattr(experiment, "B4CompactCNN", SpyModel)
     _run(harness)
 
-    canonical = order.index("model", order.index("determinism"))
+    # Exactly one model is ever constructed, and determinism is the immediately
+    # preceding event, so nothing consumes RNG between seeding and construction.
+    assert order.count("model") == 1
+    canonical = order.index("model")
     assert order[canonical - 1] == "determinism"
-    assert order.count("model") == 2  # one constant probe, one canonical model
+    assert order[:canonical].count("determinism") == 2
 
 
 # --------------------------------------------------------------------------
@@ -663,8 +732,9 @@ def test_lock_digest_is_deterministic_and_detects_tampering(
 
 def test_lock_rejects_a_dirty_checkout_and_wrong_parameter_count(harness) -> None:
     prepared = _prepare(harness)
+    prepared.report["model"]["verified_against_constructed_model"] = True
     arguments = {
-        "command": "unit-test",
+        "command": prepared.report["execution"]["command"],
         "epoch_history": ({"epoch": 1},),
         "selected_epoch": 1,
         "selected_validation_auprc": 0.5,
@@ -721,6 +791,215 @@ def test_synthetic_run_is_never_labelled_a_sealed_test_result(
     )
     assert "test" not in result["validation_evidence"]["partition"]
     assert result["validation_evidence"]["score_semantics"].startswith("uncalibrated")
+
+
+# --------------------------------------------------------------------------
+# Execution provenance
+# --------------------------------------------------------------------------
+
+
+def test_lock_records_non_default_execution_arguments(harness, monkeypatch) -> None:
+    _stub_training(monkeypatch, [0.4, 0.4, 0.4, 0.4, 0.4])
+    result = run_b4_train_validation(
+        harness["source"],
+        harness["feature_root"],
+        harness["cache_root"],
+        harness["run_root"],
+        command="cardiosentinel b4 run-train-validation",
+        requested_device="cpu",
+        workers=3,
+        save_validation_predictions=False,
+    )
+    assert result["status"] == STATUS_COMPLETE
+
+    run_dir = resolve_run_dir(harness["run_root"])
+    lock = validate_experiment_lock(run_dir)
+    execution = lock["execution"]
+
+    # Non-default values must survive rather than silently recording defaults.
+    assert execution["workers"] == 3
+    assert execution["save_validation_predictions"] is False
+    assert execution["requested_device"] == "cpu"
+    assert execution["resolved_device"] == "cpu"
+    assert execution["require_clean"] is True
+    assert execution["experiment_id"] == EXPERIMENT_ID
+    assert execution["command"] == "cardiosentinel b4 run-train-validation"
+    assert execution["source"] == str(harness["source"].resolve())
+    assert execution["feature_root"] == str(harness["feature_root"].resolve())
+    assert execution["cache_root"] == str(harness["cache_root"].resolve())
+    assert execution["run_root"] == str(harness["run_root"].resolve())
+    assert "--workers 3" in execution["shell_command"]
+    assert "--no-validation-predictions" in execution["shell_command"]
+    assert not (run_dir / experiment.VALIDATION_PREDICTIONS_NAME).exists()
+
+
+def test_run_manifest_also_carries_structured_execution(harness, monkeypatch) -> None:
+    _stub_training(monkeypatch, [0.4, 0.4, 0.4, 0.4, 0.4])
+    _run(harness, workers=2)
+    run_dir = resolve_run_dir(harness["run_root"])
+    manifest = json.loads(
+        (run_dir / experiment.RUN_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+
+    assert manifest["execution"]["workers"] == 2
+    assert manifest["execution"]["require_clean"] is True
+
+
+def test_execution_provenance_is_covered_by_the_lock_digest(
+    harness, monkeypatch
+) -> None:
+    _stub_training(monkeypatch, [0.4, 0.4, 0.4, 0.4, 0.4])
+    _run(harness)
+    run_dir = resolve_run_dir(harness["run_root"])
+    lock_path = run_dir / EXPERIMENT_LOCK_NAME
+
+    tampered = json.loads(lock_path.read_text(encoding="utf-8"))
+    tampered["execution"]["workers"] = 99
+    lock_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="lock hash validation failed"):
+        validate_experiment_lock(run_dir)
+
+
+def test_canonical_run_has_no_parameter_to_relax_clean_checkout() -> None:
+    import inspect
+
+    parameters = inspect.signature(run_b4_train_validation).parameters
+    assert "require_clean" not in parameters
+    assert "allow_dirty" not in parameters
+
+
+# --------------------------------------------------------------------------
+# Dependency environment
+# --------------------------------------------------------------------------
+
+
+def test_dependency_snapshot_is_sorted_deterministic_and_digested() -> None:
+    from cardiosentinel.neural.provenance import (
+        KEY_DEPENDENCIES,
+        dependency_environment,
+    )
+
+    first = dependency_environment()
+    second = dependency_environment()
+
+    assert first == second
+    packages = first["installed_packages"]
+    names = [item["name"] for item in packages]
+    assert names == sorted(names)
+    assert len(names) == len(set(names))
+    assert first["installed_package_count"] == len(packages)
+    assert len(first["installed_packages_sha256"]) == 64
+    assert first["name_normalization"] == "pep503"
+    assert first["resolution_source"] == "importlib.metadata"
+    assert set(first["key_dependencies"]) == set(KEY_DEPENDENCIES)
+    for package in ("torch", "numpy"):
+        assert first["key_dependencies"][package]
+    assert all(item["version"] for item in packages)
+
+
+def test_package_name_normalization_follows_pep503() -> None:
+    from cardiosentinel.neural.provenance import normalize_package_name
+
+    assert normalize_package_name("scikit_learn") == "scikit-learn"
+    assert normalize_package_name("Scikit.Learn") == "scikit-learn"
+    assert normalize_package_name("WFDB") == "wfdb"
+
+
+def test_lock_binds_the_resolved_dependency_environment(harness, monkeypatch) -> None:
+    _stub_training(monkeypatch, [0.4, 0.4, 0.4, 0.4, 0.4])
+    _run(harness)
+    run_dir = resolve_run_dir(harness["run_root"])
+    dependencies = validate_experiment_lock(run_dir)["environment"]["dependencies"]
+
+    assert dependencies["installed_packages"]
+    assert dependencies["key_dependencies"]["torch"]
+    assert len(dependencies["installed_packages_sha256"]) == 64
+    recovered = {
+        item["name"]: item["version"] for item in dependencies["installed_packages"]
+    }
+    assert recovered["torch"] == dependencies["key_dependencies"]["torch"]
+
+
+# --------------------------------------------------------------------------
+# Epoch callback semantics
+# --------------------------------------------------------------------------
+
+
+def test_epoch_callback_return_value_cannot_stop_training(
+    monkeypatch, tmp_path
+) -> None:
+    import cardiosentinel.neural.training as training
+
+    labels = np.array([1.0, 0.0])
+    scores = np.array([0.9, 0.1])
+    monkeypatch.setattr(training, "train_one_epoch", lambda *args: 0.25)
+    monkeypatch.setattr(training, "validation_scores", lambda *args: (labels, scores))
+    monkeypatch.setattr(training, "validation_auprc", lambda *args: 0.5)
+    observed: list[int] = []
+
+    result = training.run_frozen_training(
+        torch.nn.Linear(1, 1),
+        (),
+        (),
+        torch.device("cpu"),
+        tmp_path / "checkpoint.pt",
+        epoch_callback=lambda epoch: observed.append(epoch.epoch) or "STOP",
+    )
+
+    # A truthy return is ignored: early stopping still ends the run at epoch 5.
+    assert observed == [1, 2, 3, 4, 5]
+    assert len(result.history) == 5
+    assert result.selected_checkpoint_epoch == 1
+
+
+def test_epoch_callback_runs_after_the_checkpoint_decision(
+    monkeypatch, tmp_path
+) -> None:
+    import cardiosentinel.neural.training as training
+
+    labels = np.array([1.0, 0.0])
+    scores = np.array([0.9, 0.1])
+    values = iter([0.1, 0.9])
+    monkeypatch.setattr(training, "train_one_epoch", lambda *args: 0.25)
+    monkeypatch.setattr(training, "validation_scores", lambda *args: (labels, scores))
+    monkeypatch.setattr(training, "validation_auprc", lambda *args: next(values, 0.9))
+    seen: list[tuple[int, bool]] = []
+
+    training.run_frozen_training(
+        torch.nn.Linear(1, 1),
+        (),
+        (),
+        torch.device("cpu"),
+        tmp_path / "checkpoint.pt",
+        epoch_callback=lambda epoch: seen.append(
+            (epoch.epoch, epoch.checkpoint_saved)
+        ),
+    )
+
+    assert seen[0] == (1, True)
+    assert seen[1] == (2, True)
+
+
+def test_persistence_failure_aborts_the_run_without_a_lock(
+    harness, monkeypatch
+) -> None:
+    _stub_training(monkeypatch, [0.4, 0.4, 0.4, 0.4, 0.4])
+    real_write = experiment.write_json_atomic
+
+    def fail_on_history(path, payload):
+        if path.name == experiment.EPOCH_HISTORY_NAME:
+            raise OSError("simulated evidence persistence failure")
+        return real_write(path, payload)
+
+    monkeypatch.setattr(experiment, "write_json_atomic", fail_on_history)
+    with pytest.raises(OSError, match="persistence failure"):
+        _run(harness)
+
+    run_dir = resolve_run_dir(harness["run_root"])
+    status = json.loads((run_dir / RUN_STATUS_NAME).read_text(encoding="utf-8"))
+    assert status["status"] == STATUS_FAILED
+    assert status["human_review_required"] is True
+    assert not (run_dir / EXPERIMENT_LOCK_NAME).exists()
 
 
 def test_frozen_training_result_contract_is_unchanged() -> None:

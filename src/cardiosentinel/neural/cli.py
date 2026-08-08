@@ -219,6 +219,8 @@ def run_b4_command(args: argparse.Namespace) -> int:
             run_b4_train_validation,
         )
 
+        # The canonical scientific run has no --allow-dirty option by design:
+        # a clean checkout is mandatory and cannot be relaxed from the CLI.
         report = run_b4_train_validation(
             args.source,
             args.feature_root,

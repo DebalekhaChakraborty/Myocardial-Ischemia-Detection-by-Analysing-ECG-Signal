@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import platform
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -22,6 +25,55 @@ from cardiosentinel.neural.protocol import validate_frozen_protocol
 
 EXPECTED_RECORD_COUNT = 86
 EXPECTED_REQUIRED_FILE_COUNT = 1 + EXPECTED_RECORD_COUNT * 3
+# Scientific dependencies named for quick human verification. The full resolved
+# snapshot below remains authoritative; this list never narrows what is bound.
+KEY_DEPENDENCIES = ("numpy", "scikit-learn", "scipy", "torch", "wfdb")
+_NAME_SEPARATORS = re.compile(r"[-_.]+")
+
+
+def normalize_package_name(name: str) -> str:
+    """Normalize a distribution name to its PEP 503 comparison form."""
+    return _NAME_SEPARATORS.sub("-", name).strip().lower()
+
+
+def installed_package_snapshot() -> tuple[dict[str, str], ...]:
+    """Resolve installed distributions deterministically without any network.
+
+    Duplicate installations of one distribution are collapsed to their highest
+    sorted version so the snapshot never depends on filesystem search order.
+    """
+    from importlib.metadata import distributions
+
+    versions: dict[str, set[str]] = {}
+    for distribution in distributions():
+        raw_name = distribution.metadata["Name"]
+        if not raw_name:
+            continue
+        name = normalize_package_name(str(raw_name))
+        versions.setdefault(name, set()).add(str(distribution.version or ""))
+    return tuple(
+        {"name": name, "version": sorted(versions[name])[-1]}
+        for name in sorted(versions)
+    )
+
+
+def dependency_environment() -> dict[str, Any]:
+    """Return the resolved dependency environment bound by the experiment lock."""
+    packages = installed_package_snapshot()
+    resolved = {item["name"]: item["version"] for item in packages}
+    canonical = json.dumps(list(packages), sort_keys=True, separators=(",", ":"))
+    return {
+        "installed_packages": list(packages),
+        "installed_package_count": len(packages),
+        "installed_packages_sha256": hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest(),
+        "key_dependencies": {
+            name: resolved.get(name) for name in KEY_DEPENDENCIES
+        },
+        "name_normalization": "pep503",
+        "resolution_source": "importlib.metadata",
+    }
 
 
 def validate_source_verification_receipt(source: Path) -> dict[str, Any]:
@@ -77,6 +129,7 @@ def runtime_environment(device: str, worker_count: int) -> dict[str, Any]:
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
         "amp_enabled": False,
         "protocol_sha256": validate_frozen_protocol(),
+        "dependencies": dependency_environment(),
     }
 
 

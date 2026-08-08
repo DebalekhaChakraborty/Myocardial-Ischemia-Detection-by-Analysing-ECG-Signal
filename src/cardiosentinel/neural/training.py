@@ -194,9 +194,15 @@ def run_frozen_training(
 ) -> FrozenTrainingResult:
     """Execute frozen B4 training semantics; this function has no test-data API.
 
-    `epoch_callback` is non-scientific crash-safety instrumentation. It observes
-    each completed epoch so a caller can persist evidence, and it can neither
-    change nor veto any checkpoint, threshold, or stopping decision.
+    `epoch_callback` is non-scientific crash-safety instrumentation. It runs
+    only after an epoch has completed and its checkpoint decision is already
+    recorded, its return value is ignored, and it takes no part in checkpoint
+    selection, threshold selection, or the early-stopping computation.
+
+    If persistence raises, the exception propagates and aborts the whole
+    experiment so a run can never continue with missing provenance. That aborts
+    the run for integrity; it never alters the scientific early-stopping
+    decision, which is computed before the callback is invoked.
     """
     optimizer = build_optimizer(model)
     loss_function = build_loss()
