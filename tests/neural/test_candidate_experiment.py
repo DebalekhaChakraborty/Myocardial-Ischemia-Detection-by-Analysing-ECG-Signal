@@ -652,3 +652,448 @@ def test_isolated_benchmark_runs_in_a_fresh_subprocess(locked_run) -> None:
 def test_isolated_benchmark_refuses_an_invalid_run(tmp_path) -> None:
     with pytest.raises(benchmark.LockedModelError, match="Isolated benchmark failed"):
         benchmark.benchmark_locked_model_isolated(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# Official resource benchmark hardening
+# --------------------------------------------------------------------------
+
+
+def _official_lock(directory: Path, model_key: str) -> dict:
+    """Build a synthetic lock that satisfies the frozen official mapping."""
+    from cardiosentinel.data.provenance import sha256_file
+    from cardiosentinel.neural.integrity import canonical_sha256
+    from cardiosentinel.neural.protocol import B4_PROTOCOL_SHA256
+
+    specification = benchmark.OFFICIAL_MODELS[model_key]
+    factory = benchmark.SUPPORTED_ARCHITECTURES[specification["architecture"]]
+    torch.save(factory().state_dict(), directory / "model_selected.pt")
+    checkpoint = directory / "model_selected.pt"
+    lock = {
+        "experiment_id": specification["experiment_id"],
+        "status": "locked_for_one_shot_test",
+        "git_dirty": False,
+        "protocol_sha256": B4_PROTOCOL_SHA256,
+        "model": {
+            "architecture": specification["architecture"],
+            "verified_against_constructed_model": True,
+        },
+        "locked_inference_model": "model_selected.pt",
+        "checkpoint_sha256": sha256_file(checkpoint),
+        "checkpoint_bytes": checkpoint.stat().st_size,
+        "trainable_parameter_count": specification["trainable_parameter_count"],
+        "environment_dependency_digest": B4A_DEPENDENCY_DIGEST,
+        "test": None,
+    }
+    if specification["requires_architecture_protocol"]:
+        lock["architecture_protocol_sha256"] = ARCHITECTURE_PROTOCOL_SHA256
+    lock["experiment_lock_sha256"] = canonical_sha256(lock)
+    (directory / "EXPERIMENT_LOCK.json").write_text(
+        json.dumps(lock), encoding="utf-8"
+    )
+    return lock
+
+
+@pytest.fixture
+def official_runs(tmp_path):
+    directories = {}
+    for key in benchmark.OFFICIAL_ORDER:
+        directory = tmp_path / key
+        directory.mkdir()
+        _official_lock(directory, key)
+        directories[key] = directory
+    return directories
+
+
+def test_resource_protocol_sha_is_enforced(tmp_path) -> None:
+    assert (
+        benchmark.validate_resource_benchmark_protocol()
+        == benchmark.RESOURCE_PROTOCOL_SHA256
+    )
+    impostor = tmp_path / "fake.md"
+    impostor.write_text("not the protocol", encoding="utf-8")
+    with pytest.raises(benchmark.ResourceBenchmarkError, match="frozen SHA-256"):
+        benchmark.validate_resource_benchmark_protocol(impostor)
+
+
+def test_protocol_mismatch_refuses_before_any_forward(
+    official_runs, monkeypatch
+) -> None:
+    calls: list[int] = []
+    monkeypatch.setattr(
+        benchmark, "validate_resource_benchmark_protocol",
+        lambda *a, **k: (_ for _ in ()).throw(
+            benchmark.ResourceBenchmarkError("frozen SHA-256 mismatch")
+        ),
+    )
+    monkeypatch.setattr(
+        benchmark, "load_locked_model",
+        lambda *a, **k: calls.append(1),
+    )
+    with pytest.raises(benchmark.ResourceBenchmarkError, match="SHA-256"):
+        benchmark.measure_locked_model(official_runs["B4-A"])
+    assert calls == []
+
+
+def test_environment_mismatch_refuses_before_any_forward(
+    official_runs, monkeypatch
+) -> None:
+    loaded: list[int] = []
+    broken = benchmark.benchmark_environment()
+    broken["dependencies"] = dict(broken["dependencies"])
+    broken["dependencies"]["installed_packages_sha256"] = "9" * 64
+    monkeypatch.setattr(benchmark, "benchmark_environment", lambda: broken)
+    monkeypatch.setattr(
+        benchmark, "load_locked_model", lambda *a, **k: loaded.append(1)
+    )
+    with pytest.raises(ValueError, match="exact B4-A dependency snapshot"):
+        benchmark.measure_locked_model(official_runs["B4-B"])
+    assert loaded == []
+
+
+def test_environment_version_mismatch_refuses_before_any_forward(
+    official_runs, monkeypatch
+) -> None:
+    loaded: list[int] = []
+    broken = benchmark.benchmark_environment()
+    broken["torch_version"] = "9.9.9"
+    monkeypatch.setattr(benchmark, "benchmark_environment", lambda: broken)
+    monkeypatch.setattr(
+        benchmark, "load_locked_model", lambda *a, **k: loaded.append(1)
+    )
+    with pytest.raises(ValueError, match="Refusing the scientific run"):
+        benchmark.measure_locked_model(official_runs["B4-C"])
+    assert loaded == []
+
+
+def test_official_mapping_rejects_a_wrong_experiment(official_runs) -> None:
+    path = official_runs["B4-B"] / "EXPERIMENT_LOCK.json"
+    payload = json.loads(path.read_text())
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="requires experiment_id"
+    ):
+        benchmark._require_official_lock(payload, "B4-C")
+
+
+def test_official_mapping_rejects_wrong_parameter_count(official_runs) -> None:
+    payload = json.loads(
+        (official_runs["B4-A"] / "EXPERIMENT_LOCK.json").read_text()
+    )
+    payload["trainable_parameter_count"] = 12345
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="trainable parameters"
+    ):
+        benchmark._require_official_lock(payload, "B4-A")
+
+
+def test_official_lock_requires_verified_identity_and_clean_tree(
+    official_runs,
+) -> None:
+    payload = json.loads(
+        (official_runs["B4-C"] / "EXPERIMENT_LOCK.json").read_text()
+    )
+    dirty = {**payload, "git_dirty": True}
+    with pytest.raises(benchmark.ResourceBenchmarkError, match="clean Git checkout"):
+        benchmark._require_official_lock(dirty, "B4-C")
+
+    unverified = json.loads(json.dumps(payload))
+    unverified["model"]["verified_against_constructed_model"] = False
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="verified constructed-model"
+    ):
+        benchmark._require_official_lock(unverified, "B4-C")
+
+
+def test_official_lock_requires_frozen_protocol_digests(official_runs) -> None:
+    payload = json.loads(
+        (official_runs["B4-B"] / "EXPERIMENT_LOCK.json").read_text()
+    )
+    wrong_b4 = {**payload, "protocol_sha256": "0" * 64}
+    with pytest.raises(benchmark.ResourceBenchmarkError, match="B4_PROTOCOL_V1"):
+        benchmark._require_official_lock(wrong_b4, "B4-B")
+
+    wrong_arch = {**payload, "architecture_protocol_sha256": "0" * 64}
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="architecture selection protocol"
+    ):
+        benchmark._require_official_lock(wrong_arch, "B4-B")
+
+
+def test_official_lock_requires_the_frozen_dependency_digest(official_runs) -> None:
+    payload = json.loads(
+        (official_runs["B4-A"] / "EXPERIMENT_LOCK.json").read_text()
+    )
+    payload["environment_dependency_digest"] = "5" * 64
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="frozen dependency digest"
+    ):
+        benchmark._require_official_lock(payload, "B4-A")
+
+
+def test_b4a_historical_environment_equivalent_is_accepted(official_runs) -> None:
+    """B4-A predates the explicit field; the nested equivalent must satisfy it."""
+    payload = json.loads(
+        (official_runs["B4-A"] / "EXPERIMENT_LOCK.json").read_text()
+    )
+    del payload["environment_dependency_digest"]
+    payload["environment"] = {
+        "dependencies": {"installed_packages_sha256": B4A_DEPENDENCY_DIGEST}
+    }
+    benchmark._require_official_lock(payload, "B4-A")
+
+
+def test_checkpoint_byte_size_mismatch_refuses(official_runs) -> None:
+    path = official_runs["B4-A"] / "EXPERIMENT_LOCK.json"
+    payload = json.loads(path.read_text())
+    payload["checkpoint_bytes"] = 12
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    payload.pop("experiment_lock_sha256")
+    payload["experiment_lock_sha256"] = canonical_sha256(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(benchmark.LockedModelError, match="byte size does not match"):
+        benchmark.validate_locked_model(official_runs["B4-A"])
+
+
+def test_p95_uses_nearest_rank_ceil() -> None:
+    samples = list(range(1, 501))
+    assert benchmark.nearest_rank_p95(samples) == 475
+    assert benchmark.nearest_rank_p95([10]) == 10
+    assert benchmark.nearest_rank_p95(list(range(1, 21))) == 19
+
+
+def test_median_remains_the_tie_break_statistic(official_runs, monkeypatch) -> None:
+    monkeypatch.setattr(benchmark, "WARMUP_CALLS", 2)
+    monkeypatch.setattr(benchmark, "MEASURED_CALLS", 5)
+    result = benchmark.measure_locked_model(official_runs["B4-A"])
+
+    assert result["tie_break_statistic"] == "median_latency_ms_per_window"
+    assert result["p95_definition"] == "nearest_rank ceil(0.95*N)"
+    assert result["resource_benchmark_protocol_sha256"] == (
+        benchmark.RESOURCE_PROTOCOL_SHA256
+    )
+
+
+def test_result_digest_covers_the_protocol_sha(official_runs, monkeypatch) -> None:
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    monkeypatch.setattr(benchmark, "WARMUP_CALLS", 1)
+    monkeypatch.setattr(benchmark, "MEASURED_CALLS", 3)
+    result = benchmark.measure_locked_model(official_runs["B4-B"])
+
+    recorded = result.pop("benchmark_result_sha256")
+    assert recorded == canonical_sha256(result)
+    tampered = {**result, "resource_benchmark_protocol_sha256": "0" * 64}
+    assert canonical_sha256(tampered) != recorded
+
+
+# --------------------------------------------------------------------------
+# Official suite
+# --------------------------------------------------------------------------
+
+
+def _fake_child(order_log, environment=None):
+    def runner(run_dir, *, official_model=None, timeout_seconds=900.0):
+        order_log.append(official_model)
+        env = environment(official_model) if environment else {
+            "python_version": "3.12.6", "torch_version": "2.13.0+cpu",
+            "numpy_version": "2.3.2", "dependency_digest": B4A_DEPENDENCY_DIGEST,
+            "platform": "Linux-x", "cpu_model": "Xeon", "device": "cpu",
+            "intra_op_threads": 1, "inter_op_threads": 1,
+        }
+        return {
+            "official_model": official_model,
+            "experiment_lock_sha256": f"lock-{official_model}",
+            "checkpoint_sha256": f"ckpt-{official_model}",
+            "benchmark_result_sha256": f"res-{official_model}",
+            "resource_benchmark_protocol_sha256": (
+                benchmark.RESOURCE_PROTOCOL_SHA256
+            ),
+            "trainable_parameter_count": 1,
+            "fp32_parameter_payload_bytes": 4,
+            "locked_checkpoint_bytes": 8,
+            "median_latency_ms_per_window": 1.0,
+            "p95_latency_ms_per_window": 2.0,
+            "peak_rss": 1000,
+            "peak_rss_units": "kibibytes",
+            "peak_rss_available": True,
+            "environment": env,
+        }
+    return runner
+
+
+def test_official_suite_requires_exactly_three_models(tmp_path) -> None:
+    order: list[str] = []
+    for bad in (
+        {"B4-A": tmp_path},
+        {"B4-A": tmp_path, "B4-B": tmp_path},
+        {"B4-A": tmp_path, "B4-B": tmp_path, "B4-C": tmp_path, "B4-D": tmp_path},
+    ):
+        with pytest.raises(
+            benchmark.ResourceBenchmarkError, match="exactly B4-A, B4-B and B4-C"
+        ):
+            benchmark.run_official_resource_suite(
+                bad, tmp_path / "runs", _runner=_fake_child(order)
+            )
+    assert order == []
+
+
+def test_official_suite_uses_the_frozen_order(tmp_path) -> None:
+    order: list[str] = []
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    suite = benchmark.run_official_resource_suite(
+        directories, tmp_path / "runs", _runner=_fake_child(order)
+    )
+
+    assert order == ["B4-A", "B4-B", "B4-C"]
+    assert suite["candidate_order"] == ["B4-A", "B4-B", "B4-C"]
+
+
+def test_official_suite_binds_every_required_identity(tmp_path) -> None:
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    suite = benchmark.run_official_resource_suite(
+        directories, tmp_path / "runs", _runner=_fake_child([])
+    )
+
+    assert suite["resource_benchmark_protocol_sha256"] == (
+        benchmark.RESOURCE_PROTOCOL_SHA256
+    )
+    assert suite["architecture_protocol_sha256"] == ARCHITECTURE_PROTOCOL_SHA256
+    assert suite["b4_protocol_sha256"]
+    assert suite["suite_attempt_sha256"]
+    assert set(suite["experiment_lock_sha256"]) == set(benchmark.OFFICIAL_ORDER)
+    assert set(suite["checkpoint_sha256"]) == set(benchmark.OFFICIAL_ORDER)
+    assert set(suite["benchmark_result_sha256"]) == set(benchmark.OFFICIAL_ORDER)
+    assert suite["dataset_accessed"] is False
+    assert suite["test_accessed"] is False
+    assert suite["suite_duration_seconds"] >= 0
+
+    recorded = suite.pop("resource_benchmark_suite_sha256")
+    assert recorded == canonical_sha256(suite)
+    # The combined digest covers all three individual result hashes.
+    tampered = json.loads(json.dumps(suite))
+    tampered["benchmark_result_sha256"]["B4-C"] = "changed"
+    assert canonical_sha256(tampered) != recorded
+
+
+def test_official_suite_refuses_a_differing_host(tmp_path) -> None:
+    def environment(model):
+        base = {
+            "python_version": "3.12.6", "torch_version": "2.13.0+cpu",
+            "numpy_version": "2.3.2", "dependency_digest": B4A_DEPENDENCY_DIGEST,
+            "platform": "Linux-x", "cpu_model": "Xeon", "device": "cpu",
+            "intra_op_threads": 1, "inter_op_threads": 1,
+        }
+        if model == "B4-C":
+            base["cpu_model"] = "DifferentCPU"
+        return base
+
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="requires one host"
+    ):
+        benchmark.run_official_resource_suite(
+            directories, tmp_path / "runs",
+            _runner=_fake_child([], environment=environment),
+        )
+
+
+def test_official_suite_requires_single_intra_op_thread(tmp_path) -> None:
+    def environment(model):
+        return {
+            "python_version": "3.12.6", "torch_version": "2.13.0+cpu",
+            "numpy_version": "2.3.2", "dependency_digest": B4A_DEPENDENCY_DIGEST,
+            "platform": "Linux-x", "cpu_model": "Xeon", "device": "cpu",
+            "intra_op_threads": 4, "inter_op_threads": 1,
+        }
+
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    with pytest.raises(
+        benchmark.ResourceBenchmarkError, match="intra-op threads == 1"
+    ):
+        benchmark.run_official_resource_suite(
+            directories, tmp_path / "runs",
+            _runner=_fake_child([], environment=environment),
+        )
+
+
+def test_attempt_is_claimed_before_the_first_measurement(tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    observed: list[bool] = []
+
+    def runner(run_dir, *, official_model=None, timeout_seconds=900.0):
+        attempt = run_root / benchmark.SUITE_DIR_NAME / benchmark.SUITE_ATTEMPT_NAME
+        observed.append(attempt.is_file())
+        return _fake_child([])(run_dir, official_model=official_model)
+
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    benchmark.run_official_resource_suite(directories, run_root, _runner=runner)
+
+    assert observed == [True, True, True]
+
+
+def test_existing_attempt_refuses_a_second_official_suite(tmp_path) -> None:
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    run_root = tmp_path / "runs"
+    benchmark.run_official_resource_suite(
+        directories, run_root, _runner=_fake_child([])
+    )
+    with pytest.raises(benchmark.ResourceBenchmarkError, match="already exists"):
+        benchmark.run_official_resource_suite(
+            directories, run_root, _runner=_fake_child([])
+        )
+
+
+def test_failed_suite_cannot_selectively_retry(tmp_path) -> None:
+    run_root = tmp_path / "runs"
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+
+    def explode(run_dir, *, official_model=None, timeout_seconds=900.0):
+        if official_model == "B4-B":
+            raise RuntimeError("simulated child failure")
+        return _fake_child([])(run_dir, official_model=official_model)
+
+    with pytest.raises(RuntimeError, match="simulated child failure"):
+        benchmark.run_official_resource_suite(
+            directories, run_root, _runner=explode
+        )
+
+    attempt = json.loads(
+        (run_root / benchmark.SUITE_DIR_NAME / benchmark.SUITE_ATTEMPT_NAME).read_text()
+    )
+    assert attempt["attempt_status"] == benchmark.SUITE_STATUS_FAILED
+    assert attempt["human_review_required"] is True
+    assert attempt["selective_candidate_retry_permitted"] is False
+    assert attempt["repeat_attempt_permitted"] is False
+
+    # Neither the failed model alone nor the whole suite may run again.
+    with pytest.raises(benchmark.ResourceBenchmarkError, match="already exists"):
+        benchmark.run_official_resource_suite(
+            directories, run_root, _runner=_fake_child([])
+        )
+
+
+def test_no_force_or_overwrite_api_exists() -> None:
+    import ast
+    import inspect
+
+    parameters = inspect.signature(benchmark.run_official_resource_suite).parameters
+    for forbidden in (
+        "force", "best_of", "retry_one", "rerun_candidate", "overwrite", "repeat",
+    ):
+        assert forbidden not in parameters
+
+    tree = ast.parse(Path(benchmark.__file__).read_text(encoding="utf-8"))
+    names = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for forbidden in ("force", "best_of", "retry", "overwrite"):
+        assert not any(forbidden in name for name in names)
+    calls = {
+        node.func.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "unlink" not in calls and "rmtree" not in calls
