@@ -222,22 +222,16 @@ transpose                             -> [B, 79, 128]
 add learned positional embedding P    -> [B, 79, 128],  P has shape [79, 128]
 
 Encoder block x 2 (pre-norm):
-  h <- x + Dropout(MHSA(LayerNorm(x)))
-  x <- h + Dropout(FFN(LayerNorm(h)))
+  h <- x + Dropout_0.10(MHSA(LayerNorm(x)))
+  x <- h + Dropout_0.10(FFN(LayerNorm(h)))
 
 Final LayerNorm(128)
 transpose back                        -> [B, 128, 79]
 Head (shared, frozen)                 -> one raw logit
 ```
 
-- `MHSA`: 4 heads, head dimension 32, `embed_dim=128`, bias on the input and
-  output projections, full (bidirectional) attention over the 79 in-window
-  tokens, no attention mask.
 - `FFN`: `Linear(128, 256)` then GELU then `Linear(256, 128)`. The expansion
   factor is 2, chosen for compactness rather than the conventional 4.
-- `LayerNorm` uses `eps=1e-5` with trainable affine scale and bias.
-- Dropout `p=0.10` on the attention and feed-forward residual branches. This
-  rate is inherited from B4-A's frozen head, not tuned.
 - Positional representation: a learned absolute embedding of shape `[79, 128]`,
   added once before the first block. This is exact only because the token count
   is frozen at 79 by the frozen window geometry.
@@ -245,6 +239,57 @@ Head (shared, frozen)                 -> one raw logit
 Two encoder blocks, 4 heads, and an expansion factor of 2 are the single frozen
 configuration. No depth, head-count, width, expansion or dropout sweep is
 authorized.
+
+### Frozen multi-head attention semantics
+
+```text
+embed_dim        = 128
+num_heads        = 4
+head_dim         = 32
+bias             = true          (input and output projections)
+batch_first      = true
+attention span   = full 79 in-window tokens (bidirectional)
+attn_mask        = none
+key_padding_mask = none
+attention dropout = 0.0
+```
+
+### Frozen dropout placement
+
+The **only** dropout inside a B4-B encoder block is the external residual-branch
+dropout already shown above, at `p=0.10`, inherited from B4-A's frozen head
+rather than tuned:
+
+```text
+h = x + Dropout_0.10( MHSA(LayerNorm(x)) )
+x = h + Dropout_0.10( FFN(LayerNorm(h)) )
+```
+
+Internal attention-weight dropout is **0.0**. Both internal attention dropout and
+external branch dropout must not be applied together: a `torch.nn.MultiheadAttention`
+must be constructed with `dropout=0.0`, and a prebuilt
+`torch.nn.TransformerEncoderLayer` must not be used unless its internal dropout
+is likewise driven to `0.0`, because its default couples several dropout sites.
+
+### Frozen initialization
+
+Every initialization below is drawn once, after `initialize_determinism(seed=2026)`
+has established all seeds and deterministic settings, and before any optimizer
+step.
+
+- Positional embedding: `P ~ Normal(mean=0.0, std=0.02)`, elementwise and
+  independent, shape `[79, 128]`.
+- Every `LayerNorm`: `weight = 1`, `bias = 0`, `eps = 1e-5`, trainable affine.
+- Every `Linear` and every `MultiheadAttention` projection weight and bias: the
+  **PyTorch module default initialization of the resolved PyTorch version**,
+  applied after `initialize_determinism(seed=2026)`. The scientific run records
+  the exact resolved PyTorch version in its environment provenance, so the
+  initialization is reproducible from the recorded environment plus the seed.
+  The reference environment is PyTorch 2.13; a different resolved version is
+  permitted only if it is recorded, and the run is then reproducible against
+  that recorded version.
+
+No initialization is tuned, searched, or revised after any validation result.
 
 ### Trainable parameters
 
@@ -287,17 +332,37 @@ equivalent.
 
 The recurrence is derived from a continuous-time linear state-space system and
 then discretized, and its transition matrix is diagonal, time-invariant and
-independent of the input. Three consequences follow that no gated RNN provides:
+independent of the input.
 
-1. The state transition is a fixed diagonal linear operator, so the layer is a
-   linear time-invariant system per channel. Its impulse response has a closed
-   form and the layer is exactly equivalent to a causal convolution with that
-   kernel.
-2. Because the recurrence is linear and input-independent, it is associative and
-   can be evaluated by parallel scan or in the frequency domain. A gated RNN,
-   whose transition depends on the input, cannot be.
+The claims below are made about the **linear SSM core** `y = SSM(u)`, not about
+the complete block. Three consequences follow that no gated RNN provides:
+
+1. The state transition of the SSM core is a fixed diagonal linear operator, so
+   the core is a linear time-invariant (LTI) system per channel. Its impulse
+   response has a closed form, and the **SSM core alone** therefore has an exact
+   causal-convolution representation.
+2. Because the core recurrence is linear and input-independent, it is associative
+   and is in principle evaluable by parallel scan or in the frequency domain. A
+   gated RNN, whose transition depends on the input, is not.
 3. Stability is guaranteed by construction through the parameterization below,
    not by clipping, spectral normalization or gradient tricks.
+
+### Scope of the LTI claim
+
+The **complete `DiagonalGatedSSMBlock` is not LTI and is not
+convolution-equivalent.** It contains `LayerNorm`, the learned `Linear_in` and
+`Linear_out` projections, `SiLU` gating that multiplies the core output by a
+data-dependent signal, and a residual pathway. Those components are nonlinear or
+input-dependent, so no exact convolution representation exists for the block as a
+whole.
+
+The architecture is nonetheless legitimately a state-space architecture because
+its **temporal memory operator** — the only component that carries information
+across tokens — is explicitly state-space-derived, diagonal, time-invariant and
+input-independent.
+
+Restated for the avoidance of doubt: this is **not Mamba**, and there is **no
+selective or input-dependent state transition** anywhere in the design.
 
 ### Equations
 
@@ -354,14 +419,103 @@ for every channel and state, so the recurrence is unconditionally stable with no
 clipping or renormalization. `lambda_{c,n} = 0` cannot occur, so `Bbar` is well
 defined.
 
-Initialization is deterministic from seed `2026` after determinism is
-established: `w_{c,n}` is set to the S4D-Lin imaginary grid `pi * n`, `a_{c,n}`
-to `log(1/2)`, `d_c` log-uniform over `[log(0.001), log(0.1)]`, `B` and the real
-and imaginary parts of `C` from the standard normal scaled by `1/sqrt(N)`, and
-`D_c = 0`. The implementation must record the exact initialization it used.
+### Frozen numerically stable ZOH computation
+
+The mathematics above is unchanged. The **implementation** must evaluate `Bbar`
+with a complex `expm1` rather than forming `exp(z) - 1` explicitly:
+
+```text
+z          = Delta_c * lambda_{c,n}
+Abar_{c,n} = exp( z )
+Bbar_{c,n} = expm1( z ) / lambda_{c,n} * B_{c,n}
+```
+
+`expm1(z)` and `exp(z) - 1` are algebraically identical. They differ numerically:
+when `|z|` is small, `exp(z)` is close to `1`, so `exp(z) - 1` cancels the leading
+digits and loses relative precision, while `expm1` is designed to retain it. Small
+`|z|` is the expected regime here because `Delta_c` is initialized as low as
+`1e-3`. `lambda_{c,n}` is nonzero by parameterization, so the division is safe.
+
+This freezes the numerically stable implementation of an unchanged scientific
+model before training.
+
+### Frozen initialization
+
+All draws happen once, after `initialize_determinism(seed=2026)` has established
+every seed and deterministic setting, and before any optimizer step. State index
+`n` runs over `n = 1, 2, ..., 16` (one-based; `N = 16`).
+
+```text
+w_{c,n} = pi * n                    for n = 1..16     (linear frequency grid)
+a_{c,n} = log(1/2)                                    (so Re(lambda) = -1/2)
+d_c     ~ Uniform( log(1e-3), log(1e-1) )
+Delta_c = exp( d_c )                                  (log-uniform on [1e-3, 1e-1])
+B_{c,n}     ~ Normal(0, 1) / sqrt(N)
+Re(C_{c,n}) ~ Normal(0, 1) / sqrt(N)
+Im(C_{c,n}) ~ Normal(0, 1) / sqrt(N)
+D_c     = 0
+```
+
+`d_c` is the learned **log** step, so it is drawn uniformly on
+`[log(1e-3), log(1e-1)]`; the resulting step `Delta_c = exp(d_c)` is therefore
+log-uniform on `[1e-3, 1e-1]`. The earlier phrasing "`d_c` log-uniform over
+`[log(0.001), log(0.1)]`" was ambiguous about which quantity was log-uniform and
+is superseded by the contract above.
+
+The frequency grid `w_{c,n} = pi * n` is a **linear frequency grid in the spirit
+of S4D**. It is used because it is simple, deterministic and reproducible. No
+claim is made that it reproduces any specific published initializer exactly.
+
+The implementation must record the exact initialization it used.
 
 The state exists only within one window. It is created at `k = 1` and discarded
 after `k = 79`.
+
+### Frozen numerical dtype contract
+
+The shared scientific input remains `float32`. No `float64` or `complex128`
+scientific forward path is authorized.
+
+| Quantity | dtype |
+| --- | --- |
+| Block input `z`, `u`, `g` | `torch.float32` |
+| Real trainable tensors `a`, `w`, `d`, `B`, `Re(C)`, `Im(C)`, `D` | `torch.float32` |
+| `lambda` | `torch.complex64` |
+| `C` | `torch.complex64` |
+| `Abar` | `torch.complex64` |
+| `Bbar` | `torch.complex64` |
+| Recurrent state `x` | `torch.complex64` |
+| SSM core output `y` | `torch.float32` |
+| Complete model output raw logit | `torch.float32` |
+
+Complex tensors are assembled from the real `float32` parameters, so every
+trainable parameter is stored and counted as real `float32`. The parameter table
+below is unaffected.
+
+### Frozen canonical forward evaluation
+
+The V1 scientific implementation uses exactly one evaluation of the SSM core: the
+straightforward discrete recurrence over the fixed 79-token sequence.
+
+```text
+x[0] = 0
+for k = 1..79:
+    x[k] = Abar * x[k-1] + Bbar * u[k]
+    y[k] = sum_n Re( C * x[k] ) + D * u[k]
+```
+
+The `H x N` state is held as a tensor and only the temporal dimension is
+iterated, so the loop runs exactly 79 steps regardless of batch size.
+
+For the scientific B4-C V1 run this **excludes** FFT or frequency-domain
+convolution, associative or parallel scan, custom CUDA kernels, and any external
+state-space library. The sequence is only 79 tokens, so the plain recurrence is
+inexpensive, and fixing it makes numerical and provenance semantics unambiguous.
+
+The LTI core is theoretically parallelizable, as noted above, but every reported
+B4-C V1 resource measurement refers to this frozen recurrence implementation. The
+implementation must not be changed after any validation or latency result is
+observed.
 
 ### Architecture
 
@@ -461,31 +615,86 @@ including undefined metrics preserved as undefined.
 The selected architecture is not "the fanciest model" and not the winner of a
 scalar score invented after results are seen.
 
-1. Validation AUPRC is the primary dimension.
-2. A candidate that is clearly dominated in **both** predictive and resource
-   dimensions, that is, no better on validation AUPRC and also larger, slower or
-   heavier, must not be selected.
-3. A small validation AUPRC improvement does not automatically justify a
-   materially larger, slower or more memory-hungry edge model. The review must
-   state the size of the predictive difference alongside the size of the
-   resource difference.
-4. Where candidates trade predictive performance against resource use, the
-   selection record must state the trade-off explicitly and justify the choice
-   against the edge-oriented research goal. Stating a trade-off is a permitted
-   outcome; it must not trigger any additional tuning, retraining or new
-   configuration.
-5. Subject-macro behaviour and the two quantitative challenge false-positive
-   fractions are reviewed before the decision is recorded, so that a candidate
-   which wins pooled AUPRC while behaving materially worse across subjects or
-   confounders is identified explicitly.
+### Resource vector
 
-Prohibited: constructing a weighted scalar "selection score" after results are
-known; breaking a tie with test performance; consulting the historical B0-B3
-test results to justify a B4 architecture choice; and re-running any candidate
-because its first validation result was disappointing.
+Define, for each candidate, the predeclared resource vector
 
-If the evidence genuinely does not separate the candidates, the selection record
-must say so and the more resource-efficient candidate is selected.
+```text
+R = ( trainable_parameter_count,
+      serialized_FP32_bytes,
+      measured_CPU_inference_latency,
+      measured_peak_inference_memory )
+```
+
+Lower is better in every component of `R`.
+
+### Formal dominance
+
+Candidate `X` **Pareto-dominates** candidate `Y` if and only if all three hold:
+
+1. `AUPRC(X) >= AUPRC(Y)` on pooled full-primary validation; **and**
+2. `X` is no worse than `Y` in **every available** predeclared resource
+   dimension of `R`; **and**
+3. `X` is strictly better than `Y` in at least one of: validation AUPRC, or some
+   resource dimension of `R`.
+
+If the resource measurements trade off against each other, that is, `X` is better
+in one component of `R` and worse in another, then **neither candidate is
+Pareto-dominant on resources** and no dominance claim may be made in either
+direction.
+
+A Pareto-dominated candidate must not be selected.
+
+### Review dimensions that are not part of dominance
+
+Subject-macro AUPRC and the rate-related and axis-shift challenge false-positive
+fractions are mandatory safety and support review dimensions. They are examined
+before the decision is recorded, and a material robustness concern in them may
+block an otherwise attractive selection. They are deliberately **not** folded
+into the dominance test and must not be converted into a post-hoc scalar score.
+
+Conduction-change evidence remains descriptive and is never a selection criterion.
+
+### Trade-offs
+
+A small validation AUPRC improvement does not automatically justify a materially
+larger, slower or more memory-hungry edge model. Where candidates trade
+predictive performance against resource use, the selection record must state the
+size of the predictive difference alongside the size of the resource difference
+and justify the choice against the edge-oriented research goal. Stating a
+trade-off is a permitted outcome; it must not trigger any additional tuning,
+retraining or new configuration.
+
+### Prohibited
+
+Constructing a weighted scalar "selection score" after results are known;
+breaking a tie with test performance; consulting the historical B0-B3 test
+results to justify a B4 architecture choice; and re-running any candidate because
+its first validation result was disappointing.
+
+## Resource tie-break
+
+If the predictive and supporting evidence genuinely does not separate the
+candidates, and no candidate Pareto-dominates the other across the resource
+vector, the following **lexicographic** resource preference applies. It is frozen
+here, before any result is observed, and reflects the edge-oriented research
+goal:
+
+1. lower measured **median CPU inference latency**;
+2. lower measured **peak inference memory**;
+3. fewer **trainable parameters**;
+4. smaller **serialized FP32 model size**.
+
+Each item is consulted only if every higher-priority item is tied.
+
+All measurements must use the same recorded CPU environment, the same batch
+convention and the same benchmark procedure across candidates; otherwise they are
+not comparable and must not be used.
+
+If a higher-priority resource measure is unavailable or unreliable in the
+recorded environment, the selection record must state that explicitly and move to
+the next predeclared item. A missing measurement is never imputed, estimated or
+substituted, and no resource score may be invented after results.
 
 ## Experiment identifiers
 
@@ -556,10 +765,32 @@ before the test is opened, not during.
   validation remains unsampled.
 - An architecture comparison on one public dataset cannot establish diagnosis,
   clinical utility, generalization to another cohort, or hardware readiness.
-- B4-A's observed development result, validation AUPRC `0.3156014611186772`,
-  validation AUROC `0.8675598293803359`, selected epoch 4, is recorded here only
-  as historical context. It was not used to design B4-B or B4-C, and it must not
-  be used to tune them.
+- B4-A's observed development result is validation AUPRC `0.3156014611186772`,
+  validation AUROC `0.8675598293803359`, selected epoch 4. See the historical
+  provenance statement below for exactly what was and was not known when the
+  B4-B and B4-C configurations were frozen.
+
+## B4-A historical provenance
+
+This statement is deliberately precise rather than flattering, because the
+sequence matters for how the architecture comparison may be interpreted.
+
+The B4-B and B4-C architecture **families** were predeclared in the research
+handbook before any B4 sealed-test access. Their **exact V1 configurations** were
+frozen in this document *after* the B4-A development validation result had
+already been observed, but *before* either candidate was implemented or trained,
+and while every B4 test artifact remained unopened.
+
+The B4-A validation result is therefore historical context. It is **not** an
+optimization objective, **not** a hyperparameter search signal, and **not** an
+authorization for iterative tuning of B4-B or B4-C. No candidate configuration in
+this document may be revised because of it, and no candidate may receive a second
+configuration because its own first validation result is disappointing.
+
+No claim of blindness to the B4-A validation result is made, because that
+blindness did not exist. What is claimed, and what the run sequence enforces, is
+that every B4-B and B4-C configuration is fixed before those candidates are
+trained, and that no test artifact informed any of it.
 
 ## B4-D status
 

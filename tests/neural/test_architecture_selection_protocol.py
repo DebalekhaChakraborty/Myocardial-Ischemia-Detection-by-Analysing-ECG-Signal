@@ -282,3 +282,212 @@ def test_b4_protocol_v1_is_unchanged_by_this_phase() -> None:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
     assert digest == B4_PROTOCOL_V1_SHA256
+
+
+# --------------------------------------------------------------------------
+# B4-B frozen implementation semantics
+# --------------------------------------------------------------------------
+
+
+def test_b4b_freezes_attention_semantics() -> None:
+    text = _normalized()
+
+    for clause in (
+        "embed_dim = 128",
+        "num_heads = 4",
+        "head_dim = 32",
+        "batch_first = true",
+        "attn_mask = none",
+        "key_padding_mask = none",
+    ):
+        assert clause in text, clause
+
+
+def test_b4b_internal_attention_dropout_is_zero() -> None:
+    text = _normalized()
+
+    assert "attention dropout = 0.0" in text
+    assert "Internal attention-weight dropout is **0.0**" in text
+    # The only block dropout is the external residual branch at 0.10.
+    assert "Dropout_0.10( MHSA(LayerNorm(x)) )" in text
+    assert "Dropout_0.10( FFN(LayerNorm(h)) )" in text
+    assert "must not be applied together" in text
+    assert "dropout=0.0" in text
+
+
+def test_b4b_freezes_positional_and_layernorm_initialization() -> None:
+    text = _normalized()
+
+    assert "P ~ Normal(mean=0.0, std=0.02)" in text
+    assert "`weight = 1`, `bias = 0`, `eps = 1e-5`" in text
+    assert "initialize_determinism(seed=2026)" in text
+
+
+def test_b4b_states_the_default_initialization_policy() -> None:
+    text = _normalized()
+
+    policy = "PyTorch module default initialization of the resolved PyTorch version"
+    assert policy in text
+    assert "records the exact resolved PyTorch version" in text
+    assert "reference environment is PyTorch 2.13" in text
+
+
+# --------------------------------------------------------------------------
+# B4-C frozen implementation semantics
+# --------------------------------------------------------------------------
+
+
+def test_b4c_log_step_initialization_is_unambiguous() -> None:
+    text = _normalized()
+
+    assert "d_c ~ Uniform( log(1e-3), log(1e-1) )" in text
+    assert "Delta_c = exp( d_c )" in text
+    assert "log-uniform on `[1e-3, 1e-1]`" in text
+    # The previously ambiguous phrasing is explicitly superseded.
+    assert "was ambiguous about which quantity was log-uniform" in text
+
+
+def test_b4c_state_index_and_frequency_grid_are_explicit() -> None:
+    text = _normalized()
+
+    assert "n = 1, 2, ..., 16" in text
+    assert "w_{c,n} = pi * n" in text
+    assert "one-based" in text
+    # No exact-reproduction claim about a published initializer.
+    assert "in the spirit of S4D" in text
+    assert "does not reproduce" in text or "No claim is made that it reproduces" in text
+
+
+def test_b4c_freezes_the_numerical_dtype_contract() -> None:
+    text = _normalized()
+
+    assert "torch.complex64" in text
+    assert "torch.float32" in text
+    for quantity in ("`lambda`", "`Abar`", "`Bbar`", "Recurrent state `x`"):
+        assert quantity in text
+    assert "No `float64` or `complex128` scientific forward path is authorized" in text
+    assert "every trainable parameter is stored and counted as real `float32`" in text
+
+
+def test_b4c_freezes_the_stable_expm1_zoh_computation() -> None:
+    text = _normalized()
+
+    assert "Bbar_{c,n} = expm1( z ) / lambda_{c,n} * B_{c,n}" in text
+    assert "algebraically identical" in text
+    assert "cancels the leading digits" in text
+    assert "nonzero by parameterization" in text
+
+
+def test_b4c_separates_lti_core_from_the_nonlinear_block() -> None:
+    text = _normalized()
+
+    block_clause = (
+        "complete `DiagonalGatedSSMBlock` is not LTI and is not "
+        "convolution-equivalent"
+    )
+    assert block_clause in text
+    core_clause = (
+        "**SSM core alone** therefore has an exact causal-convolution "
+        "representation"
+    )
+    assert core_clause in text
+    assert "temporal memory operator" in text
+    assert "not Mamba" in text
+    assert "**no selective or input-dependent state transition**" in text
+
+
+def test_b4c_freezes_one_canonical_recurrence_implementation() -> None:
+    text = _normalized()
+
+    assert "x[0] = 0" in text
+    assert "for k = 1..79:" in text
+    assert "only the temporal dimension is iterated" in text
+    for excluded in (
+        "FFT",
+        "parallel scan",
+        "custom CUDA kernels",
+        "external state-space library",
+    ):
+        assert excluded in text
+    immutability = (
+        "must not be changed after any validation or latency result is observed"
+    )
+    assert immutability in text
+
+
+# --------------------------------------------------------------------------
+# Selection rule formalization
+# --------------------------------------------------------------------------
+
+
+def test_selection_defines_the_resource_vector() -> None:
+    text = _normalized()
+
+    for component in (
+        "trainable_parameter_count",
+        "serialized_FP32_bytes",
+        "measured_CPU_inference_latency",
+        "measured_peak_inference_memory",
+    ):
+        assert component in text
+    assert "Lower is better in every component" in text
+
+
+def test_selection_defines_formal_pareto_dominance() -> None:
+    text = _normalized()
+
+    assert "Pareto-dominates" in text
+    assert "`AUPRC(X) >= AUPRC(Y)`" in text
+    assert "no worse than `Y` in **every available** predeclared resource" in text
+    assert "strictly better than `Y` in at least one of" in text
+    assert "neither candidate is Pareto-dominant on resources" in text
+    assert "A Pareto-dominated candidate must not be selected" in text
+
+
+def test_support_dimensions_are_excluded_from_dominance() -> None:
+    text = _normalized()
+
+    assert "deliberately **not** folded into the dominance test" in text
+    assert "must not be converted into a post-hoc scalar score" in text
+
+
+def test_selection_freezes_the_lexicographic_resource_tie_break() -> None:
+    text = _normalized()
+
+    assert "lexicographic" in text
+    assert "median CPU inference latency" in text
+    assert "consulted only if every higher-priority item is tied" in text
+    assert "never imputed, estimated or substituted" in text
+    assert "same recorded CPU environment" in text
+
+
+# --------------------------------------------------------------------------
+# Historical provenance honesty
+# --------------------------------------------------------------------------
+
+
+def test_b4a_provenance_does_not_overclaim_blindness() -> None:
+    text = _normalized()
+
+    assert "No claim of blindness to the B4-A validation result is made" in text
+    assert "that blindness did not exist" in text
+    assert "architecture **families** were predeclared" in text
+    ordering = (
+        "frozen in this document *after* the B4-A development validation result"
+    )
+    assert ordering in text
+    assert "*before* either candidate was implemented or trained" in text
+    assert "not** an optimization objective" in text
+    # The historical values remain recorded as context.
+    assert "0.3156014611186772" in text
+    assert "0.8675598293803359" in text
+
+
+def test_hardening_did_not_change_the_frozen_totals() -> None:
+    # The precision pass must not move any accepted architecture number.
+    assert b4b_total_parameters() == 309_809
+    assert b4c_total_parameters() == 155_313
+    assert b4b_total_parameters() * 4 == 1_239_236
+    assert b4c_total_parameters() * 4 == 621_252
+    assert shared_front_end_parameters() == 26_160
+    assert shared_head_parameters() == 8_321
