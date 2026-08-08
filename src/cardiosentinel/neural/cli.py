@@ -128,6 +128,25 @@ def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
         help="Skip the development validation prediction artifact.",
     )
 
+    # Exactly one sealed-test command. It deliberately exposes no --threshold,
+    # --checkpoint, --force, --retry, --overwrite or --seed option: the
+    # checkpoint and threshold always come from the immutable development lock.
+    sealed_test = commands.add_parser(
+        "evaluate-locked-test",
+        help=(
+            "Performs the single predeclared B4 test evaluation from the "
+            "immutable development lock. Writes the attempt receipt before "
+            "test access and refuses repeat attempts."
+        ),
+    )
+    sealed_test.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    sealed_test.add_argument(
+        "--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT
+    )
+    _run_root(sealed_test)
+    sealed_test.add_argument("--device", choices=("cpu", "cuda"))
+    sealed_test.add_argument("--workers", type=int, default=0)
+
 
 def run_b4_command(args: argparse.Namespace) -> int:
     from cardiosentinel.neural.engineering import (
@@ -230,6 +249,20 @@ def run_b4_command(args: argparse.Namespace) -> int:
             requested_device=args.device,
             workers=args.workers,
             save_validation_predictions=not args.no_validation_predictions,
+        )
+    elif args.b4_command == "evaluate-locked-test":
+        from cardiosentinel.neural.sealed_test import (
+            DEFAULT_COMMAND as SEALED_TEST_COMMAND,
+        )
+        from cardiosentinel.neural.sealed_test import evaluate_locked_test
+
+        report = evaluate_locked_test(
+            args.source,
+            args.feature_root,
+            args.run_root,
+            command=SEALED_TEST_COMMAND,
+            requested_device=args.device,
+            workers=args.workers,
         )
     elif args.b4_command == "benchmark-cache":
         from cardiosentinel.neural.engineering import (
