@@ -9,6 +9,7 @@ from pathlib import Path
 DEFAULT_SOURCE = Path("cardiosentinel-data/ltstdb/1.0.0")
 DEFAULT_FEATURE_ROOT = Path("cardiosentinel-features/ltstdb-baseline-v1")
 DEFAULT_WAVEFORM_CACHE_ROOT = Path("cardiosentinel-features/b4-waveform-v1")
+DEFAULT_RUN_ROOT = Path("cardiosentinel-runs/phase3b2-b4-v1")
 
 
 def _common_paths(parser: argparse.ArgumentParser) -> None:
@@ -20,6 +21,10 @@ def _cache_root(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--cache-root", type=Path, default=DEFAULT_WAVEFORM_CACHE_ROOT
     )
+
+
+def _run_root(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
 
 
 def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -90,6 +95,38 @@ def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
     _cache_root(compute)
     compute.add_argument("--batches", type=int, default=32)
     compute.add_argument("--device", choices=("cpu", "cuda"))
+
+    run_preflight = commands.add_parser(
+        "run-preflight",
+        help=(
+            "Validate canonical B4 train/validation run readiness. "
+            "Does not access the test partition."
+        ),
+    )
+    _common_paths(run_preflight)
+    _cache_root(run_preflight)
+    _run_root(run_preflight)
+    run_preflight.add_argument("--device", choices=("cpu", "cuda"))
+    run_preflight.add_argument("--workers", type=int, default=0)
+    run_preflight.add_argument("--allow-dirty", action="store_true")
+
+    run_train = commands.add_parser(
+        "run-train-validation",
+        help=(
+            "Runs the single canonical B4 train/validation experiment. "
+            "Does not access the test partition."
+        ),
+    )
+    _common_paths(run_train)
+    _cache_root(run_train)
+    _run_root(run_train)
+    run_train.add_argument("--device", choices=("cpu", "cuda"))
+    run_train.add_argument("--workers", type=int, default=0)
+    run_train.add_argument(
+        "--no-validation-predictions",
+        action="store_true",
+        help="Skip the development validation prediction artifact.",
+    )
 
 
 def run_b4_command(args: argparse.Namespace) -> int:
@@ -164,6 +201,36 @@ def run_b4_command(args: argparse.Namespace) -> int:
                 args.source, args.cache_root, indexes
             ),
         }
+    elif args.b4_command == "run-preflight":
+        from cardiosentinel.neural.experiment import b4_scientific_preflight
+
+        report = b4_scientific_preflight(
+            args.source,
+            args.feature_root,
+            args.cache_root,
+            args.run_root,
+            requested_device=args.device,
+            require_clean=not args.allow_dirty,
+            workers=args.workers,
+        )
+    elif args.b4_command == "run-train-validation":
+        from cardiosentinel.neural.experiment import (
+            DEFAULT_COMMAND,
+            run_b4_train_validation,
+        )
+
+        # The canonical scientific run has no --allow-dirty option by design:
+        # a clean checkout is mandatory and cannot be relaxed from the CLI.
+        report = run_b4_train_validation(
+            args.source,
+            args.feature_root,
+            args.cache_root,
+            args.run_root,
+            command=DEFAULT_COMMAND,
+            requested_device=args.device,
+            workers=args.workers,
+            save_validation_predictions=not args.no_validation_predictions,
+        )
     elif args.b4_command == "benchmark-cache":
         from cardiosentinel.neural.engineering import (
             benchmark_direct_and_cached_io,
