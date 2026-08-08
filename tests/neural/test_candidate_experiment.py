@@ -968,34 +968,56 @@ def test_result_digest_covers_the_protocol_sha(
 # --------------------------------------------------------------------------
 
 
-def _fake_child(order_log, environment=None):
+def _child_payload(official_model, environment=None, **overrides):
+    """A synthetic child payload carrying a correctly re-derivable digest."""
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    env = environment(official_model) if environment else {
+        "python_version": "3.12.6", "torch_version": "2.13.0+cpu",
+        "numpy_version": "2.3.2", "dependency_digest": B4A_DEPENDENCY_DIGEST,
+        "platform": "Linux-x", "cpu_model": "Xeon", "device": "cpu",
+        "intra_op_threads": 1, "inter_op_threads": 1,
+    }
+    payload = {
+        "official_model": official_model,
+        "experiment_lock_sha256": f"lock-{official_model}",
+        "checkpoint_sha256": f"ckpt-{official_model}",
+        "resource_benchmark_protocol_sha256": benchmark.RESOURCE_PROTOCOL_SHA256,
+        "process_isolated": True,
+        "dataset_accessed": False,
+        "trainable_parameter_count": 1,
+        "fp32_parameter_payload_bytes": 4,
+        "locked_checkpoint_bytes": 8,
+        "median_latency_ms_per_window": 1.0,
+        "p95_latency_ms_per_window": 2.0,
+        "peak_rss": 1000,
+        "peak_rss_units": "kibibytes",
+        "peak_rss_available": True,
+        "environment": env,
+    }
+    payload.update(overrides)
+    payload["benchmark_result_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def _fake_child(order_log, environment=None, mutate=None):
     def runner(run_dir, *, official_model=None, timeout_seconds=900.0):
         order_log.append(official_model)
-        env = environment(official_model) if environment else {
-            "python_version": "3.12.6", "torch_version": "2.13.0+cpu",
-            "numpy_version": "2.3.2", "dependency_digest": B4A_DEPENDENCY_DIGEST,
-            "platform": "Linux-x", "cpu_model": "Xeon", "device": "cpu",
-            "intra_op_threads": 1, "inter_op_threads": 1,
-        }
-        return {
-            "official_model": official_model,
-            "experiment_lock_sha256": f"lock-{official_model}",
-            "checkpoint_sha256": f"ckpt-{official_model}",
-            "benchmark_result_sha256": f"res-{official_model}",
-            "resource_benchmark_protocol_sha256": (
-                benchmark.RESOURCE_PROTOCOL_SHA256
-            ),
-            "trainable_parameter_count": 1,
-            "fp32_parameter_payload_bytes": 4,
-            "locked_checkpoint_bytes": 8,
-            "median_latency_ms_per_window": 1.0,
-            "p95_latency_ms_per_window": 2.0,
-            "peak_rss": 1000,
-            "peak_rss_units": "kibibytes",
-            "peak_rss_available": True,
-            "environment": env,
-        }
+        payload = _child_payload(official_model, environment)
+        if mutate is not None:
+            payload = mutate(official_model, payload)
+        return payload
     return runner
+
+
+def _suite(directories, run_root, runner, **kwargs):
+    """Drive the private implementation, which alone accepts a runner."""
+    return benchmark._run_official_resource_suite_impl(
+        directories, run_root,
+        command=kwargs.pop("command", "unit-test"),
+        timeout_seconds=kwargs.pop("timeout_seconds", 900.0),
+        runner=runner,
+    )
 
 
 def test_official_suite_requires_exactly_three_models(tmp_path) -> None:
@@ -1008,18 +1030,14 @@ def test_official_suite_requires_exactly_three_models(tmp_path) -> None:
         with pytest.raises(
             benchmark.ResourceBenchmarkError, match="exactly B4-A, B4-B and B4-C"
         ):
-            benchmark.run_official_resource_suite(
-                bad, tmp_path / "runs", _runner=_fake_child(order)
-            )
+            _suite(bad, tmp_path / "runs", _fake_child(order))
     assert order == []
 
 
 def test_official_suite_uses_the_frozen_order(tmp_path) -> None:
     order: list[str] = []
     directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
-    suite = benchmark.run_official_resource_suite(
-        directories, tmp_path / "runs", _runner=_fake_child(order)
-    )
+    suite = _suite(directories, tmp_path / "runs", _fake_child(order))
 
     assert order == ["B4-A", "B4-B", "B4-C"]
     assert suite["candidate_order"] == ["B4-A", "B4-B", "B4-C"]
@@ -1029,9 +1047,7 @@ def test_official_suite_binds_every_required_identity(tmp_path) -> None:
     from cardiosentinel.neural.integrity import canonical_sha256
 
     directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
-    suite = benchmark.run_official_resource_suite(
-        directories, tmp_path / "runs", _runner=_fake_child([])
-    )
+    suite = _suite(directories, tmp_path / "runs", _fake_child([]))
 
     assert suite["resource_benchmark_protocol_sha256"] == (
         benchmark.RESOURCE_PROTOCOL_SHA256
@@ -1070,9 +1086,9 @@ def test_official_suite_refuses_a_differing_host(tmp_path) -> None:
     with pytest.raises(
         benchmark.ResourceBenchmarkError, match="requires one host"
     ):
-        benchmark.run_official_resource_suite(
+        _suite(
             directories, tmp_path / "runs",
-            _runner=_fake_child([], environment=environment),
+            _fake_child([], environment=environment),
         )
 
 
@@ -1089,9 +1105,9 @@ def test_official_suite_requires_single_intra_op_thread(tmp_path) -> None:
     with pytest.raises(
         benchmark.ResourceBenchmarkError, match="intra-op threads == 1"
     ):
-        benchmark.run_official_resource_suite(
+        _suite(
             directories, tmp_path / "runs",
-            _runner=_fake_child([], environment=environment),
+            _fake_child([], environment=environment),
         )
 
 
@@ -1105,7 +1121,7 @@ def test_attempt_is_claimed_before_the_first_measurement(tmp_path) -> None:
         return _fake_child([])(run_dir, official_model=official_model)
 
     directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
-    benchmark.run_official_resource_suite(directories, run_root, _runner=runner)
+    _suite(directories, run_root, runner)
 
     assert observed == [True, True, True]
 
@@ -1113,13 +1129,9 @@ def test_attempt_is_claimed_before_the_first_measurement(tmp_path) -> None:
 def test_existing_attempt_refuses_a_second_official_suite(tmp_path) -> None:
     directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
     run_root = tmp_path / "runs"
-    benchmark.run_official_resource_suite(
-        directories, run_root, _runner=_fake_child([])
-    )
+    _suite(directories, run_root, _fake_child([]))
     with pytest.raises(benchmark.ResourceBenchmarkError, match="already exists"):
-        benchmark.run_official_resource_suite(
-            directories, run_root, _runner=_fake_child([])
-        )
+        _suite(directories, run_root, _fake_child([]))
 
 
 def test_failed_suite_cannot_selectively_retry(tmp_path) -> None:
@@ -1132,9 +1144,7 @@ def test_failed_suite_cannot_selectively_retry(tmp_path) -> None:
         return _fake_child([])(run_dir, official_model=official_model)
 
     with pytest.raises(RuntimeError, match="simulated child failure"):
-        benchmark.run_official_resource_suite(
-            directories, run_root, _runner=explode
-        )
+        _suite(directories, run_root, explode)
 
     attempt = json.loads(
         (run_root / benchmark.SUITE_DIR_NAME / benchmark.SUITE_ATTEMPT_NAME).read_text()
@@ -1146,9 +1156,7 @@ def test_failed_suite_cannot_selectively_retry(tmp_path) -> None:
 
     # Neither the failed model alone nor the whole suite may run again.
     with pytest.raises(benchmark.ResourceBenchmarkError, match="already exists"):
-        benchmark.run_official_resource_suite(
-            directories, run_root, _runner=_fake_child([])
-        )
+        _suite(directories, run_root, _fake_child([]))
 
 
 def test_no_force_or_overwrite_api_exists() -> None:
@@ -1173,3 +1181,151 @@ def test_no_force_or_overwrite_api_exists() -> None:
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
     }
     assert "unlink" not in calls and "rmtree" not in calls
+
+
+# --------------------------------------------------------------------------
+# Sealed official execution path
+# --------------------------------------------------------------------------
+
+
+def test_public_suite_exposes_no_runner_injection() -> None:
+    import inspect
+
+    parameters = inspect.signature(benchmark.run_official_resource_suite).parameters
+    for forbidden in (
+        "_runner", "runner", "backend", "executor", "measurement_function",
+        "measure", "child", "force", "best_of", "retry_one", "overwrite",
+    ):
+        assert forbidden not in parameters, forbidden
+    assert set(parameters) == {
+        "run_directories", "run_root", "command", "timeout_seconds"
+    }
+
+
+def test_public_suite_hard_wires_the_isolated_runner() -> None:
+    import inspect
+
+    source = inspect.getsource(benchmark.run_official_resource_suite)
+    assert "runner=benchmark_locked_model_isolated" in source
+    assert "_run_official_resource_suite_impl" in source
+
+
+def test_public_suite_actually_invokes_the_isolated_runner(
+    tmp_path, monkeypatch
+) -> None:
+    """The public entry point must reach the real isolated-subprocess runner."""
+    seen: list[str] = []
+
+    def spy(run_dir, *, official_model=None, timeout_seconds=900.0):
+        seen.append(official_model)
+        return _child_payload(official_model)
+
+    monkeypatch.setattr(benchmark, "benchmark_locked_model_isolated", spy)
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    benchmark.run_official_resource_suite(directories, tmp_path / "runs")
+
+    assert seen == ["B4-A", "B4-B", "B4-C"]
+
+
+def test_private_helper_is_not_exported() -> None:
+    import ast
+
+    tree = ast.parse(Path(benchmark.__file__).read_text(encoding="utf-8"))
+    exported = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets
+        )
+    ]
+    for assignment in exported:
+        names = {
+            element.value for element in assignment.value.elts
+            if isinstance(element, ast.Constant)
+        }
+        assert "_run_official_resource_suite_impl" not in names
+    # The private helper is underscore-prefixed, so `from module import *`
+    # cannot pick it up regardless.
+    assert benchmark._run_official_resource_suite_impl.__name__.startswith("_")
+
+
+# --------------------------------------------------------------------------
+# Child result digest validation
+# --------------------------------------------------------------------------
+
+
+def _reject(tmp_path, mutate, match):
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    run_root = tmp_path / "runs"
+    with pytest.raises(benchmark.ResourceBenchmarkError, match=match):
+        _suite(directories, run_root, _fake_child([], mutate=mutate))
+    suite_dir = run_root / benchmark.SUITE_DIR_NAME
+    assert not (suite_dir / benchmark.SUITE_RESULTS_NAME).exists()
+    attempt = json.loads((suite_dir / benchmark.SUITE_ATTEMPT_NAME).read_text())
+    assert attempt["attempt_status"] == benchmark.SUITE_STATUS_FAILED
+    assert attempt["human_review_required"] is True
+
+
+def test_forged_child_digest_is_rejected(tmp_path) -> None:
+    def forge(model, payload):
+        payload["median_latency_ms_per_window"] = 0.0001  # digest now stale
+        return payload
+
+    _reject(tmp_path, forge, "does not re-derive")
+
+
+def test_missing_child_digest_is_rejected(tmp_path) -> None:
+    def strip(model, payload):
+        payload.pop("benchmark_result_sha256")
+        return payload
+
+    _reject(tmp_path, strip, "no benchmark_result_sha256")
+
+
+def test_wrong_official_model_is_rejected(tmp_path) -> None:
+    def swap(model, payload):
+        return _child_payload("B4-A") if model == "B4-C" else payload
+
+    _reject(tmp_path, swap, "Expected a B4-C child result")
+
+
+def test_non_isolated_child_is_rejected(tmp_path) -> None:
+    def shared(model, payload):
+        return _child_payload(model, process_isolated=False)
+
+    _reject(tmp_path, shared, "not process isolated")
+
+
+def test_dataset_accessing_child_is_rejected(tmp_path) -> None:
+    def touched(model, payload):
+        return _child_payload(model, dataset_accessed=True)
+
+    _reject(tmp_path, touched, "reports dataset access")
+
+
+def test_wrong_child_protocol_sha_is_rejected(tmp_path) -> None:
+    def wrong(model, payload):
+        return _child_payload(model, resource_benchmark_protocol_sha256="0" * 64)
+
+    _reject(tmp_path, wrong, "different resource protocol digest")
+
+
+def test_valid_children_still_produce_a_complete_suite(tmp_path) -> None:
+    directories = {name: tmp_path / name for name in benchmark.OFFICIAL_ORDER}
+    run_root = tmp_path / "runs"
+    suite = _suite(directories, run_root, _fake_child([]))
+
+    suite_dir = run_root / benchmark.SUITE_DIR_NAME
+    assert (suite_dir / benchmark.SUITE_RESULTS_NAME).is_file()
+    attempt = json.loads((suite_dir / benchmark.SUITE_ATTEMPT_NAME).read_text())
+    assert attempt["attempt_status"] == benchmark.SUITE_STATUS_COMPLETE
+    assert suite["resource_benchmark_suite_sha256"]
+
+
+def test_child_validation_does_not_alter_the_payload() -> None:
+    payload = _child_payload("B4-A")
+    original = json.loads(json.dumps(payload))
+    benchmark._require_valid_child_result(
+        payload, "B4-A", benchmark.RESOURCE_PROTOCOL_SHA256
+    )
+    assert payload == original

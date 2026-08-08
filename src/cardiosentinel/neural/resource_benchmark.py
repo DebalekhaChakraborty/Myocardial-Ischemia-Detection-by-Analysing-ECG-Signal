@@ -479,19 +479,88 @@ def _require_same_host(results: dict[str, dict[str, Any]]) -> dict[str, Any]:
     return shared
 
 
+def _require_valid_child_result(
+    result: dict[str, Any], expected_model: str, protocol_sha256: str
+) -> None:
+    """Re-verify one child payload before it can enter official evidence.
+
+    This is evidence-integrity validation only: it neither performs nor alters
+    any measurement. A child result that cannot re-derive its own digest, or
+    that disagrees with the frozen procedure, is refused.
+    """
+    recorded = result.get("benchmark_result_sha256")
+    if not isinstance(recorded, str) or not recorded:
+        raise ResourceBenchmarkError(
+            f"{expected_model} child result has no benchmark_result_sha256."
+        )
+    payload = {
+        key: value
+        for key, value in result.items()
+        if key != "benchmark_result_sha256"
+    }
+    if canonical_sha256(payload) != recorded:
+        raise ResourceBenchmarkError(
+            f"{expected_model} child result digest does not re-derive; the "
+            "payload was altered after measurement."
+        )
+    if result.get("official_model") != expected_model:
+        raise ResourceBenchmarkError(
+            f"Expected a {expected_model} child result; observed "
+            f"{result.get('official_model')!r}."
+        )
+    if result.get("process_isolated") is not True:
+        raise ResourceBenchmarkError(
+            f"{expected_model} child result was not process isolated."
+        )
+    if result.get("dataset_accessed") is not False:
+        raise ResourceBenchmarkError(
+            f"{expected_model} child result reports dataset access."
+        )
+    if result.get("resource_benchmark_protocol_sha256") != protocol_sha256:
+        raise ResourceBenchmarkError(
+            f"{expected_model} child used a different resource protocol digest."
+        )
+
+
 def run_official_resource_suite(
     run_directories: dict[str, Path],
     run_root: Path,
     *,
     command: str = "cardiosentinel b4 resource-benchmark",
     timeout_seconds: float = 900.0,
-    _runner=benchmark_locked_model_isolated,
 ) -> dict[str, Any]:
     """Benchmark B4-A, B4-B and B4-C in one exclusive official invocation.
 
     Exactly three locked run directories are required, measured in the frozen
     order, each in its own fresh subprocess. No model may be omitted, no fourth
     model added, and no model benchmarked officially on its own.
+
+    The measurement backend is hard-wired to `benchmark_locked_model_isolated`.
+    There is deliberately no runner, backend, executor or measurement-function
+    parameter: official evidence can only ever be produced by the real isolated
+    child process.
+    """
+    return _run_official_resource_suite_impl(
+        run_directories,
+        run_root,
+        command=command,
+        timeout_seconds=timeout_seconds,
+        runner=benchmark_locked_model_isolated,
+    )
+
+
+def _run_official_resource_suite_impl(
+    run_directories: dict[str, Path],
+    run_root: Path,
+    *,
+    command: str,
+    timeout_seconds: float,
+    runner,
+) -> dict[str, Any]:
+    """Private implementation permitting a substituted runner for unit tests.
+
+    Not exported. The public `run_official_resource_suite` always supplies the
+    real isolated-subprocess runner.
     """
     if set(run_directories) != set(OFFICIAL_ORDER):
         raise ResourceBenchmarkError(
@@ -525,17 +594,15 @@ def run_official_resource_suite(
     try:
         results: dict[str, dict[str, Any]] = {}
         for name in OFFICIAL_ORDER:
-            results[name] = _runner(
+            child = runner(
                 run_directories[name],
                 official_model=name,
                 timeout_seconds=timeout_seconds,
             )
+            # Re-verify the child payload before it can enter official evidence.
+            _require_valid_child_result(child, name, protocol_sha256)
+            results[name] = child
         shared_environment = _require_same_host(results)
-        for name, result in results.items():
-            if result.get("resource_benchmark_protocol_sha256") != protocol_sha256:
-                raise ResourceBenchmarkError(
-                    f"{name} used a different resource protocol digest."
-                )
 
         suite = {
             "suite": SUITE_DIR_NAME,
