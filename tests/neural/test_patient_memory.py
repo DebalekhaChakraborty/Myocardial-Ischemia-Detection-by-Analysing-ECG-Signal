@@ -3,7 +3,7 @@
 These are the invariants that make M1 a *causal* experiment rather than a
 plausible-looking one. Several of them encode defects that were real risks in
 this codebase's history: a memory that peeks at its own window, a stream key
-that merges two simultaneous channels, and an admission rule that quietly reads
+that merges simultaneous channels, and an admission rule that quietly reads
 a label.
 
 Everything here is synthetic. No real corpus, no real waveform, no real model
@@ -770,3 +770,145 @@ def test_q_no_force_or_retry_flag_exists_in_the_m1_modules():
                 assert node.func.attr not in {"unlink", "rmtree", "rmdir"}
             if isinstance(node, ast.keyword):
                 assert node.arg not in {"force", "overwrite", "retry", "fresh_seed"}
+
+
+# --------------------------------------------------------------------------
+# D2. Three-channel records
+#
+# The frozen development corpus holds both 2-channel and 3-channel LTSTDB
+# records (observed indices {0, 1, 2}). An earlier chronology audit wrongly
+# reported two channels everywhere, and that claim reached the protocol text.
+# The stream key was already generic, and these tests pin that: nothing may
+# start assuming exactly two channels.
+# --------------------------------------------------------------------------
+
+
+def _three_channel_record(windows: int = 6):
+    return [
+        reference("rA", channel, index, partition="train")
+        for channel in (0, 1, 2)
+        for index in range(windows)
+    ]
+
+
+def test_d2_a_three_channel_record_yields_three_independent_streams():
+    streams = build_causal_streams(_three_channel_record())
+    assert set(streams) == {("rA", 0), ("rA", 1), ("rA", 2)}
+    assert len(streams) == 3
+    for key, rows in streams.items():
+        assert len(rows) == 6
+        assert all(row.channel_index == key[1] for row in rows)
+
+
+def test_d2_channel_two_is_accepted_and_keyed_independently():
+    assert stream_key(reference("rA", 2, 0)) == ("rA", 2)
+    assert stream_key(reference("rA", 2, 0)) != stream_key(reference("rA", 1, 0))
+    assert stream_key(reference("rA", 2, 0)) != stream_key(reference("rA", 0, 0))
+
+
+@pytest.mark.parametrize("perturbed", [0, 1, 2])
+def test_d2_no_channel_contaminates_any_other(standardizer, perturbed):
+    """Perturb one lead entirely; the other two must be bit-identical."""
+    rows = _three_channel_record()
+    baseline = {row.stable_id: vector(index) for index, row in enumerate(rows)}
+    altered = dict(baseline)
+    for row in rows:
+        if row.channel_index == perturbed:
+            altered[row.stable_id] = vector(4242, scale=75.0)
+
+    streams = build_causal_streams(rows)
+    first = generate_stream_memory(
+        streams, partition="train", representations=baseline, standardizer=standardizer
+    )
+    second = generate_stream_memory(
+        streams, partition="train", representations=altered, standardizer=standardizer
+    )
+
+    index = first.index()
+    untouched = [row for row in rows if row.channel_index != perturbed]
+    assert {row.channel_index for row in untouched} == {0, 1, 2} - {perturbed}
+    for row in untouched:
+        position = index[row.stable_id]
+        assert first.d_short[position] == second.d_short[position]
+        assert first.d_long[position] == second.d_long[position]
+
+    touched = [row for row in rows if row.channel_index == perturbed]
+    assert any(
+        first.d_short[index[row.stable_id]] != second.d_short[index[row.stable_id]]
+        for row in touched
+    )
+
+
+def test_d2_every_channel_cold_starts_from_the_global_prior(standardizer):
+    rows = _three_channel_record()
+    values = {row.stable_id: vector(index) for index, row in enumerate(rows)}
+    memory = generate_stream_memory(
+        build_causal_streams(rows),
+        partition="train",
+        representations=values,
+        standardizer=standardizer,
+    )
+    prior = standardizer.prior_vector()
+    index = memory.index()
+    for channel in (0, 1, 2):
+        opening = next(row for row in rows if row.channel_index == channel)
+        position = index[opening.stable_id]
+        expected = standardizer.standardize(values[opening.stable_id])[0]
+        assert memory.d_short[position] == pytest.approx(
+            float(np.sqrt(np.mean((expected - prior) ** 2)))
+        )
+        assert memory.past_observed_count[position] == 0
+        assert memory.recording_age_seconds[position] == 0.0
+
+
+def test_d2_ordering_within_each_channel_follows_start_samples(standardizer):
+    rows = _three_channel_record()
+    values = {row.stable_id: vector(index) for index, row in enumerate(rows)}
+    memory = generate_stream_memory(
+        build_causal_streams(list(reversed(rows))),
+        partition="train",
+        representations=values,
+        standardizer=standardizer,
+    )
+    seen: dict[int, list[int]] = {0: [], 1: [], 2: []}
+    for position, channel in enumerate(memory.channel_indices.tolist()):
+        seen[channel].append(int(memory.start_samples[position]))
+    for channel, starts in seen.items():
+        assert starts == sorted(starts), channel
+        assert len(starts) == 6
+
+
+def test_d2_mixed_two_and_three_channel_records_coexist(standardizer):
+    """The corpus holds both shapes; stream counts must follow the data."""
+    rows = _three_channel_record(4) + [
+        reference("rB", channel, index, partition="train")
+        for channel in (0, 1)
+        for index in range(4)
+    ]
+    streams = build_causal_streams(rows)
+    assert len(streams) == 5  # 3 + 2, exactly as the real corpus mixes them
+    values = {row.stable_id: vector(index) for index, row in enumerate(rows)}
+    memory = generate_stream_memory(
+        streams, partition="train", representations=values, standardizer=standardizer
+    )
+    assert sorted({int(v) for v in memory.channel_indices}) == [0, 1, 2]
+    assert len(memory.streams) == 5
+
+
+def test_d2_no_module_assumes_a_two_channel_record():
+    """Nothing may hard-code the channel set."""
+    for module in (patient_memory, m1_experiment):
+        tree = ast.parse(Path(module.__file__).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Compare):
+                for comparator in node.comparators:
+                    if isinstance(comparator, ast.Set | ast.Tuple | ast.List):
+                        values = [
+                            element.value
+                            for element in comparator.elts
+                            if isinstance(element, ast.Constant)
+                        ]
+                        assert values != [0, 1], (
+                            "a hard-coded {0, 1} channel set would exclude the "
+                            "third lead present in the frozen corpus"
+                        )

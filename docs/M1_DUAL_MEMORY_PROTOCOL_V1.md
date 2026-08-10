@@ -11,8 +11,17 @@ directory existed when this document was written.
 | Digest | State |
 |---|---|
 | `52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4` | **SUPERSEDED BEFORE USE — NO M1 SCIENTIFIC EVIDENCE GENERATED UNDER THIS SHA** |
+| `cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61` | **SUPERSEDED BEFORE USE — NO M1 SCIENTIFIC EVIDENCE GENERATED UNDER THIS SHA** |
 
-The superseded draft stated the recording-age formula as
+**`cc2e78e7…ccda61`.** The chronology table incorrectly described every LTSTDB
+record as carrying two channels `{0, 1}`. Real-environment read-only validation
+established that the frozen development corpus contains both 2-channel and
+3-channel records, with observed indices `{0, 1, 2}`. The execution stream key
+was already generic and no M1 scientific evidence existed, so this is a
+**prospective factual correction only**. Section 4 below carries the measured
+values.
+
+**`52eedc62…815f4`.** The earlier draft stated the recording-age formula as
 `window_start_samples / sampling_rate`, which is absolute rather than
 stream-relative and contradicted both the surrounding sentence and the
 implementation. It also left the standard-deviation convention unstated and did
@@ -73,21 +82,32 @@ is never fine-tuned. The physiology transform is loaded from the frozen P1
 artifact and is **never refitted** by M1. No second morphology implementation
 exists.
 
-## 4. Chronology contract (established by read-only audit)
+## 4. Chronology contract (measured in the real frozen corpus)
 
 | Property | Value |
 |---|---|
 | Causal order field | `window_start_samples` |
 | Stream key | **`(record_id, channel_index)`** |
-| Channels per record | 2 (`{0, 1}`) |
-| Train population | 56 subjects / 60 records |
-| Validation population | 12 subjects / 13 records |
+| Observed channel indices | **`{0, 1, 2}`** |
+| Channels per record | **2 or 3** |
 | Cross-record acquisition chronology | **NOT AVAILABLE** |
 
+| Partition | Subjects | Records | Record-channel streams | Full-stream rows |
+|---|---|---|---|---|
+| TRAIN | 56 | 60 | **132** | 2,208,431 |
+| VALIDATION | 12 | 13 | **30** | 492,904 |
+
+Stream counts follow directly from the channel cardinality: TRAIN has 48
+two-channel and 12 three-channel records (`48x2 + 12x3 = 132`); VALIDATION has 9
+two-channel and 4 three-channel records (`9x2 + 4x3 = 30`).
+
 Rows sharing a start sample on different channels are **simultaneous**, not
-sequential. Both channels of one record must therefore **never** be merged into
-a single sequential history; each `(record_id, channel_index)` pair is an
-independent causal state unit.
+sequential. Channels within one record are simultaneous lead streams and must
+never be interleaved into one sequential history; each
+`(record_id, channel_index)` pair is an independent causal state unit. The
+stream key is generic over the integer channel index, so a third lead simply
+becomes a third independent stream — there is no cross-channel fusion and no
+shared cross-channel prototype.
 
 `metadata_json.elapsed_seconds` is **feature-generation wall-clock** and MUST
 NOT be used as acquisition chronology.

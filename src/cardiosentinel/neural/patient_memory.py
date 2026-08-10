@@ -14,7 +14,7 @@ Three invariants are structural rather than conventional here:
 * **No label path.** Nothing in this module accepts a label, a target family, a
   score, a threshold or an event state. Memory admission therefore cannot be
   gated on evaluation metadata even by accident.
-* **Streams are `(record_id, channel_index)`.** A record carries two
+* **Streams are `(record_id, channel_index)`.** A record carries several
   simultaneous channels; merging them into one history would fabricate
   chronology that does not exist.
 
@@ -63,15 +63,20 @@ from cardiosentinel.neural.protocol import (
 M1_PROTOCOL_NAME: Final = "M1_DUAL_MEMORY_PROTOCOL_V1"
 M1_PROTOCOL_PATH: Final = REPOSITORY_ROOT / "docs" / f"{M1_PROTOCOL_NAME}.md"
 M1_PROTOCOL_SHA256: Final = (
-    "cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61"
+    "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253"
 )
-# Superseded before any M1 evidence existed. The earlier draft stated the
-# recording-age formula absolutely rather than stream-relative, left the
-# standard-deviation convention unstated, and did not define the subject-wise
-# false-positive summary. Retained so a stale digest is recognised rather than
-# merely rejected as unknown.
+# Both superseded before any M1 evidence existed, and retained so a stale digest
+# is recognised as such rather than merely rejected as unknown.
+#
+# 52eedc62...: stated the recording-age formula absolutely rather than
+# stream-relative, left the standard-deviation convention unstated, and did not
+# define the subject-wise false-positive summary.
+# cc2e78e7...: described every LTSTDB record as carrying two channels, which
+# real-environment read-only validation disproved. The stream key was already
+# generic, so execution semantics were unaffected.
 SUPERSEDED_M1_PROTOCOL_SHA256: Final = (
     "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4",
+    "cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61",
 )
 P1_RETENTION_DECISION_SHA256: Final = (
     "7b403709fa0fb12eef65423d830c121fc3ada904266a1b47931d438f5e797d68"
@@ -194,8 +199,13 @@ def m1_alpha_identity() -> dict[str, Any]:
 def stream_key(reference: B4WindowReference) -> StreamKey:
     """The independent causal state unit.
 
-    Each record carries two simultaneous channels, so the record alone is not a
-    sequential history: keying on it would interleave two concurrent leads.
+    Records may carry multiple simultaneous channels -- the frozen development
+    corpus holds both 2-channel and 3-channel LTSTDB records, with observed
+    indices {0, 1, 2}. The record alone is therefore not a sequential history:
+    keying on it would interleave concurrent leads. Each
+    (record_id, channel_index) pair is an independent causal state unit, and
+    this key is generic over the integer index rather than assuming any
+    particular channel count.
     """
     return (reference.record_id, int(reference.channel_index))
 
