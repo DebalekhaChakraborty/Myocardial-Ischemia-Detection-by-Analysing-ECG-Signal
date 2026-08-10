@@ -781,11 +781,22 @@ def test_superseded_protocol_digest_is_named_as_such():
         SUPERSEDED_M1_PROTOCOL_SHA256,
     )
 
-    assert (
-        "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4"
-        in SUPERSEDED_M1_PROTOCOL_SHA256
-    )
+    # Both drafts were superseded BEFORE any M1 evidence existed. Historical
+    # entries are never erased, so a stale digest is recognised as superseded
+    # rather than merely rejected as unknown.
+    for digest in (
+        "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4",
+        "cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61",
+    ):
+        assert digest in SUPERSEDED_M1_PROTOCOL_SHA256
     assert M1_PROTOCOL_SHA256 not in SUPERSEDED_M1_PROTOCOL_SHA256
+
+    document = Path("docs/M1_DUAL_MEMORY_PROTOCOL_V1.md").read_text()
+    for digest in SUPERSEDED_M1_PROTOCOL_SHA256:
+        assert digest in document, "the revision record must retain every entry"
+    assert document.count("SUPERSEDED BEFORE USE") >= len(
+        SUPERSEDED_M1_PROTOCOL_SHA256
+    )
 
 
 # --------------------------------------------------------------------------
