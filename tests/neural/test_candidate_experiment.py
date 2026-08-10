@@ -311,6 +311,17 @@ def test_both_candidates_complete_independently(harness) -> None:
     assert first["run_dir"] != second["run_dir"]
 
 
+def test_run_status_records_each_candidate_identity(harness) -> None:
+    """Regression: the heartbeat must not stamp the historical B4-A constant."""
+    _run(harness, "b4b")
+    _run(harness, "b4c")
+    for experiment_id in (B4B_EXPERIMENT_ID, B4C_EXPERIMENT_ID):
+        run_dir = resolve_candidate_run_dir(harness["run_root"], experiment_id)
+        status = json.loads((run_dir / RUN_STATUS_NAME).read_text())
+        assert status["experiment_id"] == experiment_id
+        assert status["status"] == STATUS_COMPLETE
+
+
 def test_duplicate_candidate_run_is_refused(harness) -> None:
     _run(harness, "b4b")
     with pytest.raises(ValueError, match="has already been claimed"):

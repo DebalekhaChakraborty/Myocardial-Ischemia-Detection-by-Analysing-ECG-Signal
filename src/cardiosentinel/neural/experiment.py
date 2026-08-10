@@ -481,9 +481,17 @@ def b4_scientific_preflight(
     return prepared.report
 
 
-def _write_status(run_dir: Path, status: str, **fields: Any) -> dict[str, Any]:
+def _write_status(
+    run_dir: Path, status: str, *, experiment_id: str, **fields: Any
+) -> dict[str, Any]:
+    """Write the run heartbeat for the *calling* experiment.
+
+    `experiment_id` is required rather than defaulted: this helper is shared by
+    the B4-A runner and the B4-B/B4-C candidate runner, and a default would
+    silently stamp one experiment's identity onto another's status file.
+    """
     payload = {
-        "experiment_id": EXPERIMENT_ID,
+        "experiment_id": experiment_id,
         "status": status,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         **fields,
@@ -719,7 +727,9 @@ def run_b4_train_validation(
     prepared = prepare_b4_experiment(execution)
     run_dir = prepared.run_dir
     run_dir.mkdir(parents=True, exist_ok=True)
-    _write_status(run_dir, STATUS_RUNNING, command=command)
+    _write_status(
+        run_dir, STATUS_RUNNING, experiment_id=EXPERIMENT_ID, command=command
+    )
     write_json_atomic(
         run_dir / RUN_MANIFEST_NAME,
         {**prepared.report, "command": command, "status": STATUS_RUNNING},
@@ -822,6 +832,7 @@ def run_b4_train_validation(
         _write_status(
             run_dir,
             STATUS_COMPLETE,
+            experiment_id=EXPERIMENT_ID,
             command=command,
             selected_epoch=result.selected_checkpoint_epoch,
             experiment_lock_sha256=lock["experiment_lock_sha256"],
@@ -848,6 +859,7 @@ def run_b4_train_validation(
         _write_status(
             run_dir,
             STATUS_FAILED,
+            experiment_id=EXPERIMENT_ID,
             command=command,
             error_type=type(error).__name__,
             error=str(error),
