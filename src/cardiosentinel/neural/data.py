@@ -87,7 +87,7 @@ class B4WaveformDataset(Dataset[B4PredictiveSample]):
         waveform = self._cache.get(reference.stable_id)
         if waveform is None:
             self._cache_misses += 1
-            waveform = self._read_waveform(reference)
+            waveform = self.read_waveform(reference)
             if self._cache_windows:
                 self._cache[reference.stable_id] = waveform
                 self._cache.move_to_end(reference.stable_id)
@@ -111,7 +111,14 @@ class B4WaveformDataset(Dataset[B4PredictiveSample]):
             conversion_seconds=self._conversion_seconds,
         )
 
-    def _read_waveform(self, reference: B4WindowReference) -> Tensor:
+    def read_waveform(self, reference: B4WindowReference) -> Tensor:
+        """Read one validated physical-mV window with no target attached.
+
+        Public so inference-only development paths (for example the validation
+        challenge evidence suite) can reuse the exact same validated waveform
+        contract without going through the labelled training sample, whose
+        `binary_label` is defined for primary families only.
+        """
         if reference.end_sample - reference.start_sample != WINDOW_SAMPLES:
             raise ValueError("B4 metadata interval must contain exactly 2500 samples.")
         started = time.perf_counter()

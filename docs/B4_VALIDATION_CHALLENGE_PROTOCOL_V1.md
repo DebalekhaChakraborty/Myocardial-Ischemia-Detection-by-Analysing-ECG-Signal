@@ -1,5 +1,14 @@
 # B4 Validation Challenge Evidence Protocol V1
 
+## 0. Revision note
+
+An earlier draft of this procedure specified a prediction-only design. That was
+**scientifically invalid**: the locked prediction artifacts contain primary rows
+only (§3). The error was found in review **before any real challenge evidence
+was generated**, so the procedure was corrected prospectively. The superseded
+draft (SHA-256 `5478c46fe5013d1d893f1f134d35af68ec3007105c542a2115718c0431858692`)
+produced no scientific evidence and must not be cited as a frozen protocol.
+
 ## 1. Purpose
 
 This document freezes the **execution procedure** for producing the missing
@@ -27,7 +36,23 @@ an architecture-selection decision.
 
 The B4 sealed test is out of scope in every respect. See §10.
 
-## 3. Inputs
+## 3. Why this is not a prediction-only procedure
+
+The canonical B4 `validation_predictions.npz` artifacts contain **primary
+validation rows only**. `build_validation_index` calls `load_b4_references`
+with its `primary_only=True` default, which drops every family outside
+`PRIMARY_FAMILIES`, and both runners persist predictions from
+`prepared.indexes["validation"]`. The three locked artifacts therefore contain
+exactly `ischemic_positive` (21,628) and `background_negative` (452,269) and
+**no confounder rows at all**.
+
+Negative challenge evidence consequently **cannot** be derived from those files.
+It requires scoring the frozen challenge rows with each already-locked model.
+Positive-context descriptives are the exception: those ischemic-positive rows,
+with their context flags, are already present in the locked primary predictions
+and are read from there.
+
+## 4. Inputs
 
 Exactly three locked candidate runs, in the frozen order below.
 
@@ -37,21 +62,64 @@ Exactly three locked candidate runs, in the frozen order below.
 | 2 | `B4-B` | `B4B_cnn_transformer_v1` | `B4BTransformerCNN` |
 | 3 | `B4-C` | `B4C_cnn_ssm_v1` | `B4CSSMCNN` |
 
-For each candidate the evaluator consumes only:
+For each candidate the evaluator consumes:
 
 1. `EXPERIMENT_LOCK.json` — the immutable development lock;
-2. `validation_predictions.npz` — the immutable locked validation predictions.
+2. `model_selected.pt` — the locked inference model, **for inference only**;
+3. `validation_predictions.npz` — the locked primary predictions, used **only**
+   for positive-context descriptives;
+4. the frozen validation metadata and the validated waveform source, for the
+   challenge rows.
 
-No other artifact is read for measurement purposes.
+### 4.1 Frozen validation challenge population
 
-## 4. Partition
+Rebuilt from validation metadata via
+`load_b4_references(feature_root, "validation", primary_only=False)`, keeping
+only the three confounder families. `quality_excluded`, `boundary_ambiguous` and
+`source_censored_or_unknown` are **excluded**.
+
+| Family | Windows | Subjects |
+|---|---:|---:|
+| `rate_related_confounder` | 4,973 | 4 |
+| `axis_shift_confounder` | 3,000 | 8 |
+| `conduction_change_confounder` | 164 | 1 |
+| **Total** | **8,137** | 9 distinct |
+
+Window counts are Benchmark V1; subject counts are the denominators already
+recorded in the frozen B0-B3 `challenge_metrics_validation.json` evidence.
+
+Canonical sorted stable-ID selection digest:
+`49899d1b59430ff22f70cdf509184e98caedbe0e2a8756939ee77e25210ee72a`
+
+Conduction is supported by a **single subject**, which is the standing reason it
+is exploratory-only (§8.3).
+
+### 4.2 Waveform contract
+
+Challenge windows are read through the existing validated physical path
+(`B4WaveformDataset.read_waveform`): single channel, 10 s, 250 Hz, 2,500
+samples, physical mV, float32 model input, raw identity, no filtering, no
+normalisation, no handcrafted features. `B4WindowReference.binary_label` is
+**not** used for challenge rows — it is defined for primary families only and
+that invariant is preserved.
+
+### 4.3 Locked model inference
+
+`model_selected.pt` only. No optimizer, no training checkpoint. The model is
+`eval()` with `requires_grad_(False)` and every forward runs under
+`torch.no_grad()`. The complete model state is digested before and after
+inference and the two digests must match, so inference cannot silently mutate a
+locked model. No backward pass, augmentation, calibration fitting or threshold
+search exists on this path.
+
+## 5. Partition
 
 The evaluation partition is exactly the frozen **primary validation** partition
 recorded in each candidate lock (`validation_rows`).
 
 The `train` partition is not evaluated. The `test` partition is prohibited.
 
-## 5. Test prohibition
+## 6. Test prohibition
 
 The evaluator must not, on any code path:
 
@@ -62,8 +130,9 @@ The evaluator must not, on any code path:
 - produce any test metric.
 
 A partition value of `test` entering any public execution path is a hard error.
+The challenge index is built from validation metadata only.
 
-## 6. Prediction-artifact integrity
+## 7. Artifact integrity
 
 Before any quantity is computed, the evaluator must verify:
 
@@ -80,7 +149,7 @@ Before any quantity is computed, the evaluator must verify:
 
 Any failure is refused. Nothing is repaired, coerced, filled or dropped.
 
-### 6.1 Historical binding (B4-A)
+### 7.1 Historical binding (B4-A)
 
 B4-A predates `environment_dependency_digest`, `candidate_architecture` and
 `architecture_protocol_sha256`. The evaluator validates the **strongest
@@ -92,7 +161,7 @@ records which fields were unavailable.
 B4-B and B4-C are **not** weakened to match B4-A. Fields that exist for them are
 required for them.
 
-## 7. Threshold source
+## 8. Threshold source
 
 Each candidate is evaluated at its own **already locked** validation threshold,
 read from `validation_threshold` in that candidate's `EXPERIMENT_LOCK.json`.
@@ -107,7 +176,7 @@ The evaluator must not:
 
 `threshold_source` is recorded as `locked_experiment_lock.validation_threshold`.
 
-## 8. Challenge definitions
+## 9. Challenge definitions
 
 The evaluator reuses the already-frozen production implementation
 `cardiosentinel.baseline.metrics.challenge_metrics` and the frozen policy table
@@ -125,17 +194,17 @@ is by construction a **non-ischemic / negative-context** population.
 | Axis-shift | `axis_shift_confounder` | `quantitative_secondary` | permitted |
 | Conduction-change | `conduction_change_confounder` | `exploratory_descriptive` | **never** |
 
-### 8.1 Rate-related interpretation
+### 9.1 Rate-related interpretation
 
 Quantitative secondary evidence. May inform the selection gate alongside the
 other required dimensions. It is not a headline metric and is never a
 tie-breaker on its own.
 
-### 8.2 Axis-shift interpretation
+### 9.2 Axis-shift interpretation
 
-Quantitative secondary evidence, on the same terms as §8.1.
+Quantitative secondary evidence, on the same terms as §9.1.
 
-### 8.3 Conduction-change interpretation
+### 9.3 Conduction-change interpretation
 
 **Exploratory / descriptive only.** Subject support for this stratum is sparse.
 
@@ -144,7 +213,7 @@ counts and must be labelled `exploratory_descriptive` wherever it appears. It
 must not be bootstrapped, must not carry a confidence interval, and must not be
 used as quantitative selection evidence.
 
-## 9. Positive-context handling
+## 10. Positive-context handling
 
 Positive ischemic windows that also carry a confounder context remain **positive**
 and remain in the primary task. They are never removed, reweighted or converted
@@ -156,20 +225,20 @@ Where the frozen machinery already provides positive-context descriptives
 evidence level `descriptive_error_analysis`. They are descriptive error analysis,
 not challenge FPR.
 
-## 10. Prohibited operations
+## 11. Prohibited operations
 
 The evaluator must not:
 
-- construct a neural model or call `forward()`;
-- load `model_selected.pt` or `training_checkpoint.pt` for inference;
 - train, optimise or call `backward()`;
+- load `training_checkpoint.pt` or any optimizer state;
+- modify, rewrite or re-derive any locked candidate artifact;
 - regenerate or rewrite validation predictions;
 - read a waveform cache, WFDB source or LTSTDB signal file;
 - access the sealed test (§5);
 - select an architecture, rank candidates, or emit a winner;
 - combine challenge strata into a single scalar score.
 
-## 11. Required supporting counts
+## 12. Required supporting counts
 
 Every reported challenge stratum must carry, without exception:
 
@@ -182,7 +251,7 @@ Every reported challenge stratum must carry, without exception:
 A fraction is never reported without its denominator. An empty stratum is
 reported as empty; it is never silently omitted and never fabricated.
 
-## 12. Artifact schema
+## 13. Artifact schema
 
 The official suite writes one directory:
 
@@ -207,16 +276,26 @@ validation-prediction hashes, all three locked thresholds, all three candidate
 evidence digests, the metric definition and status labels, `dataset_accessed`,
 `test_accessed`, and a combined `validation_challenge_suite_sha256`.
 
-Both `dataset_accessed` and `test_accessed` must be `false`.
+`test_accessed`, `training_performed` and `threshold_search_performed` must be
+`false`. `dataset_accessed` and `waveform_accessed` are `true` by design: the
+challenge rows are scored from validated waveforms. Recording that honestly is
+required — the suite must never claim to be prediction-only.
 
-## 13. One-suite execution semantics
+## 14. One-suite execution semantics
 
 The official suite requires exactly B4-A, B4-B and B4-C, measured in that frozen
 order. No omission, no fourth model, no candidate-only official mode.
 
 The official attempt is claimed atomically via `O_EXCL` creation of
-`VALIDATION_CHALLENGE_ATTEMPT.json`. The directory and attempt file together are
-the claim.
+`VALIDATION_CHALLENGE_ATTEMPT.json`, fsynced on write. Execution is also refused
+if `VALIDATION_CHALLENGE_RESULTS.json` already exists, even should the attempt
+receipt have disappeared. The run root must be a non-versioned path, and the
+checkout must be clean.
+
+If any exception occurs after the claim, the attempt is rewritten in place to
+`FAILED_OR_INTERRUPTED` recording `error_type`, `error`, `traceback`,
+`human_review_required: true`, `repeat_attempt_permitted: false` and
+`selective_candidate_retry_permitted: false`. The claim is **never** unlinked.
 
 An existing attempt in **any** state — started, complete, partial or corrupt —
 blocks automatic re-execution. There is no `--force`, `--overwrite`,
@@ -226,7 +305,7 @@ may be added.
 If a real official run fails after the claim, the attempt is consumed and human
 review is required. Recovery semantics are deliberately not defined here.
 
-## 14. Selection is out of scope
+## 15. Selection is out of scope
 
 This evaluator produces evidence. It does not select.
 

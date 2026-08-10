@@ -158,8 +158,8 @@ def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
         "validation-challenge",
         help=(
             "Runs the one official B4-A/B4-B/B4-C validation challenge evidence "
-            "suite from locked predictions. Performs no model inference and "
-            "does not access the test partition."
+            "suite: locked-model inference over the frozen validation challenge "
+            "rows. Trains nothing and does not access the test partition."
         ),
     )
     challenge.add_argument(
@@ -168,6 +168,8 @@ def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
     challenge.add_argument("--b4a-run", type=Path, default=DEFAULT_B4A_RUN_DIR)
     challenge.add_argument("--b4b-run", type=Path, default=DEFAULT_B4B_RUN_DIR)
     challenge.add_argument("--b4c-run", type=Path, default=DEFAULT_B4C_RUN_DIR)
+    challenge.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+    challenge.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
 
     # Candidate architecture runners. Only b4b and b4c are selectable, and no
     # model, optimizer, threshold, seed or epoch override is exposed.
@@ -349,6 +351,8 @@ def run_b4_command(args: argparse.Namespace) -> int:
                 "B4-C": args.b4c_run,
             },
             args.run_root,
+            args.feature_root,
+            args.source,
             command="cardiosentinel b4 validation-challenge",
         )
     elif args.b4_command == "evaluate-locked-test":
