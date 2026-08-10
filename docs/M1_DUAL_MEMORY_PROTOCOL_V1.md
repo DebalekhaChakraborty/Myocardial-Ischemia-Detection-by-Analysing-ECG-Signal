@@ -6,6 +6,20 @@ This protocol is frozen **before any real M1 evidence exists**. Every execution
 semantic below was fixed prospectively. No M1 metric, cache, arm claim or run
 directory existed when this document was written.
 
+### Revision record
+
+| Digest | State |
+|---|---|
+| `52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4` | **SUPERSEDED BEFORE USE — NO M1 SCIENTIFIC EVIDENCE GENERATED UNDER THIS SHA** |
+
+The superseded draft stated the recording-age formula as
+`window_start_samples / sampling_rate`, which is absolute rather than
+stream-relative and contradicted both the surrounding sentence and the
+implementation. It also left the standard-deviation convention unstated and did
+not define the subject-wise false-positive summary. All three are corrected
+below. The correction is **prospective**: no M1 cache, arm claim, metric or run
+directory existed under either digest.
+
 > **THIS M1 UPDATE RULE IS INTENTIONALLY NOT CONTAMINATION-SAFE.**
 >
 > **AN ABNORMAL OR CONFOUNDED WINDOW MAY ENTER MEMORY.**
@@ -145,6 +159,10 @@ development population rather than to validation or challenge composition.
 Per dimension `j`: `mean_j` and `std_j` are the TRAIN mean and standard
 deviation; a zero-variance dimension takes `scale = 1`.
 
+**Standard-deviation convention: NumPy population standard deviation,
+`numpy.std(..., axis=0, ddof=0)`.** This is stated explicitly so the frozen
+distance space cannot drift with a sample-variance reading.
+
 ```
 x_t = (z_t - mean) / scale
 ```
@@ -272,8 +290,17 @@ Frozen challenge selection `49899d1b59430ff22f70cdf509184e98caedbe0e2a8756939ee7
 
 ## 15. Cold-start bins (frozen now)
 
-Recording age relative to each stream's first available window, computed as
-`window_start_samples / sampling_rate`:
+Recording age is **stream-relative**: it is measured from the first available
+window of the same `(record_id, channel_index)` stream, not from the absolute
+start of the record.
+
+```
+recording_age_seconds =
+    (window_start_samples - first_stream_start_sample) / sampling_rate
+```
+
+with `sampling_rate = 250.0 Hz`. The first window of every stream therefore has
+`recording_age_seconds == 0.0` by construction. Bins:
 
 - `0-5 minutes`
 - `5-60 minutes`
@@ -292,6 +319,40 @@ Personalization evidence: primary-background FPR; subject-wise false-positive
 distribution; sensitivity preservation; cold-start bins; rate FPR; axis FPR;
 conduction descriptive FPR; finite representation rate; update counts;
 descriptive short/long prototype disagreement.
+
+### 16.1 Subject-wise false-positive evidence (frozen definition)
+
+Computed on **PRIMARY VALIDATION only**, at the arm's **already selected**
+threshold. It is **supporting evidence only**: it never selects a threshold,
+never enters a weighted score, and is never used for tuning.
+
+A false positive is a `background_negative` window scored at or above the
+selected threshold. Only subjects with at least one background-negative window
+("negative support") contribute.
+
+```
+pooled_background_fpr = FP(all background_negative rows) / N(background_negative rows)
+subject_fpr[s]        = FP(background_negative rows of subject s) / N(background_negative rows of subject s)
+```
+
+Reported fields, over the contributing subjects' `subject_fpr` values sorted
+ascending:
+
+| Field | Definition |
+|---|---|
+| `pooled_background_negative_fpr` | as above |
+| `background_negative_count` | pooled denominator |
+| `contributing_subject_count` | subjects with negative support |
+| `subject_fpr_median` | `numpy.median` |
+| `subject_fpr_q25`, `subject_fpr_q75` | `numpy.quantile`, **linear** interpolation |
+| `subject_fpr_iqr` | `q75 - q25` |
+| `subject_fpr_p90` | `numpy.quantile(0.90)`, linear interpolation |
+| `subject_fpr_max` | maximum |
+| `subject_false_positive_rates` | exact per-subject values, keyed by subject ID |
+
+The interpolation method is named because quantile conventions differ between
+libraries and the frozen definition must be reproducible. Subject IDs appear
+here as **reporting keys only**; they are never model inputs.
 
 Comparison is across the frozen P1-B global control, M1S, M1L and M1D, by
 **bounded Pareto judgement only**. There is **no weighted score**. Dual memory

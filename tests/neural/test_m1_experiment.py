@@ -20,6 +20,12 @@ import pytest
 
 from cardiosentinel.neural import m1_experiment
 from cardiosentinel.neural.m1_experiment import (
+    FROZEN_DEVELOPMENT_FEATURE_INTEGRITY_SHA256,
+    FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256,
+    FROZEN_P1_EMBEDDING_CACHE_SHA256,
+    FROZEN_P1_STAGE1_SUITE_SHA256,
+    FROZEN_P1B_LOCK_SHA256,
+    FROZEN_PHYSIOLOGY_TRANSFORM_SHA256,
     M1_ARM_ORDER,
     M1_STAGE1_RESULT_NAME,
     M1StreamRepresentation,
@@ -30,6 +36,9 @@ from cardiosentinel.neural.m1_experiment import (
     build_m1_stage1_result,
     build_stream_cache_manifest,
     load_stream_cache,
+    require_frozen_upstream_identities,
+    scan_test_artifacts,
+    subject_false_positive_evidence,
     train_m1_arm,
     validate_m1_lock,
     validate_m1_stage1_results,
@@ -86,8 +95,19 @@ def synthetic(standardizer):
     return memory, representation
 
 
+UPSTREAM = {
+    "p1_stage1_suite_sha256": FROZEN_P1_STAGE1_SUITE_SHA256,
+    "p1b_experiment_lock_sha256": FROZEN_P1B_LOCK_SHA256,
+    "physiology_transform_sha256": FROZEN_PHYSIOLOGY_TRANSFORM_SHA256,
+    "p1_train_embedding_cache_sha256": FROZEN_P1_EMBEDDING_CACHE_SHA256["train"],
+    "encoder_checkpoint_sha256": "b1301723909c641a0014c31f6daa9549d47ab231f0b07"
+    "483e0de729aff5591c9",
+}
+
 MANIFEST_FIELDS = {
     "standardizer_sha256": "a" * 64,
+    "feature_integrity_sha256": FROZEN_DEVELOPMENT_FEATURE_INTEGRITY_SHA256,
+    "source_integrity_sha256": FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256,
     "p1_stage1_suite_sha256": "b" * 64,
     "p1b_lock_sha256": "c" * 64,
     "physiology_transform_sha256": "d" * 64,
@@ -117,6 +137,7 @@ def test_standardizer_is_fitted_on_train_only(standardizer, synthetic):
                 primary_audit={},
             ),
             primary_train_stable_ids=representation.stable_ids,
+            upstream_identities=UPSTREAM,
         )
 
 
@@ -126,7 +147,9 @@ def test_standardizer_requires_the_frozen_primary_train_population(synthetic):
     # so the guard must refuse rather than quietly fit on whatever it is given.
     with pytest.raises(M1MemoryError, match="374452"):
         build_distance_standardizer(
-            representation, primary_train_stable_ids=representation.stable_ids
+            representation,
+            primary_train_stable_ids=representation.stable_ids,
+            upstream_identities=UPSTREAM,
         )
 
 
@@ -297,6 +320,7 @@ def _lock_for(experiment_id: str, run_dir: Path) -> dict:
         challenge_evidence={"rate_related": {"false_positive_fraction": 0.1}},
         cold_start={"0_5_minutes": {"window_count": 1}},
         descriptives={"window_count": 1},
+        subject_false_positives={"pooled_background_negative_fpr": 0.01},
         train_cache={"stream_cache_sha256": "a" * 64},
         validation_cache={"stream_cache_sha256": "b" * 64},
         standardizer={"standardizer_sha256": "c" * 64},
@@ -304,8 +328,8 @@ def _lock_for(experiment_id: str, run_dir: Path) -> dict:
         provenance={"git_sha": "f" * 40, "git_dirty": False},
         environment={"device": "cpu"},
         dependency_digest="0" * 64,
-        p1_stage1_suite_sha256="d" * 64,
-        p1b_lock_sha256="e" * 64,
+        p1_stage1_suite_sha256=FROZEN_P1_STAGE1_SUITE_SHA256,
+        p1b_lock_sha256=FROZEN_P1B_LOCK_SHA256,
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / EXPERIMENT_LOCK_NAME).write_text(json.dumps(lock))
@@ -350,11 +374,22 @@ def test_stage1_suite_requires_all_three_arms(tmp_path):
 
 def test_stage1_suite_round_trips_and_makes_no_selection(tmp_path):
     locks = {arm: _lock_for(arm, tmp_path / arm) for arm in M1_ARM_ORDER}
+    rows = np.stack([vector(seed) for seed in range(30)]).astype(np.float64)
+    standardizer = fit_distance_standardizer(
+        rows, partition="train", input_identities=UPSTREAM
+    ).as_dict()
     payload = build_m1_stage1_result(
         locks,
-        control={"experiment_id": "P1B_phys_fusion_v1"},
-        stream_caches={"train": {"stream_cache_sha256": "a" * 64}},
-        standardizer={"standardizer_sha256": "c" * 64},
+        control={
+            "experiment_id": "P1B_phys_fusion_v1",
+            "experiment_lock_sha256": FROZEN_P1B_LOCK_SHA256,
+            "retrained_by_m1": False,
+        },
+        stream_caches={
+            "train": {"stream_cache_sha256": "a" * 64},
+            "validation": {"stream_cache_sha256": "b" * 64},
+        },
+        standardizer=standardizer,
         provenance={"git_sha": "f" * 40, "git_dirty": False},
         environment={},
         dependency_digest="0" * 64,
@@ -549,3 +584,296 @@ def test_missing_control_artifact_is_refused(tmp_path):
     (run_dir / "CHALLENGE_METRICS.json").unlink()
     with pytest.raises(M1MemoryError):
         m1_experiment.load_frozen_control_evidence(run_dir)
+
+
+# --------------------------------------------------------------------------
+# Preflight firewall and partial-state semantics
+# --------------------------------------------------------------------------
+
+
+def test_test_artifact_scan_actually_walks_the_supplied_roots(tmp_path):
+    assert scan_test_artifacts(tmp_path) == []
+    claimed = tmp_path / "M1S_short_memory_v1"
+    claimed.mkdir()
+    (claimed / "TEST_ATTEMPT.json").write_text("{}")
+    found = scan_test_artifacts(tmp_path)
+    assert any(name.endswith("TEST_ATTEMPT.json") for name in found)
+
+
+def test_preflight_refuses_when_a_test_artifact_exists(tmp_path, monkeypatch):
+    _stub_preflight_runtime(monkeypatch)
+    run_root = tmp_path / "runs"
+    (run_root / "M1S_short_memory_v1").mkdir(parents=True)
+    (run_root / "M1S_short_memory_v1" / "TEST_ATTEMPT.json").write_text("{}")
+    report = m1_experiment.m1_preflight(run_root, tmp_path / "caches")
+    assert report["status"] == "test_artifact_present_human_review_required"
+    assert report["test_artifacts_present"] is True
+    assert report["ready_for_canonical_m1_stage1"] is False
+    assert report["human_review_required"] is True
+
+
+def test_preflight_reports_partial_cache_for_human_review(tmp_path, monkeypatch):
+    _stub_preflight_runtime(monkeypatch)
+    caches = tmp_path / "caches"
+    (caches / "train").mkdir(parents=True)  # directory, no manifest
+    report = m1_experiment.m1_preflight(tmp_path / "runs", caches)
+    assert report["status"] == "partial_stream_cache_human_review_required"
+    assert report["stream_cache_state"]["partial_partitions"] == ["train"]
+    assert report["ready_for_canonical_m1_stage1"] is False
+
+
+def test_preflight_refuses_an_orphan_standardizer(tmp_path, monkeypatch):
+    _stub_preflight_runtime(monkeypatch)
+    caches = tmp_path / "caches"
+    caches.mkdir(parents=True)
+    (caches / "M1_DISTANCE_STANDARDIZER.json").write_text("{}")
+    report = m1_experiment.m1_preflight(tmp_path / "runs", caches)
+    assert report["status"] == "partial_stream_cache_human_review_required"
+    assert report["stream_cache_state"]["orphan_standardizer"] is True
+
+
+def test_preflight_absent_cache_is_healthy_initial_state(tmp_path, monkeypatch):
+    _stub_preflight_runtime(monkeypatch)
+    report = m1_experiment.m1_preflight(tmp_path / "runs", tmp_path / "caches")
+    # With no upstream roots supplied the gates are legitimately unproven, but
+    # an absent cache must never be mistaken for a partial one.
+    assert report["status"] != "partial_stream_cache_human_review_required"
+    assert report["stream_cache_state"]["partial_partitions"] == []
+    assert report["stream_cache_state"]["one_partition_only"] is False
+    assert report["human_review_required"] is False
+    assert report["models_created"] == 0
+    assert report["artifacts_created"] == 0
+    assert not (tmp_path / "caches").exists()
+
+
+def test_preflight_sha256_is_computed_over_the_complete_report(
+    tmp_path, monkeypatch
+):
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    _stub_preflight_runtime(monkeypatch)
+    report = m1_experiment.m1_preflight(tmp_path / "runs", tmp_path / "caches")
+    body = {k: v for k, v in report.items() if k != "preflight_sha256"}
+    assert report["preflight_sha256"] == canonical_sha256(body)
+    assert "status" in body and "stream_caches" in body
+
+
+def _stub_preflight_runtime(monkeypatch):
+    """Preflight is read-only, but it still gates on the frozen runtime.
+
+    CI runs a different Python than the frozen scientific environment, so the
+    gate is stubbed here rather than weakened in production. The real preflight
+    still evaluates it.
+    """
+    monkeypatch.setattr(
+        m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, "0" * 64)
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "require_clean_checkout",
+        lambda: {"git_sha": "f" * 40, "git_dirty": False},
+    )
+
+
+# --------------------------------------------------------------------------
+# Exact frozen upstream identity enforcement
+# --------------------------------------------------------------------------
+
+
+def _upstream_kwargs(**overrides):
+    payload = {
+        "p1_suite": {
+            "p1_stage1_suite_sha256": FROZEN_P1_STAGE1_SUITE_SHA256,
+            "test_accessed": False,
+        },
+        "p1b_lock": {"experiment_lock_sha256": FROZEN_P1B_LOCK_SHA256},
+        "physiology_transform_sha256": FROZEN_PHYSIOLOGY_TRANSFORM_SHA256,
+        "embedding_caches": {
+            partition: {"cache_sha256": digest}
+            for partition, digest in FROZEN_P1_EMBEDDING_CACHE_SHA256.items()
+        },
+        "encoder_lock": {
+            "checkpoint_sha256": (
+                "b1301723909c641a0014c31f6daa9549d47ab231f0b07483e0de729aff5591c9"
+            ),
+            "experiment_lock_sha256": (
+                "58e44a09ce3ebffecfcd49d957acfa368fc03b534fdcd990aedb9b6b0e9bda7b"
+            ),
+            "test": None,
+        },
+        "feature_receipt": {
+            "development_feature_integrity_sha256": (
+                FROZEN_DEVELOPMENT_FEATURE_INTEGRITY_SHA256
+            )
+        },
+        "source_receipt": {
+            "development_source_integrity_sha256": (
+                FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256
+            )
+        },
+        "challenge_selection_sha256": (
+            "49899d1b59430ff22f70cdf509184e98caedbe0e2a8756939ee77e25210ee72a"
+        ),
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_frozen_upstream_identities_pass_when_exact():
+    receipt = require_frozen_upstream_identities(**_upstream_kwargs())
+    assert receipt["all_frozen_identities_enforced"] is True
+    assert receipt["p1_stage1_suite_sha256"] == FROZEN_P1_STAGE1_SUITE_SHA256
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"p1_suite": {"p1_stage1_suite_sha256": "0" * 64, "test_accessed": False}},
+        {"p1b_lock": {"experiment_lock_sha256": "0" * 64}},
+        {"physiology_transform_sha256": "0" * 64},
+        {
+            "embedding_caches": {
+                "train": {"cache_sha256": "0" * 64},
+                "validation": {
+                    "cache_sha256": FROZEN_P1_EMBEDDING_CACHE_SHA256["validation"]
+                },
+            }
+        },
+        {
+            "feature_receipt": {
+                "development_feature_integrity_sha256": "0" * 64
+            }
+        },
+        {"source_receipt": {"development_source_integrity_sha256": "0" * 64}},
+        {"challenge_selection_sha256": "0" * 64},
+    ],
+)
+def test_a_different_valid_artifact_is_not_a_substitute(override):
+    with pytest.raises(M1MemoryError, match="frozen M1 protocol binds"):
+        require_frozen_upstream_identities(**_upstream_kwargs(**override))
+
+
+def test_a_suite_recording_test_access_is_refused():
+    with pytest.raises(M1MemoryError, match="test access"):
+        require_frozen_upstream_identities(
+            **_upstream_kwargs(
+                p1_suite={
+                    "p1_stage1_suite_sha256": FROZEN_P1_STAGE1_SUITE_SHA256,
+                    "test_accessed": True,
+                }
+            )
+        )
+
+
+def test_standardizer_refuses_null_upstream_identities(synthetic):
+    _, representation = synthetic
+    with pytest.raises(M1MemoryError, match="absent or null"):
+        build_distance_standardizer(
+            representation,
+            primary_train_stable_ids=representation.stable_ids,
+            upstream_identities={**UPSTREAM, "p1b_experiment_lock_sha256": None},
+        )
+
+
+def test_superseded_protocol_digest_is_named_as_such():
+    from cardiosentinel.neural.patient_memory import (
+        M1_PROTOCOL_SHA256,
+        SUPERSEDED_M1_PROTOCOL_SHA256,
+    )
+
+    assert (
+        "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4"
+        in SUPERSEDED_M1_PROTOCOL_SHA256
+    )
+    assert M1_PROTOCOL_SHA256 not in SUPERSEDED_M1_PROTOCOL_SHA256
+
+
+# --------------------------------------------------------------------------
+# Subject-wise false-positive evidence
+# --------------------------------------------------------------------------
+
+
+def test_subject_false_positive_evidence_is_deterministic():
+    labels = np.array([0, 0, 0, 0, 1, 0, 0, 1], dtype=np.int64)
+    scores = np.array([0.9, 0.1, 0.2, 0.8, 0.95, 0.7, 0.05, 0.99])
+    subjects = ["a", "a", "b", "b", "b", "c", "c", "c"]
+    first = subject_false_positive_evidence(labels, scores, subjects, 0.5)
+    second = subject_false_positive_evidence(labels, scores, subjects, 0.5)
+    assert first == second
+
+    # a: 1/2, b: 1/2, c: 1/2 -> pooled 3/6
+    assert first["pooled_background_negative_fpr"] == pytest.approx(0.5)
+    assert first["background_negative_count"] == 6
+    assert first["contributing_subject_count"] == 3
+    assert first["subject_false_positive_rates"] == {"a": 0.5, "b": 0.5, "c": 0.5}
+    assert first["quantile_interpolation"] == "linear"
+    assert first["evidence_status"] == "supporting"
+    assert first["threshold_optimized_from_this_evidence"] is False
+
+
+def test_subject_without_negative_support_is_excluded():
+    labels = np.array([0, 0, 1], dtype=np.int64)
+    scores = np.array([0.9, 0.1, 0.99])
+    evidence = subject_false_positive_evidence(labels, scores, ["a", "a", "b"], 0.5)
+    assert evidence["contributing_subject_count"] == 1
+    assert set(evidence["subject_false_positive_rates"]) == {"a"}
+
+
+def test_subject_false_positive_summary_reports_the_frozen_fields():
+    labels = np.zeros(20, dtype=np.int64)
+    scores = np.linspace(0.0, 1.0, 20)
+    subjects = [f"s{i // 4}" for i in range(20)]
+    evidence = subject_false_positive_evidence(labels, scores, subjects, 0.5)
+    for field in (
+        "pooled_background_negative_fpr",
+        "background_negative_count",
+        "contributing_subject_count",
+        "subject_fpr_median",
+        "subject_fpr_q25",
+        "subject_fpr_q75",
+        "subject_fpr_iqr",
+        "subject_fpr_p90",
+        "subject_fpr_max",
+        "subject_false_positive_rates",
+    ):
+        assert field in evidence, field
+    assert evidence["subject_fpr_iqr"] == pytest.approx(
+        evidence["subject_fpr_q75"] - evidence["subject_fpr_q25"]
+    )
+
+
+def test_subject_false_positive_evidence_refuses_an_empty_negative_population():
+    with pytest.raises(M1MemoryError, match="background-negative"):
+        subject_false_positive_evidence(
+            np.ones(3, dtype=np.int64), np.ones(3), ["a", "a", "a"], 0.5
+        )
+
+
+# --------------------------------------------------------------------------
+# Corrected cold-start origin
+# --------------------------------------------------------------------------
+
+
+def test_recording_age_is_stream_relative_not_absolute(standardizer):
+    from cardiosentinel.neural.patient_memory import (
+        build_causal_streams as _streams,
+    )
+
+    # A stream that starts deep into the record: absolute start samples would
+    # place its first window in the ">60 minutes" bin, which is exactly the
+    # error the superseded protocol text described.
+    offset = 4_000_000  # 16000 s at 250 Hz
+    rows = [
+        reference("rA", 0, index + offset // 1250, partition="train")
+        for index in range(4)
+    ]
+    values = {row.stable_id: vector(index) for index, row in enumerate(rows)}
+    memory = generate_stream_memory(
+        _streams(rows),
+        partition="train",
+        representations=values,
+        standardizer=standardizer,
+    )
+    assert memory.recording_age_seconds[0] == 0.0
+    assert memory.cold_start_bins[0] == "0_5_minutes"
+    assert memory.recording_age_seconds[1] == pytest.approx(5.0)

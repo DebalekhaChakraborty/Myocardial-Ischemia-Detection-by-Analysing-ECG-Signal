@@ -63,7 +63,15 @@ from cardiosentinel.neural.protocol import (
 M1_PROTOCOL_NAME: Final = "M1_DUAL_MEMORY_PROTOCOL_V1"
 M1_PROTOCOL_PATH: Final = REPOSITORY_ROOT / "docs" / f"{M1_PROTOCOL_NAME}.md"
 M1_PROTOCOL_SHA256: Final = (
-    "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4"
+    "cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61"
+)
+# Superseded before any M1 evidence existed. The earlier draft stated the
+# recording-age formula absolutely rather than stream-relative, left the
+# standard-deviation convention unstated, and did not define the subject-wise
+# false-positive summary. Retained so a stale digest is recognised rather than
+# merely rejected as unknown.
+SUPERSEDED_M1_PROTOCOL_SHA256: Final = (
+    "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4",
 )
 P1_RETENTION_DECISION_SHA256: Final = (
     "7b403709fa0fb12eef65423d830c121fc3ada904266a1b47931d438f5e797d68"
@@ -140,6 +148,12 @@ def validate_m1_protocol(path: Path = M1_PROTOCOL_PATH) -> str:
     if not document.is_file():
         raise M1MemoryError(f"Frozen M1 protocol is missing at {document}.")
     digest = sha256_file(document)
+    if digest in SUPERSEDED_M1_PROTOCOL_SHA256:
+        raise M1MemoryError(
+            f"M1 protocol digest {digest} is a draft that was SUPERSEDED "
+            "BEFORE USE; no M1 scientific evidence was generated under it. The "
+            f"frozen protocol is {M1_PROTOCOL_SHA256}."
+        )
     if digest != M1_PROTOCOL_SHA256:
         raise M1MemoryError(
             f"M1 protocol digest {digest} differs from the frozen "
@@ -350,7 +364,8 @@ def fit_distance_standardizer(
         raise M1MemoryError("M1 standardizer fit received a non-finite value.")
 
     means = matrix.mean(axis=0)
-    deviations = matrix.std(axis=0)
+    # Population standard deviation (ddof=0), as named in the protocol.
+    deviations = matrix.std(axis=0, ddof=0)
     zero_variance = tuple(int(i) for i in np.flatnonzero(deviations == 0.0))
     scales = np.where(deviations == 0.0, 1.0, deviations)
     prior = ((matrix - means) / scales).mean(axis=0)
