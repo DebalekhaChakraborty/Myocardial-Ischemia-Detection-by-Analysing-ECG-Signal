@@ -11,6 +11,9 @@ DEFAULT_FEATURE_ROOT = Path("cardiosentinel-features/ltstdb-baseline-v1")
 DEFAULT_WAVEFORM_CACHE_ROOT = Path("cardiosentinel-features/b4-waveform-v1")
 DEFAULT_RUN_ROOT = Path("cardiosentinel-runs/phase3b2-b4-v1")
 DEFAULT_CANDIDATE_RUN_ROOT = Path("cardiosentinel-runs/phase3b2-architecture-v1")
+DEFAULT_B4A_RUN_DIR = DEFAULT_RUN_ROOT / "B4_raw_compact_cnn_v1"
+DEFAULT_B4B_RUN_DIR = DEFAULT_CANDIDATE_RUN_ROOT / "B4B_cnn_transformer_v1"
+DEFAULT_B4C_RUN_DIR = DEFAULT_CANDIDATE_RUN_ROOT / "B4C_cnn_ssm_v1"
 
 
 def _common_paths(parser: argparse.ArgumentParser) -> None:
@@ -147,6 +150,24 @@ def add_b4_parser(subparsers: argparse._SubParsersAction) -> None:
     _run_root(sealed_test)
     sealed_test.add_argument("--device", choices=("cpu", "cuda"))
     sealed_test.add_argument("--workers", type=int, default=0)
+
+    # Official A/B/C validation challenge evidence. There is deliberately no
+    # --candidate flag: the suite is all three or nothing, and no threshold,
+    # metric or retry override exists.
+    challenge = commands.add_parser(
+        "validation-challenge",
+        help=(
+            "Runs the one official B4-A/B4-B/B4-C validation challenge evidence "
+            "suite from locked predictions. Performs no model inference and "
+            "does not access the test partition."
+        ),
+    )
+    challenge.add_argument(
+        "--run-root", type=Path, default=DEFAULT_CANDIDATE_RUN_ROOT
+    )
+    challenge.add_argument("--b4a-run", type=Path, default=DEFAULT_B4A_RUN_DIR)
+    challenge.add_argument("--b4b-run", type=Path, default=DEFAULT_B4B_RUN_DIR)
+    challenge.add_argument("--b4c-run", type=Path, default=DEFAULT_B4C_RUN_DIR)
 
     # Candidate architecture runners. Only b4b and b4c are selectable, and no
     # model, optimizer, threshold, seed or epoch override is exposed.
@@ -316,6 +337,20 @@ def run_b4_command(args: argparse.Namespace) -> int:
                 command=CANDIDATE_COMMAND,
                 workers=args.workers,
             )
+    elif args.b4_command == "validation-challenge":
+        from cardiosentinel.neural.validation_challenge import (
+            run_official_validation_challenge_suite,
+        )
+
+        report = run_official_validation_challenge_suite(
+            {
+                "B4-A": args.b4a_run,
+                "B4-B": args.b4b_run,
+                "B4-C": args.b4c_run,
+            },
+            args.run_root,
+            command="cardiosentinel b4 validation-challenge",
+        )
     elif args.b4_command == "evaluate-locked-test":
         from cardiosentinel.neural.sealed_test import (
             DEFAULT_COMMAND as SEALED_TEST_COMMAND,

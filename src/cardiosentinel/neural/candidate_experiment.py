@@ -667,7 +667,9 @@ def run_candidate_train_validation(
     # deliberately outside the try below: a refused claim belongs to another
     # process, so this one must never write status into that directory.
     claim_candidate_run_directory(run_dir, prepared.experiment_id)
-    _write_status(run_dir, STATUS_RUNNING, command=command)
+    _write_status(
+        run_dir, STATUS_RUNNING, experiment_id=experiment_id, command=command
+    )
     write_json_atomic(
         run_dir / RUN_MANIFEST_NAME,
         {**prepared.report, "command": command, "status": STATUS_RUNNING},
@@ -773,6 +775,7 @@ def run_candidate_train_validation(
         _write_status(
             run_dir,
             STATUS_COMPLETE,
+            experiment_id=experiment_id,
             command=command,
             selected_epoch=result.selected_checkpoint_epoch,
             experiment_lock_sha256=lock["experiment_lock_sha256"],
@@ -799,6 +802,7 @@ def run_candidate_train_validation(
         _write_status(
             run_dir,
             STATUS_FAILED,
+            experiment_id=experiment_id,
             command=command,
             error_type=type(error).__name__,
             error=str(error),
