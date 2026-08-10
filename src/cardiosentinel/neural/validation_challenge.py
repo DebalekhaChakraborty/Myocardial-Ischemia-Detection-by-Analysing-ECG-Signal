@@ -58,7 +58,11 @@ from cardiosentinel.evaluation.protocol import (
     POSITIVE_CONTEXT_FLAGS,
     challenge_evidence_policy,
 )
+from cardiosentinel.neural.candidate_experiment import (
+    require_exact_scientific_environment,
+)
 from cardiosentinel.neural.data import B4WaveformDataset
+from cardiosentinel.neural.determinism import initialize_determinism
 from cardiosentinel.neural.integrity import (
     canonical_sha256,
     validate_development_feature_integrity,
@@ -77,6 +81,7 @@ from cardiosentinel.neural.protocol import (
     protocol_sha256,
     require_development_partition,
 )
+from cardiosentinel.neural.provenance import runtime_environment
 from cardiosentinel.neural.resource_benchmark import (
     ARCHITECTURE_PROTOCOL_SHA256,
     OFFICIAL_ORDER,
@@ -89,7 +94,7 @@ VALIDATION_CHALLENGE_PROTOCOL_PATH: Final = (
     REPOSITORY_ROOT / "docs" / "B4_VALIDATION_CHALLENGE_PROTOCOL_V1.md"
 )
 VALIDATION_CHALLENGE_PROTOCOL_SHA256: Final = (
-    "4ab7e2e6adcf1e4d4e88a4ca5114515abc917aef6c1927ee52aaf79b16a81be1"
+    "44df775f43301a782d3acd48fc4b3cd9358c07d4ed45d270fcb2763200761926"
 )
 
 SUITE_DIR_NAME: Final = "B4_architecture_validation_challenge_v1"
@@ -131,6 +136,7 @@ PRIMARY_VALIDATION_COUNTS: Final = {
     "total": 473_897,
     "positive": 21_628,
     "negative": 452_269,
+    "subjects": 12,
 }
 PRIMARY_FAMILY_SET: Final = frozenset(("ischemic_positive", "background_negative"))
 
@@ -162,6 +168,25 @@ METRIC_DEFINITIONS: Final = {
 
 class ValidationChallengeError(RuntimeError):
     """Raised when challenge evidence cannot be produced with full integrity."""
+
+
+def require_challenge_runtime_environment() -> tuple[dict[str, Any], str]:
+    """Verify the CURRENT runtime against the frozen scientific environment.
+
+    Challenge evidence performs real model inference, so it must execute under
+    the same environment as the candidate experiments and the official resource
+    benchmark. The already-reviewed gate is reused rather than redefined, and
+    this is deliberately distinct from the historical environment recorded in a
+    candidate lock.
+    """
+    determinism = initialize_determinism(requested_device="cpu")
+    environment = runtime_environment(determinism.device, 0)
+    dependency_digest = require_exact_scientific_environment(environment)
+    if environment.get("amp_enabled") is not False:
+        raise ValidationChallengeError(
+            "Challenge inference forbids automatic mixed precision."
+        )
+    return environment, dependency_digest
 
 
 def validate_validation_challenge_protocol(
@@ -458,10 +483,12 @@ def load_primary_validation_predictions(
         )
     positives = int(np.sum(labels == 1))
     negatives = int(np.sum(labels == 0))
+    subjects = int(len(set(columns["subject_id"].tolist())))
     for field, observed in (
         ("total", rows),
         ("positive", positives),
         ("negative", negatives),
+        ("subjects", subjects),
     ):
         bound = expected_rows.get(field)
         if bound is not None and bound != observed:
@@ -470,6 +497,26 @@ def load_primary_validation_predictions(
                 f"{bound}."
             )
     return columns
+
+
+def require_canonical_primary_population(columns: dict[str, np.ndarray]) -> None:
+    """Require the frozen canonical primary validation population.
+
+    A self-consistent but altered lock must not be able to redefine the
+    population: the frozen constants are the authority.
+    """
+    labels = np.asarray(columns["label"], dtype=np.int64)
+    observed = {
+        "total": int(labels.shape[0]),
+        "positive": int(np.sum(labels == 1)),
+        "negative": int(np.sum(labels == 0)),
+        "subjects": int(len(set(columns["subject_id"].tolist()))),
+    }
+    if observed != PRIMARY_VALIDATION_COUNTS:
+        raise ValidationChallengeError(
+            "Primary validation population differs from the frozen canonical "
+            f"identity: expected {PRIMARY_VALIDATION_COUNTS}, observed {observed}."
+        )
 
 
 def evaluate_candidate_validation_challenge(
@@ -526,6 +573,7 @@ def evaluate_candidate_validation_challenge(
         }
 
     primary = load_primary_validation_predictions(Path(run_dir), lock)
+    require_canonical_primary_population(primary)
     payload: dict[str, Any] = {
         "official_model": official_model,
         "experiment_id": lock["experiment_id"],
@@ -613,10 +661,18 @@ def _claim_suite_attempt(path: Path, payload: dict[str, Any]) -> str:
             "candidate-specific retry and attempt replacement are prohibited "
             "and require documented human review."
         ) from error
+    # The claim now exists on disk and is never unlinked on failure. Durability
+    # matches the reviewed resource-suite pattern: fsync the file, then fsync the
+    # parent directory so the claim survives a crash before the entry is flushed.
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(body)
         handle.flush()
         os.fsync(handle.fileno())
+    directory = os.open(path.parent, os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
     return canonical_sha256(payload)
 
 
@@ -642,6 +698,9 @@ def run_official_validation_challenge_suite(
             f"{list(OFFICIAL_ORDER)}; received {sorted(run_directories)}."
         )
     protocol_digest = validate_validation_challenge_protocol()
+    # Gate the runtime BEFORE the one-shot attempt is claimed: a wrong
+    # environment must never consume the official attempt.
+    environment, dependency_digest = require_challenge_runtime_environment()
     provenance = git_provenance(REPOSITORY_ROOT)
     if provenance["git_dirty"]:
         raise ValidationChallengeError(
@@ -670,6 +729,7 @@ def run_official_validation_challenge_suite(
         "git_sha": provenance["git_sha"],
         "git_dirty": provenance["git_dirty"],
         "validation_challenge_protocol_sha256": protocol_digest,
+        "runtime_dependency_digest": dependency_digest,
         "created_at_utc_audit_only": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime()
         ),
@@ -719,6 +779,15 @@ def run_official_validation_challenge_suite(
             "architecture_protocol_sha256": ARCHITECTURE_PROTOCOL_SHA256,
             "metric_definitions": dict(METRIC_DEFINITIONS),
             "metric_implementation_sha256": _metric_implementation_digest(),
+            "runtime_environment": {
+                "python_version": environment["python_version"],
+                "torch_version": environment["torch_version"],
+                "numpy_version": environment["numpy_version"],
+                "device": environment.get("device"),
+                "amp_enabled": environment.get("amp_enabled"),
+                "dependency_digest": dependency_digest,
+            },
+            "runtime_environment_receipt": environment,
             "challenge_evidence_policies": {
                 name: {
                     "target_family": policy.target_family,
@@ -827,6 +896,8 @@ __all__ = [
     "challenge_selection_digest",
     "evaluate_candidate_validation_challenge",
     "load_primary_validation_predictions",
+    "require_canonical_primary_population",
+    "require_challenge_runtime_environment",
     "read_official_validation_challenge_results",
     "require_evaluated_partition",
     "run_official_validation_challenge_suite",

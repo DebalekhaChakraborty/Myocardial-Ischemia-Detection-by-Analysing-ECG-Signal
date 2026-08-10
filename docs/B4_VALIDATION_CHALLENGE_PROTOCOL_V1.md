@@ -9,6 +9,12 @@ was generated**, so the procedure was corrected prospectively. The superseded
 draft (SHA-256 `5478c46fe5013d1d893f1f134d35af68ec3007105c542a2115718c0431858692`)
 produced no scientific evidence and must not be cited as a frozen protocol.
 
+A second revision (`4ab7e2e6adcf1e4d4e88a4ca5114515abc917aef6c1927ee52aaf79b16a81be1`)
+corrected the design but still carried stale prediction-only language in §5, §11
+and §13. It too was **superseded before use** and produced no scientific
+evidence. Every superseded SHA in this history was replaced before any real
+challenge evidence existed.
+
 ## 1. Purpose
 
 This document freezes the **execution procedure** for producing the missing
@@ -112,12 +118,24 @@ inference and the two digests must match, so inference cannot silently mutate a
 locked model. No backward pass, augmentation, calibration fitting or threshold
 search exists on this path.
 
-## 5. Partition
+## 5. Partition and its two subsets
 
-The evaluation partition is exactly the frozen **primary validation** partition
-recorded in each candidate lock (`validation_rows`).
+Everything here lives inside the frozen **development validation** split. Two
+disjoint subsets of that split are used for different purposes.
 
-The `train` partition is not evaluated. The `test` partition is prohibited.
+**Primary validation subset** — `ischemic_positive` + `background_negative`,
+473,897 windows over 12 subjects, recorded in each lock as `validation_rows`.
+This is the subset that produced checkpoint selection and threshold selection,
+and it is the source of the positive-context descriptives (§10).
+
+**Validation challenge subset** — the prospectively frozen
+`rate_related_confounder`, `axis_shift_confounder` and
+`conduction_change_confounder` rows (§4.1). These sit in the same validation
+split but outside the primary task subset, and are used only for secondary
+architecture-selection evidence.
+
+Both subsets are validation. Neither is test. The `train` partition is not
+evaluated and the `test` partition is prohibited (§6).
 
 ## 6. Test prohibition
 
@@ -145,7 +163,11 @@ Before any quantity is computed, the evaluator must verify:
 6. the prediction arrays are mutually length-aligned and non-empty;
 7. `stable_id` values are unique;
 8. every `score` and `label` is finite; labels are exactly `{0, 1}`;
-9. the prediction row count and subject count equal the lock's `validation_rows`.
+9. the prediction row count, positive count, negative count **and distinct
+   subject count** equal the lock's `validation_rows`;
+10. the primary population equals the frozen canonical identity — 473,897
+    windows, 21,628 positive, 452,269 negative, 12 subjects — so a
+    self-consistent but altered lock cannot redefine it.
 
 Any failure is refused. Nothing is repaired, coerced, filled or dropped.
 
@@ -233,7 +255,10 @@ The evaluator must not:
 - load `training_checkpoint.pt` or any optimizer state;
 - modify, rewrite or re-derive any locked candidate artifact;
 - regenerate or rewrite validation predictions;
-- read a waveform cache, WFDB source or LTSTDB signal file;
+- use or modify the primary B4 waveform cache for challenge evidence;
+- read any **test** waveform, cache or metadata;
+- read challenge waveforms through any path other than the already validated
+  raw physical-mV source path (§4.2);
 - access the sealed test (§5);
 - select an architecture, rank candidates, or emit a winner;
 - combine challenge strata into a single scalar score.
@@ -261,25 +286,58 @@ The official suite writes one directory:
     VALIDATION_CHALLENGE_RESULTS.json
 ```
 
-Per candidate, the results record at minimum: `experiment_id`, `architecture`,
-`official_model`, `experiment_lock_sha256`, `validation_prediction_sha256`,
-`locked_validation_threshold`, `threshold_source`, `split_sha256`,
-`feature_corpus_sha256`, `validation_window_count`, `validation_subject_count`,
-the three challenge strata of §11 with their evidence statuses, the
-positive-context descriptives of §9, `dataset_accessed`, `test_accessed`,
-`model_inference_performed`, and a canonical `challenge_result_sha256`.
+Per candidate the results record: `official_model`, `experiment_id`,
+`architecture`, `experiment_lock_sha256`, `checkpoint_sha256`,
+`locked_inference_model`, `locked_validation_threshold`, `threshold_source`,
+`threshold_selected_by_evaluator`, `partition`, `dataset`, `dataset_version`,
+`split_sha256`, `feature_corpus_sha256`, `training_selection_sha256`,
+`development_feature_integrity_sha256`, `development_source_integrity_sha256`,
+`provenance_binding`, `challenge_selection_sha256`, `challenge_population`,
+`challenge_window_total`, `challenges` (per family: `target_family`,
+`evidence_status`, `is_headline_metric`, `challenge_window_count`,
+`false_positive_count`, `false_positive_fraction`, `supporting_subject_count`,
+`bootstrap_permitted`, `frozen_metric`), `challenge_evidence_source`,
+`inference_receipt`, `positive_context` (with `evidence_source`,
+`validation_prediction_sha256` and `primary_window_count`),
+`metric_definitions`, `validation_challenge_protocol_sha256`,
+`b4_protocol_sha256` and a canonical `challenge_result_sha256`.
 
 The suite binds: this protocol's SHA-256, the B4 protocol SHA, the
-architecture-selection protocol SHA, the benchmark and metrics definitions relied
-upon, the frozen candidate order, all three experiment-lock SHAs, all three
-validation-prediction hashes, all three locked thresholds, all three candidate
-evidence digests, the metric definition and status labels, `dataset_accessed`,
-`test_accessed`, and a combined `validation_challenge_suite_sha256`.
+architecture-selection protocol SHA, `metric_implementation_sha256` (the actual
+metric source, not merely function names), the frozen challenge policy table,
+`challenge_selection_sha256`, `challenge_population`, the frozen candidate
+order, `git_sha` and `git_dirty`, the verified `runtime_environment` and its
+`dependency_digest`, all three experiment-lock SHAs, all three checkpoint SHAs,
+all three locked thresholds, all three candidate evidence digests, and a
+combined `validation_challenge_suite_sha256`.
 
-`test_accessed`, `training_performed` and `threshold_search_performed` must be
-`false`. `dataset_accessed` and `waveform_accessed` are `true` by design: the
-challenge rows are scored from validated waveforms. Recording that honestly is
-required — the suite must never claim to be prediction-only.
+Honest access flags are mandatory:
+
+| Flag | Required value |
+|---|---|
+| `dataset_accessed` | `true` |
+| `waveform_accessed` | `true` |
+| `model_inference_performed` | `true` |
+| `training_performed` | `false` |
+| `test_accessed` | `false` |
+| `threshold_search_performed` | `false` |
+| `architecture_selection_performed` | `false` |
+
+The suite must never claim to be prediction-only.
+
+## 13.1 Runtime environment gate
+
+Because challenge evidence performs real inference, the **current runtime** must
+equal the frozen scientific environment — Python 3.12.6, PyTorch 2.13.0+cpu,
+NumPy 2.3.2, scikit-learn 1.9.0, SciPy 1.18.0, WFDB 4.3.1, dependency digest
+`b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a`, AMP off.
+
+The already-reviewed `require_exact_scientific_environment` gate is reused; no
+second comparison is defined. **The gate runs before the one-shot attempt is
+claimed**, so a wrong environment can never consume the official attempt.
+
+This runtime environment is distinct from the historical environment recorded in
+a candidate lock. Both are retained; the runtime one is verified.
 
 ## 14. One-suite execution semantics
 

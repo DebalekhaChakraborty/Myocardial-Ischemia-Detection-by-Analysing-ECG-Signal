@@ -86,6 +86,15 @@ def _stub_reader_factory(fill: float):
     return type("_FilledStubReader", (_StubReader,), {"fill": fill})
 
 
+def _real_env_gate():
+    """The unpatched runtime gate, for tests that must exercise it for real."""
+    from cardiosentinel.neural.determinism import initialize_determinism
+
+    determinism = initialize_determinism(requested_device="cpu")
+    environment = challenge.runtime_environment(determinism.device, 0)
+    return environment, challenge.require_exact_scientific_environment(environment)
+
+
 def _reference(index: int, family: str, subject: str) -> B4WindowReference:
     start = index * WINDOW_SAMPLES
     end = start + WINDOW_SAMPLES
@@ -211,6 +220,23 @@ def scored(monkeypatch, challenge_index):
 
 @pytest.fixture
 def evaluated(monkeypatch, official_runs, challenge_index, scored, tmp_path):
+    monkeypatch.setattr(
+        challenge,
+        "PRIMARY_VALIDATION_COUNTS",
+        {
+            "total": len(PRIMARY_ROWS),
+            "positive": sum(r[2] for r in PRIMARY_ROWS),
+            "negative": sum(1 - r[2] for r in PRIMARY_ROWS),
+            "subjects": len({r[1] for r in PRIMARY_ROWS}),
+        },
+    )
+    monkeypatch.setattr(
+        challenge,
+        "require_challenge_runtime_environment",
+        lambda: ({"python_version": "3.12.6", "torch_version": "2.13.0+cpu",
+                  "numpy_version": "2.3.2", "device": "cpu",
+                  "amp_enabled": False}, "digest-abc"),
+    )
     monkeypatch.setattr(
         challenge, "validate_development_feature_integrity", lambda root: {}
     )
@@ -390,6 +416,16 @@ def test_positive_context_comes_from_primary_predictions(
 def test_threshold_comes_from_the_lock_only(
     monkeypatch, tmp_path, challenge_index, scored
 ) -> None:
+    monkeypatch.setattr(
+        challenge,
+        "PRIMARY_VALIDATION_COUNTS",
+        {
+            "total": len(PRIMARY_ROWS),
+            "positive": sum(r[2] for r in PRIMARY_ROWS),
+            "negative": sum(1 - r[2] for r in PRIMARY_ROWS),
+            "subjects": len({r[1] for r in PRIMARY_ROWS}),
+        },
+    )
     monkeypatch.setattr(
         challenge, "validate_development_feature_integrity", lambda root: {}
     )
@@ -767,3 +803,128 @@ def test_suite_exposes_no_evaluator_or_retry_injection() -> None:
     }
     for forbidden in ("runner", "backend", "evaluator", "metric", "retry", "force"):
         assert forbidden not in parameters
+
+
+# --------------------------------------------------------------------------
+# Final correction: runtime gate, population invariants, claim durability
+# --------------------------------------------------------------------------
+
+
+def test_frozen_primary_population_is_canonical() -> None:
+    assert challenge.PRIMARY_VALIDATION_COUNTS == {
+        "total": 473897,
+        "positive": 21628,
+        "negative": 452269,
+        "subjects": 12,
+    }
+
+
+def test_wrong_primary_population_is_refused() -> None:
+    columns = {
+        "label": np.asarray([1, 0, 0], dtype=np.int64),
+        "subject_id": np.asarray(["s1", "s1", "s2"], dtype=np.str_),
+    }
+    with pytest.raises(challenge.ValidationChallengeError, match="canonical"):
+        challenge.require_canonical_primary_population(columns)
+
+
+def test_wrong_subject_count_against_the_lock_is_refused(tmp_path) -> None:
+    directory = _locked_candidate(
+        tmp_path / "B4-A",
+        "B4-A",
+        validation_rows={
+            "partition": "validation",
+            "total": len(PRIMARY_ROWS),
+            "subjects": 99,
+        },
+    )
+    lock = json.loads((directory / "EXPERIMENT_LOCK.json").read_text())
+    with pytest.raises(
+        challenge.ValidationChallengeError, match="subjects is 2 but the lock"
+    ):
+        challenge.load_primary_validation_predictions(directory, lock)
+
+
+def test_exact_runtime_environment_passes() -> None:
+    environment, digest = challenge.require_challenge_runtime_environment()
+    assert environment["python_version"] == "3.12.6"
+    assert environment["torch_version"] == "2.13.0+cpu"
+    assert environment["numpy_version"] == "2.3.2"
+    assert environment["amp_enabled"] is False
+    assert digest == (
+        "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
+    )
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("python_version", "3.11.9"),
+        ("torch_version", "2.12.0+cpu"),
+        ("numpy_version", "2.0.0"),
+    ],
+)
+def test_wrong_runtime_environment_fails_before_the_claim(
+    monkeypatch, evaluated, tmp_path, key, value
+) -> None:
+    real = challenge.runtime_environment
+
+    def broken(device, workers):
+        environment = real(device, workers)
+        environment[key] = value
+        return environment
+
+    monkeypatch.setattr(challenge, "runtime_environment", broken)
+    monkeypatch.undo_key = None
+    monkeypatch.setattr(
+        challenge,
+        "require_challenge_runtime_environment",
+        challenge.require_challenge_runtime_environment.__wrapped__
+        if hasattr(challenge.require_challenge_runtime_environment, "__wrapped__")
+        else _real_env_gate,
+    )
+    root = tmp_path / "runs"
+    with pytest.raises(ValueError):
+        challenge.run_official_validation_challenge_suite(
+            evaluated, root, Path("unused"), Path("unused")
+        )
+    # The attempt must NOT have been consumed by a bad environment.
+    assert not (root / challenge.SUITE_DIR_NAME / challenge.SUITE_ATTEMPT_NAME).exists()
+
+
+def test_wrong_dependency_digest_fails_before_the_claim(
+    monkeypatch, evaluated, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        challenge,
+        "require_exact_scientific_environment",
+        lambda environment: (_ for _ in ()).throw(ValueError("digest mismatch")),
+    )
+    monkeypatch.setattr(
+        challenge, "require_challenge_runtime_environment", _real_env_gate
+    )
+    root = tmp_path / "runs"
+    with pytest.raises(ValueError, match="digest mismatch"):
+        challenge.run_official_validation_challenge_suite(
+            evaluated, root, Path("unused"), Path("unused")
+        )
+    assert not (root / challenge.SUITE_DIR_NAME / challenge.SUITE_ATTEMPT_NAME).exists()
+
+
+def test_suite_binds_the_verified_runtime_environment(suite_runner) -> None:
+    suite = suite_runner()
+    runtime = suite["runtime_environment"]
+    assert runtime["python_version"] == "3.12.6"
+    assert runtime["torch_version"] == "2.13.0+cpu"
+    assert runtime["numpy_version"] == "2.3.2"
+    assert runtime["dependency_digest"] == "digest-abc"
+    assert suite["runtime_environment_receipt"]
+
+
+def test_initial_claim_fsyncs_the_parent_directory() -> None:
+    source = inspect.getsource(challenge._claim_suite_attempt)
+    assert "os.O_CREAT | os.O_EXCL" in source
+    assert "os.fsync(handle.fileno())" in source
+    assert "os.O_DIRECTORY" in source
+    assert "os.fsync(directory)" in source
+    assert "unlink(" not in source
