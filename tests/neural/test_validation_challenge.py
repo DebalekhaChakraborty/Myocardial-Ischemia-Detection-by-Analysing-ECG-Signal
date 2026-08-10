@@ -86,13 +86,36 @@ def _stub_reader_factory(fill: float):
     return type("_FilledStubReader", (_StubReader,), {"fill": fill})
 
 
-def _real_env_gate():
-    """The unpatched runtime gate, for tests that must exercise it for real."""
-    from cardiosentinel.neural.determinism import initialize_determinism
+# Captured before any fixture can stub it, so the negative gate tests exercise
+# the real reviewed validator rather than a fixture's stand-in.
+_REAL_RUNTIME_GATE = challenge.require_challenge_runtime_environment
 
-    determinism = initialize_determinism(requested_device="cpu")
-    environment = challenge.runtime_environment(determinism.device, 0)
-    return environment, challenge.require_exact_scientific_environment(environment)
+
+def _exact_scientific_environment(**overrides):
+    """The frozen scientific environment receipt, built synthetically.
+
+    CI runs Python 3.11.15 while the scientific runtime is pinned to 3.12.6, so
+    these tests must never read the host they execute on. Only the receipt is
+    synthetic — the REAL reviewed gate still evaluates it.
+    """
+    payload = {
+        "python_version": "3.12.6",
+        "torch_version": "2.13.0+cpu",
+        "numpy_version": "2.3.2",
+        "amp_enabled": False,
+        "dependencies": {
+            "installed_packages_sha256": B4A_DEPENDENCY_DIGEST,
+            "key_dependencies": {
+                "numpy": "2.3.2",
+                "scikit-learn": "1.9.0",
+                "scipy": "1.18.0",
+                "torch": "2.13.0+cpu",
+                "wfdb": "4.3.1",
+            },
+        },
+    }
+    payload.update(overrides)
+    return payload
 
 
 def _reference(index: int, family: str, subject: str) -> B4WindowReference:
@@ -845,7 +868,12 @@ def test_wrong_subject_count_against_the_lock_is_refused(tmp_path) -> None:
         challenge.load_primary_validation_predictions(directory, lock)
 
 
-def test_exact_runtime_environment_passes() -> None:
+def test_exact_runtime_environment_passes(monkeypatch) -> None:
+    monkeypatch.setattr(
+        challenge,
+        "runtime_environment",
+        lambda device, workers: _exact_scientific_environment(),
+    )
     environment, digest = challenge.require_challenge_runtime_environment()
     assert environment["python_version"] == "3.12.6"
     assert environment["torch_version"] == "2.13.0+cpu"
@@ -859,7 +887,7 @@ def test_exact_runtime_environment_passes() -> None:
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("python_version", "3.11.9"),
+        ("python_version", "3.11.15"),
         ("torch_version", "2.12.0+cpu"),
         ("numpy_version", "2.0.0"),
     ],
@@ -867,44 +895,36 @@ def test_exact_runtime_environment_passes() -> None:
 def test_wrong_runtime_environment_fails_before_the_claim(
     monkeypatch, evaluated, tmp_path, key, value
 ) -> None:
-    real = challenge.runtime_environment
-
-    def broken(device, workers):
-        environment = real(device, workers)
-        environment[key] = value
-        return environment
-
-    monkeypatch.setattr(challenge, "runtime_environment", broken)
-    monkeypatch.undo_key = None
     monkeypatch.setattr(
         challenge,
-        "require_challenge_runtime_environment",
-        challenge.require_challenge_runtime_environment.__wrapped__
-        if hasattr(challenge.require_challenge_runtime_environment, "__wrapped__")
-        else _real_env_gate,
+        "runtime_environment",
+        lambda device, workers: _exact_scientific_environment(**{key: value}),
+    )
+    monkeypatch.setattr(
+        challenge, "require_challenge_runtime_environment", _REAL_RUNTIME_GATE
     )
     root = tmp_path / "runs"
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=key.replace("_version", "")):
         challenge.run_official_validation_challenge_suite(
             evaluated, root, Path("unused"), Path("unused")
         )
-    # The attempt must NOT have been consumed by a bad environment.
+    # A wrong environment must never consume the one-shot attempt.
     assert not (root / challenge.SUITE_DIR_NAME / challenge.SUITE_ATTEMPT_NAME).exists()
 
 
 def test_wrong_dependency_digest_fails_before_the_claim(
     monkeypatch, evaluated, tmp_path
 ) -> None:
+    corrupted = _exact_scientific_environment()
+    corrupted["dependencies"]["installed_packages_sha256"] = "0" * 64
     monkeypatch.setattr(
-        challenge,
-        "require_exact_scientific_environment",
-        lambda environment: (_ for _ in ()).throw(ValueError("digest mismatch")),
+        challenge, "runtime_environment", lambda device, workers: corrupted
     )
     monkeypatch.setattr(
-        challenge, "require_challenge_runtime_environment", _real_env_gate
+        challenge, "require_challenge_runtime_environment", _REAL_RUNTIME_GATE
     )
     root = tmp_path / "runs"
-    with pytest.raises(ValueError, match="digest mismatch"):
+    with pytest.raises(ValueError, match="dependency"):
         challenge.run_official_validation_challenge_suite(
             evaluated, root, Path("unused"), Path("unused")
         )
