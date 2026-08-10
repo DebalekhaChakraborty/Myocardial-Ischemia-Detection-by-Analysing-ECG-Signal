@@ -15,7 +15,13 @@ while stamping the frozen checkpoint SHA, partial caches were not blocked,
 physiology was passed as bare arrays with no stable-ID binding, the challenge set
 was accepted unverified, and checkpoint selection was conflated with the
 early-stopping delta. It too was **superseded before use** and produced **no
-scientific evidence**. This revision states the corrected path.
+scientific evidence**. A third revision (`64a7d9bd4b6bc6a2d67a721ff08e01c69df9133150e1af7952cdbd0035039d6e`)
+still had three execution blockers: the primary embedding caches had no canonical
+creation route, challenge embeddings were wrongly looked up in the **primary**
+validation cache (which contains no confounder rows at all), and the threshold
+search re-derived full metrics per candidate. It too was **superseded before
+use** and produced **no scientific evidence**. This revision states the corrected
+path.
 
 ## 1. Scientific question
 
@@ -400,6 +406,42 @@ These are **separate**, following the reviewed `CheckpointTracker`:
 
 An improvement of, say, 5e-7 therefore becomes the selected maximum checkpoint
 **without** resetting patience. The earliest epoch wins an exact tie.
+
+### 14.4c Canonical embedding-cache preparation
+
+`run-stage1` prepares the primary caches deterministically **before either arm is
+claimed**: it validates development feature and source integrity, rebuilds the
+frozen primary train/validation indexes through the reviewed
+`build_development_indexes`, reads waveforms through the already-reviewed
+validated B4 waveform cache, loads the locked B4-B encoder, materializes the
+128-d embeddings and fully validates both caches. Valid existing caches are
+loaded and verified, never regenerated. A partial cache stops for human review.
+No manual assembly of waveform batches, stable IDs, labels or subjects is
+required.
+
+### 14.4d Challenge embeddings are a SEPARATE path
+
+The primary validation cache holds only `ischemic_positive` (21,628) and
+`background_negative` (452,269). The frozen challenge rows — rate 4,973, axis
+3,000, conduction 164, total 8,137 — are **not in it**, so challenge embeddings
+must never be looked up there.
+
+They are produced by a dedicated validation-only path mirroring the reviewed B4
+challenge evaluator: rebuild and verify the frozen challenge index → validated
+raw physical-mV validation waveform reads → locked `model_selected.pt` under
+`eval()` + `requires_grad_(False)` + `torch.no_grad()` with a state digest
+before and after → 8,137 float32 embeddings. They are generated **once** and
+reused unchanged by P1-A and P1-B; P1-B additionally joins frozen morphology_v1
+by those exact challenge stable IDs and applies the TRAIN-fitted transform. The
+ordered-ID digest, embedding content digest and encoder receipt are bound into
+the Stage-1 provenance. No training, no threshold search, no test.
+
+### 14.4e Threshold implementation
+
+Threshold selection delegates to the repository's reviewed exact
+`select_validation_f1_threshold` (O(N log N) cumulative sweep). No second
+P1-specific implementation exists. Semantics are unchanged: validation only,
+maximum F1 over exact observed scores, highest threshold winning an exact tie.
 
 ### 14.5 Stage-1 suite
 

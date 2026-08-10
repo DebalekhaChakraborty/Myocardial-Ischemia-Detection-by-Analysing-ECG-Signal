@@ -35,12 +35,18 @@ from cardiosentinel.baseline.metrics import (
     subject_macro_metrics,
 )
 from cardiosentinel.data.provenance import git_provenance, sha256_file
+from cardiosentinel.evaluation.metrics import select_validation_f1_threshold
 from cardiosentinel.evaluation.protocol import challenge_evidence_policy
 from cardiosentinel.neural.candidate_experiment import (
     require_exact_scientific_environment,
 )
+from cardiosentinel.neural.data import B4WaveformDataset
 from cardiosentinel.neural.determinism import initialize_determinism
-from cardiosentinel.neural.integrity import canonical_sha256
+from cardiosentinel.neural.integrity import (
+    canonical_sha256,
+    validate_development_feature_integrity,
+    validate_development_source_integrity,
+)
 from cardiosentinel.neural.physiology_fusion import (
     B4B_CHECKPOINT_SHA256,
     B4B_EXPERIMENT_LOCK_SHA256,
@@ -89,6 +95,11 @@ from cardiosentinel.neural.validation_challenge import (
     CHALLENGE_EXPECTED_COUNTS,
     CHALLENGE_TOTAL_WINDOWS,
     build_validation_challenge_index,
+)
+from cardiosentinel.neural.waveform_cache import (
+    B4CachedWaveformDataset,
+    build_development_indexes,
+    validate_waveform_cache,
 )
 
 CACHE_MANIFEST_NAME: Final = "P1_EMBEDDING_CACHE_MANIFEST.json"
@@ -730,22 +741,22 @@ def train_p1_arm(
 
 
 def select_p1_threshold(labels: np.ndarray, scores: np.ndarray) -> float:
-    """Maximum-F1 threshold over exact observed validation scores.
+    """Maximum-F1 validation threshold via the reviewed exact sweep.
 
-    The highest threshold wins an exact tie, matching the frozen B4 rule.
+    This delegates to `select_validation_f1_threshold`, the repository's exact
+    O(N log N) cumulative implementation. A second P1-specific implementation is
+    deliberately not maintained: the previous per-candidate loop recomputed full
+    metrics (including AUPRC/AUROC) for every unique score, which is
+    quadratic-ish and unacceptable at 473,897 validation rows.
+
+    Semantics are unchanged: validation only, maximum F1 over exact observed
+    scores, highest threshold winning an exact tie.
     """
-    best_f1 = -np.inf
-    best_threshold = 0.0
-    for candidate in np.unique(scores):
-        metrics = binary_metrics(labels, scores, float(candidate))
-        f1 = metrics.get("f1")
-        if f1 is None or not np.isfinite(f1):
-            continue
-        if f1 > best_f1 or (f1 == best_f1 and float(candidate) > best_threshold):
-            best_f1, best_threshold = float(f1), float(candidate)
-    if not np.isfinite(best_f1):
-        raise P1ExecutionError("No finite validation F1 was observed.")
-    return best_threshold
+    return select_validation_f1_threshold(
+        np.asarray(labels, dtype=np.int64).tolist(),
+        np.asarray(scores, dtype=np.float64).tolist(),
+        partition="validation",
+    )
 
 
 def p1_validation_evidence(
@@ -1242,12 +1253,115 @@ def run_p1_stage1_suite(
     return suite
 
 
+def prepare_p1_challenge_embeddings(
+    b4b_run_dir: Path,
+    feature_root: Path,
+    source: Path,
+    *,
+    batch_size: int = P1_BATCH_SIZE,
+) -> dict[str, Any]:
+    """Score the frozen validation challenge rows with the locked B4-B encoder.
+
+    The challenge rows are a SEPARATE validation population from the primary
+    cache: the primary cache holds only `ischemic_positive` +
+    `background_negative`, so challenge embeddings can never be looked up there.
+    They are produced here through the same validated raw physical-mV path the
+    reviewed B4 challenge evaluator uses.
+    """
+    require_p1_partition("validation")
+    index = build_validation_challenge_index(Path(feature_root))
+    if index.selection_sha256 != CHALLENGE_SELECTION_SHA256:
+        raise P1ExecutionError(
+            "Rebuilt challenge selection digest differs from the frozen identity."
+        )
+    encoder = load_official_b4b_encoder(Path(b4b_run_dir))
+    reader = B4WaveformDataset(index.references, Path(source))
+    chunks: list[np.ndarray] = []
+    receipt: dict[str, Any] = {}
+    for start in range(0, len(index.references), batch_size):
+        batch = torch.stack(
+            [
+                reader.read_waveform(reference)
+                for reference in index.references[start : start + batch_size]
+            ]
+        )
+        embeddings, receipt = extract_frozen_embeddings(encoder, batch)
+        chunks.append(embeddings.to(torch.float32).numpy())
+    matrix = np.concatenate(chunks, axis=0).astype(np.float32)
+    stable_ids = tuple(item.stable_id for item in index.references)
+    return {
+        "index": index,
+        "stable_ids": stable_ids,
+        "embeddings": matrix,
+        "encoder_receipt": receipt,
+        "ordered_stable_id_sha256": ordered_stable_id_digest(stable_ids),
+        "embedding_content_sha256": embedding_content_digest(matrix),
+        "waveform_reads": reader.stats.source_reads,
+    }
+
+
+def prepare_p1_embedding_caches(
+    *,
+    cache_root: Path,
+    feature_root: Path,
+    source: Path,
+    b4b_run_dir: Path,
+    waveform_cache_root: Path,
+) -> dict[str, P1EmbeddingCache]:
+    """Load, or canonically materialize, both primary embedding caches.
+
+    Valid existing caches are loaded and verified, never regenerated. A partial
+    cache directory stops for human review. Nothing here requires the caller to
+    assemble waveform batches, stable IDs, labels or subjects by hand.
+    """
+    caches: dict[str, P1EmbeddingCache] = {}
+    indexes = build_development_indexes(Path(feature_root))
+    validated = validate_waveform_cache(Path(waveform_cache_root), indexes)
+    for partition in ("train", "validation"):
+        directory = Path(cache_root) / partition
+        if (directory / CACHE_MANIFEST_NAME).is_file():
+            caches[partition] = load_p1_embedding_cache(Path(cache_root), partition)
+            continue
+        if directory.exists():
+            raise P1ExecutionError(
+                f"A partial P1 embedding cache exists at {directory}; human "
+                "review is required before Stage P1-1 may proceed."
+            )
+        index = indexes[partition]
+        dataset = B4CachedWaveformDataset(validated, index)
+        references = index.references
+
+        def batches(dataset=dataset, total=len(references)):
+            for start in range(0, total, P1_BATCH_SIZE):
+                yield torch.stack(
+                    [
+                        dataset[row].waveform
+                        for row in range(start, min(start + P1_BATCH_SIZE, total))
+                    ]
+                )
+
+        caches[partition] = materialize_p1_embedding_cache(
+            Path(b4b_run_dir),
+            batches(),
+            partition=partition,
+            stable_ids=[item.stable_id for item in references],
+            labels=np.asarray(
+                [int(item.binary_label) for item in references], dtype=np.int64
+            ),
+            subject_ids=[item.subject_id for item in references],
+            cache_root=Path(cache_root),
+        )
+    return caches
+
+
 def execute_p1_stage1(
     *,
     run_root: Path,
     cache_root: Path,
     feature_root: Path,
+    source: Path,
     b4b_run_dir: Path,
+    waveform_cache_root: Path,
     command: str = "cardiosentinel p1 run-stage1",
 ) -> dict[str, Any]:
     """Assemble every canonical input and run Stage P1-1.
@@ -1261,9 +1375,19 @@ def execute_p1_stage1(
     require_p1_runtime()
     require_clean_checkout()
     load_official_b4b_encoder(Path(b4b_run_dir))
+    feature_receipt = validate_development_feature_integrity(Path(feature_root))
+    source_receipt = validate_development_source_integrity(
+        Path(source), feature_receipt
+    )
 
-    train_cache = load_p1_embedding_cache(Path(cache_root), "train")
-    validation_cache = load_p1_embedding_cache(Path(cache_root), "validation")
+    caches = prepare_p1_embedding_caches(
+        cache_root=Path(cache_root),
+        feature_root=Path(feature_root),
+        source=Path(source),
+        b4b_run_dir=Path(b4b_run_dir),
+        waveform_cache_root=Path(waveform_cache_root),
+    )
+    train_cache, validation_cache = caches["train"], caches["validation"]
     raw_train = read_frozen_physiology(Path(feature_root), "train")
     raw_validation = read_frozen_physiology(Path(feature_root), "validation")
 
@@ -1284,15 +1408,20 @@ def execute_p1_stage1(
         raw_by_stable_id=raw_validation,
         transform=transform,
     )
+    # Challenge embeddings come from the DEDICATED validation-challenge path,
+    # never from the primary validation cache: the two populations are disjoint.
+    challenge_embeddings = prepare_p1_challenge_embeddings(
+        Path(b4b_run_dir), Path(feature_root), Path(source)
+    )
     challenge = prepare_p1_challenge_set(
         Path(feature_root),
         embeddings_by_stable_id=dict(
-            zip(validation_cache.stable_ids, validation_cache.embeddings)
+            zip(challenge_embeddings["stable_ids"], challenge_embeddings["embeddings"])
         ),
         raw_physiology_by_stable_id=raw_validation,
         transform=transform,
     )
-    return run_p1_stage1_suite(
+    suite = run_p1_stage1_suite(
         run_root=Path(run_root),
         train_cache=train_cache,
         validation_cache=validation_cache,
@@ -1302,6 +1431,20 @@ def execute_p1_stage1(
         challenge=challenge,
         command=command,
     )
+    suite["challenge_embedding_provenance"] = {
+        "ordered_stable_id_sha256": challenge_embeddings["ordered_stable_id_sha256"],
+        "embedding_content_sha256": challenge_embeddings["embedding_content_sha256"],
+        "encoder_receipt": challenge_embeddings["encoder_receipt"],
+        "waveform_reads": challenge_embeddings["waveform_reads"],
+        "source": "dedicated_validation_challenge_locked_encoder_path",
+    }
+    suite["development_feature_integrity_sha256"] = feature_receipt[
+        "development_feature_integrity_sha256"
+    ]
+    suite["development_source_integrity_sha256"] = source_receipt[
+        "development_source_integrity_sha256"
+    ]
+    return suite
 
 
 def read_frozen_physiology(
@@ -1330,6 +1473,7 @@ def p1_preflight(
     *,
     b4b_run_dir: Path | None = None,
     feature_root: Path | None = None,
+    source: Path | None = None,
 ) -> dict[str, Any]:
     """Read-only Stage P1-1 readiness gate. Creates nothing.
 
@@ -1393,6 +1537,28 @@ def p1_preflight(
                 "error": f"{type(error).__name__}: {error}",
             }
 
+    integrity: dict[str, Any] = {"validated": False}
+    if feature_root is not None and source is not None:
+        try:
+            feature_receipt = validate_development_feature_integrity(Path(feature_root))
+            source_receipt = validate_development_source_integrity(
+                Path(source), feature_receipt
+            )
+            integrity = {
+                "validated": True,
+                "development_feature_integrity_sha256": feature_receipt[
+                    "development_feature_integrity_sha256"
+                ],
+                "development_source_integrity_sha256": source_receipt[
+                    "development_source_integrity_sha256"
+                ],
+            }
+        except Exception as error:
+            integrity = {
+                "validated": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+
     test_artifacts = sorted(
         path.name
         for path in Path(REPOSITORY_ROOT).glob("cardiosentinel-runs/**/TEST_*")
@@ -1411,12 +1577,15 @@ def p1_preflight(
         status = "selected_encoder_not_verified"
     elif feature_root is not None and not challenge_ready:
         status = "challenge_population_not_verified"
+    elif source is not None and not integrity.get("validated"):
+        status = "development_integrity_not_verified"
     else:
         status = "ready_for_canonical_p1_stage1"
 
     report = {
         "selected_encoder": encoder_state,
         "challenge_population": challenge_state,
+        "development_integrity": integrity,
         "test_artifacts_present": test_artifacts,
         "embedding_caches_ready": caches_ready,
         "command": "cardiosentinel p1 preflight",
@@ -1451,7 +1620,9 @@ __all__ = [
     "build_physiology_bundle",
     "load_official_b4b_encoder",
     "execute_p1_stage1",
+    "prepare_p1_challenge_embeddings",
     "prepare_p1_challenge_set",
+    "prepare_p1_embedding_caches",
     "read_frozen_physiology",
     "require_aligned_physiology",
     "CHALLENGE_SELECTION_SHA256",

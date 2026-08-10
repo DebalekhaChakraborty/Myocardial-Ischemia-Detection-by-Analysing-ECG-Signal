@@ -803,7 +803,9 @@ def test_official_stage1_orchestration_exists_without_manual_assembly() -> None:
         "run_root",
         "cache_root",
         "feature_root",
+        "source",
         "b4b_run_dir",
+        "waveform_cache_root",
         "command",
     }
     for forbidden in ("arm", "only", "force", "retry", "overwrite"):
@@ -850,3 +852,227 @@ def test_cache_load_refuses_altered_subject_assignment(tmp_path, monkeypatch) ->
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(p1x.P1ExecutionError, match="subject assignment"):
         p1x.load_p1_embedding_cache(tmp_path / "cache", "train")
+
+
+# --------------------------------------------------------------------------
+# Population separation: primary cache vs validation challenge rows
+# --------------------------------------------------------------------------
+
+PRIMARY_IDS = tuple(f"v_primary_{i}" for i in range(ROWS_VALIDATION))
+CHALLENGE_IDS = tuple(f"v_challenge_{i}" for i in range(24))
+CHALLENGE_FAMILIES = (
+    ("rate_related_confounder",) * 12
+    + ("axis_shift_confounder",) * 8
+    + ("conduction_change_confounder",) * 4
+)
+
+
+class _FakeReference:
+    def __init__(self, stable_id, family, subject):
+        self.stable_id = stable_id
+        self.target_family = family
+        self.subject_id = subject
+
+
+class _FakeChallengeIndex:
+    def __init__(self):
+        self.references = tuple(
+            _FakeReference(i, f, f"s{n % 3}")
+            for n, (i, f) in enumerate(zip(CHALLENGE_IDS, CHALLENGE_FAMILIES))
+        )
+        self.selection_sha256 = p1x.CHALLENGE_SELECTION_SHA256
+        self.counts = {
+            "rate_related_confounder": {"windows": 12, "subjects": 3},
+            "axis_shift_confounder": {"windows": 8, "subjects": 3},
+            "conduction_change_confounder": {"windows": 4, "subjects": 3},
+        }
+
+
+@pytest.fixture
+def disjoint(monkeypatch, caches):
+    """Primary and challenge stable IDs are strictly disjoint, as in reality."""
+    train, validation = caches
+    primary = p1x.P1EmbeddingCache(
+        partition="validation",
+        stable_ids=PRIMARY_IDS,
+        embeddings=validation.embeddings,
+        labels=validation.labels,
+        subject_ids=validation.subject_ids,
+        manifest=validation.manifest,
+    )
+    assert not set(PRIMARY_IDS) & set(CHALLENGE_IDS)
+    index = _FakeChallengeIndex()
+    monkeypatch.setattr(p1x, "build_validation_challenge_index", lambda root: index)
+    monkeypatch.setattr(
+        p1x, "CHALLENGE_EXPECTED_COUNTS", index.counts
+    )
+    monkeypatch.setattr(p1x, "CHALLENGE_TOTAL_WINDOWS", len(CHALLENGE_IDS))
+    return train, primary, index
+
+
+def test_primary_cache_contains_no_challenge_rows(disjoint) -> None:
+    _, primary, index = disjoint
+    challenge_ids = {item.stable_id for item in index.references}
+    assert not challenge_ids & set(primary.stable_ids)
+    # The previous head looked challenge rows up in the primary cache; on the
+    # real disjoint populations that lookup cannot succeed.
+    lookup = dict(zip(primary.stable_ids, primary.embeddings))
+    assert all(key not in lookup for key in challenge_ids)
+
+
+def test_challenge_set_uses_dedicated_embeddings(disjoint, physiology) -> None:
+    _, _, index = disjoint
+    transform, _, _ = physiology
+    challenge_ids = [item.stable_id for item in index.references]
+    dedicated = {
+        key: np.full(p1.EMBEDDING_DIM, 0.25, dtype=np.float32) for key in challenge_ids
+    }
+    raw = _raw_physiology(challenge_ids, 21)
+    prepared = p1x.prepare_p1_challenge_set(
+        Path("unused"),
+        embeddings_by_stable_id=dedicated,
+        raw_physiology_by_stable_id=raw,
+        transform=transform,
+    )
+    assert prepared.stable_ids == tuple(challenge_ids)
+    assert prepared.embeddings.shape == (len(challenge_ids), p1.EMBEDDING_DIM)
+    assert prepared.selection_sha256 == p1x.CHALLENGE_SELECTION_SHA256
+    assert prepared.physiology.stable_ids == tuple(challenge_ids)
+
+
+def test_challenge_set_refuses_primary_cache_as_lookup(disjoint, physiology) -> None:
+    """The exact previous defect must now fail loudly."""
+    _, primary, _ = disjoint
+    transform, _, _ = physiology
+    with pytest.raises(p1x.P1ExecutionError, match="no frozen B4-B embedding"):
+        p1x.prepare_p1_challenge_set(
+            Path("unused"),
+            embeddings_by_stable_id=dict(
+                zip(primary.stable_ids, primary.embeddings)
+            ),
+            raw_physiology_by_stable_id=_raw_physiology(primary.stable_ids, 5),
+            transform=transform,
+        )
+
+
+def test_both_arms_receive_the_same_challenge_embeddings(
+    tmp_path, disjoint, physiology
+) -> None:
+    train, primary, index = disjoint
+    transform, train_bundle, _ = physiology
+    challenge_ids = [item.stable_id for item in index.references]
+    dedicated = {
+        key: np.full(p1.EMBEDDING_DIM, 0.25, dtype=np.float32) for key in challenge_ids
+    }
+    challenge = p1x.prepare_p1_challenge_set(
+        Path("unused"),
+        embeddings_by_stable_id=dedicated,
+        raw_physiology_by_stable_id=_raw_physiology(challenge_ids, 21),
+        transform=transform,
+    )
+    validation_bundle = p1x.build_physiology_bundle(
+        partition="validation",
+        stable_ids=primary.stable_ids,
+        raw_by_stable_id=_raw_physiology(primary.stable_ids, 13),
+        transform=transform,
+    )
+    suite = p1x.run_p1_stage1_suite(
+        run_root=tmp_path / "runs",
+        train_cache=train,
+        validation_cache=primary,
+        transform=transform,
+        train_physiology=train_bundle,
+        validation_physiology=validation_bundle,
+        challenge=challenge,
+    )
+    assert set(suite["arm_results"]) == set(p1x.P1_ARM_ORDER)
+    for arm in p1x.P1_ARM_ORDER:
+        metrics = json.loads(
+            (tmp_path / "runs" / arm / p1x.CHALLENGE_METRICS_NAME).read_text()
+        )
+        assert metrics["rate_related"]["challenge_window_count"] == 12
+        assert metrics["axis_shift"]["challenge_window_count"] == 8
+        assert metrics["conduction_change"]["challenge_window_count"] == 4
+        assert (
+            metrics["conduction_change"]["evidence_status"] == "exploratory_descriptive"
+        )
+    # No challenge row entered training or primary threshold selection.
+    predictions = np.load(
+        tmp_path / "runs" / p1.P1A_EXPERIMENT_ID / p1x.VALIDATION_PREDICTIONS_NAME,
+        allow_pickle=False,
+    )
+    assert not set(predictions["stable_id"].tolist()) & set(challenge_ids)
+
+
+# --------------------------------------------------------------------------
+# Threshold: reviewed implementation and brute-force equivalence
+# --------------------------------------------------------------------------
+
+
+def _brute_force_threshold(labels, scores):
+    from cardiosentinel.baseline.metrics import binary_metrics
+
+    best_f1, best_threshold = -1.0, 0.0
+    for candidate in sorted(set(float(s) for s in scores)):
+        f1 = binary_metrics(np.asarray(labels), np.asarray(scores), candidate)["f1"]
+        if f1 is None:
+            continue
+        if f1 > best_f1 or (f1 == best_f1 and candidate > best_threshold):
+            best_f1, best_threshold = float(f1), candidate
+    return best_threshold
+
+
+def test_threshold_reuses_the_reviewed_implementation() -> None:
+    source = inspect.getsource(p1x.select_p1_threshold)
+    assert "select_validation_f1_threshold" in source
+    assert "for candidate in" not in source
+
+
+@pytest.mark.parametrize(
+    "labels,scores",
+    [
+        ([1, 0, 1, 0], [0.9, 0.8, 0.7, 0.1]),
+        ([1, 1, 0, 0], [0.5, 0.5, 0.5, 0.5]),          # all tied scores
+        ([1, 0, 1, 0, 1], [0.6, 0.6, 0.4, 0.4, 0.9]),  # tied scores and F1
+        ([1, 0, 0, 0], [0.2, 0.1, 0.1, 0.05]),
+    ],
+)
+def test_threshold_matches_brute_force(labels, scores) -> None:
+    labels = np.asarray(labels, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    assert p1x.select_p1_threshold(labels, scores) == _brute_force_threshold(
+        labels, scores
+    )
+
+
+def test_orchestration_consumes_source_and_waveform_cache() -> None:
+    parameters = inspect.signature(p1x.execute_p1_stage1).parameters
+    assert {"source", "waveform_cache_root", "feature_root", "b4b_run_dir"} <= set(
+        parameters
+    )
+    source = inspect.getsource(p1x.execute_p1_stage1)
+    assert "validate_development_feature_integrity" in source
+    assert "validate_development_source_integrity" in source
+    assert "prepare_p1_embedding_caches" in source
+    assert "prepare_p1_challenge_embeddings" in source
+    # Integrity is checked before any arm is claimed.
+    assert source.index("validate_development_source_integrity") < source.index(
+        "run_p1_stage1_suite"
+    )
+
+
+def test_partial_cache_stops_stage1_before_any_claim(tmp_path, monkeypatch) -> None:
+    directory = tmp_path / "cache" / "train"
+    directory.mkdir(parents=True)
+    (directory / "stray.bin").write_bytes(b"partial")
+    monkeypatch.setattr(p1x, "build_development_indexes", lambda root: {})
+    monkeypatch.setattr(p1x, "validate_waveform_cache", lambda root, idx: None)
+    with pytest.raises(p1x.P1ExecutionError, match="human review is required"):
+        p1x.prepare_p1_embedding_caches(
+            cache_root=tmp_path / "cache",
+            feature_root=Path("unused"),
+            source=Path("unused"),
+            b4b_run_dir=Path("unused"),
+            waveform_cache_root=Path("unused"),
+        )
+    assert not (tmp_path / "runs").exists()

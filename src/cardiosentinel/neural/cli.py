@@ -427,6 +427,11 @@ def add_p1_parser(subparsers: argparse._SubParsersAction) -> None:
         parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
         parser.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
         parser.add_argument("--b4b-run", type=Path, default=DEFAULT_B4B_RUN_DIR)
+        parser.add_argument(
+            "--waveform-cache-root",
+            type=Path,
+            default=DEFAULT_WAVEFORM_CACHE_ROOT,
+        )
 
 
 def run_p1_command(args: argparse.Namespace) -> int:
@@ -438,13 +443,16 @@ def run_p1_command(args: argparse.Namespace) -> int:
             args.cache_root,
             b4b_run_dir=args.b4b_run,
             feature_root=args.feature_root,
+            source=args.source,
         )
     else:
         report = execute_p1_stage1(
             run_root=args.run_root,
             cache_root=args.cache_root,
             feature_root=args.feature_root,
+            source=args.source,
             b4b_run_dir=args.b4b_run,
+            waveform_cache_root=args.waveform_cache_root,
         )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
