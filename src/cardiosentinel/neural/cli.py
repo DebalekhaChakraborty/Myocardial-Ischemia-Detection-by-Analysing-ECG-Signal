@@ -392,3 +392,52 @@ def run_b4_command(args: argparse.Namespace) -> int:
         )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
+
+
+DEFAULT_P1_RUN_ROOT = Path("cardiosentinel-runs/phase4-p1-physiology-v1")
+DEFAULT_P1_CACHE_ROOT = Path("cardiosentinel-features/p1-b4b-embeddings-v1")
+
+
+def add_p1_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the P1 development commands.
+
+    Only two official routes exist: a read-only preflight, and the Stage P1-1
+    suite that runs BOTH arms. There is deliberately no single-arm route and no
+    force/retry/overwrite option.
+    """
+    p1 = subparsers.add_parser(
+        "p1", help="Phase 4 P1 physiology-fusion development commands."
+    )
+    commands = p1.add_subparsers(dest="p1_command", required=True)
+    for name, description in (
+        (
+            "preflight",
+            "Read-only P1 Stage-1 readiness report. Creates no artifact and "
+            "does not access the test partition.",
+        ),
+        (
+            "run-stage1",
+            "Runs the one canonical P1-A vs P1-B Stage-1 ablation. Both arms "
+            "are mandatory. Does not access the test partition.",
+        ),
+    ):
+        parser = commands.add_parser(name, help=description)
+        parser.add_argument("--run-root", type=Path, default=DEFAULT_P1_RUN_ROOT)
+        parser.add_argument("--cache-root", type=Path, default=DEFAULT_P1_CACHE_ROOT)
+        parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+        parser.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
+
+
+def run_p1_command(args: argparse.Namespace) -> int:
+    from cardiosentinel.neural.p1_experiment import p1_preflight
+
+    if args.p1_command == "preflight":
+        report = p1_preflight(args.run_root, args.cache_root)
+    else:
+        raise SystemExit(
+            "cardiosentinel p1 run-stage1 requires the reviewed canonical "
+            "embedding caches and physiology transform; it is invoked from the "
+            "authorized scientific runner, not ad hoc."
+        )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0

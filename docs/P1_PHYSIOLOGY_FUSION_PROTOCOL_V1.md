@@ -1,5 +1,14 @@
 # P1 Physiology-Fusion Protocol V1
 
+## 0. Revision note
+
+A first draft (SHA-256
+`f4ad68bac1474e0de920ac7e0b67dd3be108324452ef135889c6d1496260b20e`) froze the P1
+scientific design correctly but described execution semantics the implementation
+did not yet provide, and mis-stated the claim mechanism as an `O_EXCL` file
+claim. It was **superseded before use** and produced **no scientific evidence**.
+This revision states the completed execution path exactly as implemented.
+
 ## 1. Scientific question
 
 Does adding already-frozen explicit physiology/morphology proxy information to
@@ -171,7 +180,8 @@ procedure differs.
 
 ## 7. Common training contract
 
-One procedure, applied identically to P1-A and P1-B:
+One procedure, applied identically to P1-A and P1-B. Every deterministic detail
+is frozen here before any P1 metric exists:
 
 | | |
 |---|---|
@@ -184,10 +194,26 @@ One procedure, applied identically to P1-A and P1-B:
 | checkpoint selection | maximum full primary-validation AUPRC; earliest epoch wins an exact tie |
 | early stopping | 4 completed epochs without improvement > 1e-6 |
 
+Additional frozen determinism:
+
+| | |
+|---|---|
+| `amsgrad` / `foreach` / `fused` | false / false / false |
+| Head initialization | standard PyTorch `nn.Linear` initialization under `torch.manual_seed(2026)` applied **immediately before** head construction, so nothing may consume RNG in between |
+| Train shuffle | `torch.randperm` under a generator seeded `2026 + epoch`; deterministic and epoch-dependent |
+| Inference batching | 256, `torch.no_grad()`, `eval()` |
+
 Max epochs is 30 rather than B4's 15: this is a small head over precomputed
 embeddings, so an epoch is far cheaper and the frozen early-stopping rule, not
 the ceiling, is expected to terminate training. No hyperparameter sweep, no
-alternate seed after observing P1, no validation-driven tweaking.
+alternate seed after observing P1, no validation-driven tweaking, no arm-specific
+tuning.
+
+### 7.1 Numerical integrity
+
+Training aborts without repair on a non-finite mean training loss, a non-finite
+prediction, a non-finite head parameter or a non-finite validation metric. There
+is no restart, retry, learning-rate reduction or alternate seed.
 
 ## 8. Populations
 
@@ -261,23 +287,88 @@ import, no `TEST_ATTEMPT`, no test cache, metadata or waveform.
 
 Historical B0–B3 test evidence is closed and may not inform P1 design.
 
-## 14. Provenance and one-shot semantics
+## 14. Execution path, provenance and one-shot semantics
 
 Experiment IDs `P1A_neural_head_v1` and `P1B_phys_fusion_v1`, run root
 `cardiosentinel-runs/phase4-p1-physiology-v1`.
 
-Each canonical run directory is claimed atomically (`O_EXCL`), fsynced with its
-parent, and never unlinked. An existing attempt in any state blocks
-re-execution; there is no force, overwrite, retry, rerun-candidate or delete
-path. On any post-claim exception the attempt is rewritten to
-`FAILED_OR_INTERRUPTED` with `error_type`, `error`, `traceback` and
-`human_review_required: true`, and **human review is required**.
+### 14.1 Embedding cache
 
-Runs bind: Git SHA and clean state, this protocol SHA, the B4-B experiment lock
-and checkpoint SHA, the embedding tap identity and dimension, the physiology
-schema SHA and transform digest, split and corpus identity, populations, the
-runtime environment and dependency digest, and their own canonical result
-digest.
+Train and validation embeddings are materialized once with the frozen B4-B
+checkpoint and are the only input to head training; the encoder never executes
+inside training. Each cache binds, and re-verifies on load:
+
+- an **order-sensitive** stable-ID digest (a sorted digest alone would not detect
+  a row-order change, which would silently misalign labels and physiology);
+- an embedding **content** digest over shape, dtype and contiguous bytes;
+- a label content digest;
+- the persisted artifact's file SHA-256;
+- the exact population (train 374,452 / 93,613 / 280,839 / 56; validation
+  473,897 / 21,628 / 452,269 / 12);
+- the B4-B experiment-lock and checkpoint SHAs, embedding tap, dimension 128;
+- split, feature-corpus and training-selection identities;
+- Git SHA with `git_dirty: false`, runtime environment and dependency digest;
+- this protocol's SHA.
+
+An existing canonical cache is refused, never overwritten. Any altered row, row
+order, embedding value, artifact or bound identity fails validation.
+
+### 14.2 Claim semantics
+
+The canonical experiment **directory** is the claim: it is created with
+`mkdir(exist_ok=False)` and its parent is fsynced. That atomic directory
+creation is the irreversible claim — this is not an `O_EXCL` file claim. An
+existing directory **in any state** consumes and blocks the attempt. It is never
+deleted, reset or renamed, and there is no force, overwrite, retry,
+rerun-candidate or selective-arm path.
+
+On any post-claim exception a `FAILED_OR_INTERRUPTED` receipt is written with
+`error_type`, `error`, `traceback`, `human_review_required: true` and
+`repeat_attempt_permitted: false`. **Human review is required.**
+
+### 14.3 Gates before any claim
+
+The exact scientific runtime (Python 3.12.6, PyTorch 2.13.0+cpu, NumPy 2.3.2,
+scikit-learn 1.9.0, SciPy 1.18.0, WFDB 4.3.1, CPU, AMP off, dependency digest
+`b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a`) and a clean
+Git checkout are verified **before** any attempt is claimed, reusing the already
+reviewed environment gate. Nothing is installed or repaired automatically.
+
+### 14.4 Artifacts and lock
+
+Each completed arm writes `RUN_STATUS.json`, `RUN_MANIFEST.json`,
+`EPOCH_HISTORY.json`, `PHYSIOLOGY_TRANSFORM.json` (explicit null for P1-A),
+`VALIDATION_METRICS.json`, `VALIDATION_THRESHOLD.json`,
+`VALIDATION_PREDICTIONS.npz`, `CHALLENGE_METRICS.json`, `model_selected.pt`,
+`training_checkpoint.pt` and `EXPERIMENT_LOCK.json`.
+
+The lock binds the experiment ID, head architecture/input dimension/parameter
+count/payload, the B4-B lock and checkpoint SHAs with `encoder_fine_tuned:
+false`, both embedding-cache digests and ordered-ID digests, the physiology
+transform digest for P1-B, this protocol SHA, Git SHA and clean state, the
+environment dependency digest, split/corpus/training-selection identities,
+populations, selected epoch, selected validation AUPRC, locked threshold, epoch
+history digest, artifact hashes, challenge evidence identity, and `test: null`.
+A lock validator re-derives the canonical digest and re-checks the bound
+checkpoint, so no self-consistent altered artifact validates silently.
+
+### 14.5 Stage-1 suite
+
+One official controller runs **both** arms in the frozen order P1-A then P1-B and
+writes a combined `P1_STAGE1_RESULTS.json`. There is deliberately **no official
+route that runs a single arm** and calls Stage P1-1 complete, and no selective
+retry. The suite records `physiology_retained: null` and
+`retention_decision_performed: false`: **it never retains or rejects
+physiology** — that is the later human decision of §11.
+
+### 14.6 Entry points
+
+`cardiosentinel p1 preflight` is read-only: it validates the protocol, the B4-B
+identities, the runtime and Git state, the expected populations and schema, and
+reports whether the canonical attempts and caches exist. It constructs no
+scientific model and creates no artifact.
+
+`cardiosentinel p1 run-stage1` is the only official Stage P1-1 route.
 
 ## 15. Next gate
 
