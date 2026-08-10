@@ -1,0 +1,104 @@
+{
+  "selection_version": "B4_GLOBAL_ENCODER_SELECTION_V1",
+  "phase": "3B-2",
+  "decision_class": "development_architecture_selection",
+  "selected_official_model": "B4-B",
+  "experiment_id": "B4B_cnn_transformer_v1",
+  "architecture": "B4BTransformerCNN",
+  "experiment_lock_sha256": "58e44a09ce3ebffecfcd49d957acfa368fc03b534fdcd990aedb9b6b0e9bda7b",
+  "checkpoint_sha256": "b1301723909c641a0014c31f6daa9549d47ab231f0b07483e0de729aff5591c9",
+  "locked_inference_model": "model_selected.pt",
+  "locked_validation_threshold": 0.8329097628593445,
+  "threshold_source": "locked_experiment_lock.validation_threshold",
+  "score_semantics": "uncalibrated sigmoid model score; not calibrated probability",
+  "candidate_order": ["B4-A", "B4-B", "B4-C"],
+  "rejected_candidates": {
+    "B4-A": {
+      "experiment_id": "B4_raw_compact_cnn_v1",
+      "architecture": "B4CompactCNN",
+      "experiment_lock_sha256": "ea1e1d76365b0cd52ba1b7f022f22f85af848bbdc002beeae806eda9c39a78fa",
+      "checkpoint_sha256": "3a33cfb3c05e0f26fc8bc9c3bb826710215921da11b1ecd3a7ea92c3c57e9175",
+      "retained_role": "efficient_required_cnn_reference"
+    },
+    "B4-C": {
+      "experiment_id": "B4C_cnn_ssm_v1",
+      "architecture": "B4CSSMCNN",
+      "experiment_lock_sha256": "22ba491b7219ee94af7bb64b5cab57e96b4a0aea84a237d19e6608712738e959",
+      "checkpoint_sha256": "d590a3ab657ef4dec9c63b01754b04851937547f1bc85083b3c085ab529ab3ec",
+      "retained_role": "alternative_architecture_negative_result",
+      "note": "Short-window S4D-inspired diagonal SSM only; does not reject the planned T2 longitudinal SSM."
+    }
+  },
+  "evidence_sources": {
+    "b4_protocol_sha256": "f6f5e9ed728c86a9b2bd75b2327b9199f0e097b91387525a192c212e6771b28b",
+    "architecture_selection_protocol_sha256": "986bc166f7f4a787423e1ac33cad65342ae7a700f85bfd8bb9d0291f64d2a0dc",
+    "resource_benchmark_protocol_sha256": "9184f54eb2b80fd495460d0a5c8989cdc6b923ed992a87ea18253e836f4c4b98",
+    "validation_challenge_protocol_sha256": "44df775f43301a782d3acd48fc4b3cd9358c07d4ed45d270fcb2763200761926",
+    "resource_suite_sha256": "2292dbf102091ca002e6a8fb5acc12a72aa69374eba57bf8a45b56f780333f6d",
+    "validation_challenge_suite_sha256": "f063c67dc00e85fb38bd20fc98ecb333bf17d27540ff96c7a47de47eb1c0bedb",
+    "challenge_selection_sha256": "49899d1b59430ff22f70cdf509184e98caedbe0e2a8756939ee77e25210ee72a",
+    "split_sha256": "66e25d77b6aaa25502974b4b60667b4c4b24d649bf9493666827c747a385ced7",
+    "feature_corpus_sha256": "f18785d520828cb171482926922346dda824c8868ed4b7f9be45897cd71d6eb5"
+  },
+  "selection_evidence": {
+    "pooled_validation_auprc": {
+      "B4-A": 0.3156014611186772,
+      "B4-B": 0.38053499010488423,
+      "B4-C": 0.3377705149052735
+    },
+    "subject_macro_auprc": {
+      "B4-A": 0.3658236963081271,
+      "B4-B": 0.40063630025780333,
+      "B4-C": 0.4033236569167703
+    },
+    "rate_related_fpr": {
+      "B4-A": 0.34566659963804547,
+      "B4-B": 0.331188417454253,
+      "B4-C": 0.4651116026543334,
+      "evidence_status": "quantitative_secondary"
+    },
+    "axis_shift_fpr": {
+      "B4-A": 0.102,
+      "B4-B": 0.06166666666666667,
+      "B4-C": 0.11766666666666667,
+      "evidence_status": "quantitative_secondary"
+    },
+    "conduction_change_fpr": {
+      "B4-A": 0.036585365853658534,
+      "B4-B": 0.0,
+      "B4-C": 0.018292682926829267,
+      "evidence_status": "exploratory_descriptive",
+      "supporting_subject_count": 1,
+      "used_in_selection": false
+    },
+    "trainable_parameter_count": {
+      "B4-A": 87089,
+      "B4-B": 309809,
+      "B4-C": 155313
+    },
+    "median_latency_ms_per_window": {
+      "B4-A": 3.274761,
+      "B4-B": 4.1613225,
+      "B4-C": 14.4363955,
+      "measurement_context": "frozen resource benchmark host; not an edge-device measurement"
+    },
+    "selected_epoch": {
+      "B4-A": 4,
+      "B4-B": 2,
+      "B4-C": 2
+    }
+  },
+  "statistical_claims": {
+    "hypothesis_test_performed": false,
+    "confidence_intervals_computed": false,
+    "paired_subject_analysis_performed": false,
+    "significance_claimed": false,
+    "note": "Margins are derived descriptive comparisons over frozen evidence."
+  },
+  "test_evidence_used": false,
+  "sealed_test_state": "unopened",
+  "test_attempt_present": false,
+  "authorizes_sealed_test_access": false,
+  "new_scientific_computation_performed": false,
+  "phase_3b2_exit_gate": "satisfied_upon_merge_of_this_reviewed_decision"
+}
