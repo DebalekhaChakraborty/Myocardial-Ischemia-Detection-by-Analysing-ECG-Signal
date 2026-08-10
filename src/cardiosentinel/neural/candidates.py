@@ -178,14 +178,27 @@ class B4BTransformerCNN(nn.Module):
                 nn.init.ones_(module.weight)
                 nn.init.zeros_(module.bias)
 
-    def forward(self, waveforms: Tensor) -> Tensor:
+    def encode(self, waveforms: Tensor) -> Tensor:
+        """Return the pooled `[B, MODEL_DIM]` representation, no classification.
+
+        This is the encoder output immediately before the classifier MLP: after
+        the final LayerNorm and adaptive average pooling, and before the head's
+        first dropout site. It is the representation downstream development work
+        (P1 physiology fusion, later patient memory) consumes, so it is exposed
+        explicitly rather than reconstructed by callers.
+
+        `forward` is defined in terms of this method, so the two can never drift.
+        """
         _validate_waveform_input(waveforms)
         values = self.front_end(waveforms)
         tokens = values.transpose(1, 2) + self.positional_embedding
         for block in self.blocks:
             tokens = block(tokens)
         tokens = self.final_norm(tokens)
-        return self.classifier(tokens.transpose(1, 2))
+        return self.classifier.pool(tokens.transpose(1, 2)).squeeze(-1)
+
+    def forward(self, waveforms: Tensor) -> Tensor:
+        return self.classifier.head(self.encode(waveforms)).squeeze(-1)
 
 
 class DiagonalGatedSSMBlock(nn.Module):
