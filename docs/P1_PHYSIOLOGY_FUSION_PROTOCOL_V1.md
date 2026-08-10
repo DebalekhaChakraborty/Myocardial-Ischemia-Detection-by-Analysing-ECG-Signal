@@ -7,7 +7,15 @@ A first draft (SHA-256
 scientific design correctly but described execution semantics the implementation
 did not yet provide, and mis-stated the claim mechanism as an `O_EXCL` file
 claim. It was **superseded before use** and produced **no scientific evidence**.
-This revision states the completed execution path exactly as implemented.
+A second revision (`66e91c6cda73ac66c7dfddb2cf25a601af383ed8a84ba9f24dfed82519d8f256`)
+described the execution path but preceded six execution-integrity corrections
+found in re-review: the official `run-stage1` route was a stub, preflight could
+report ready without caches, cache materialization accepted an arbitrary encoder
+while stamping the frozen checkpoint SHA, partial caches were not blocked,
+physiology was passed as bare arrays with no stable-ID binding, the challenge set
+was accepted unverified, and checkpoint selection was conflated with the
+early-stopping delta. It too was **superseded before use** and produced **no
+scientific evidence**. This revision states the corrected path.
 
 ## 1. Scientific question
 
@@ -351,6 +359,47 @@ populations, selected epoch, selected validation AUPRC, locked threshold, epoch
 history digest, artifact hashes, challenge evidence identity, and `test: null`.
 A lock validator re-derives the canonical digest and re-checks the bound
 checkpoint, so no self-consistent altered artifact validates silently.
+
+### 14.4a Corrected execution integrity
+
+- **Encoder provenance.** Cache materialization loads the canonical B4-B model
+  through the reviewed locked-model loader, verifying the experiment lock, the
+  checkpoint SHA-256, `test: null` and the constructed architecture before use.
+  An arbitrary preconstructed encoder can never be stamped as official.
+- **Crash safety.** Any pre-existing canonical cache directory — complete or
+  partial, manifest or not — blocks materialization and requires human review or
+  explicit read-only validation. The array is written to a temporary file and
+  atomically published; `p1_embeddings.npz` is never silently overwritten.
+- **Physiology binding.** Physiology is carried as a bundle holding the ordered
+  stable IDs, content digest, schema SHA and transform digest, joined from the
+  frozen corpus **by stable ID in the cache's exact row order**. A row
+  permutation or a partition mismatch is refused.
+- **Challenge identity.** The challenge population is **rebuilt** through the
+  reviewed B4 validation-challenge index and must reproduce rate 4,973/4, axis
+  3,000/8, conduction 164/1, total 8,137 and selection digest
+  `49899d1b…e72a`. It is a **mandatory** keyword argument of the Stage-1 suite:
+  there is no `challenge=None` path.
+- **Cache load.** Validation requires the exact frozen population, the training
+  selection SHA for train, split/corpus/protocol identities, the frozen
+  dependency digest, encoder identity, and the ordered stable-ID, embedding,
+  label **and subject-ID** content digests. Subject IDs are bound because
+  subject-macro metrics depend on them.
+- **Artifact locking.** The lock binds a file SHA-256 for every claim-bearing
+  artifact — epoch history, physiology transform, validation metrics and
+  threshold, validation predictions, challenge metrics, both checkpoints and the
+  run manifest — and the validator re-checks each one.
+
+### 14.4b Checkpoint selection versus patience
+
+These are **separate**, following the reviewed `CheckpointTracker`:
+
+- a checkpoint is saved whenever `validation_auprc > best_auprc` (strict
+  numerical maximum, no delta);
+- patience resets **only** when
+  `validation_auprc > early_stopping_reference + 1e-6`.
+
+An improvement of, say, 5e-7 therefore becomes the selected maximum checkpoint
+**without** resetting patience. The earliest epoch wins an exact tie.
 
 ### 14.5 Stage-1 suite
 

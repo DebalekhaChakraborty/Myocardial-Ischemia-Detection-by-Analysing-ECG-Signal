@@ -48,7 +48,6 @@ from cardiosentinel.neural.physiology_fusion import (
     EMBEDDING_TAP,
     MORPHOLOGY_SCHEMA_SHA256,
     P1_BATCH_SIZE,
-    P1_EARLY_STOPPING_DELTA,
     P1_EARLY_STOPPING_PATIENCE,
     P1_LEARNING_RATE,
     P1_MAX_EPOCHS,
@@ -58,16 +57,20 @@ from cardiosentinel.neural.physiology_fusion import (
     P1A_EXPERIMENT_ID,
     P1B_EXPERIMENT_ID,
     PHYSIOLOGY_DIM,
+    PHYSIOLOGY_FEATURE_NAMES,
     PhysiologyTransform,
     build_p1_head,
     claim_p1_run_directory,
     extract_frozen_embeddings,
+    fit_physiology_transform,
+    morphology_columns,
     p1_head_identity,
     p1_training_configuration,
     record_p1_failure,
     require_p1_partition,
     resolve_p1_run_dir,
     validate_p1_protocol,
+    validate_physiology_schema,
     write_p1_status,
 )
 from cardiosentinel.neural.protocol import (
@@ -77,9 +80,20 @@ from cardiosentinel.neural.protocol import (
     REPOSITORY_ROOT,
 )
 from cardiosentinel.neural.provenance import runtime_environment
+from cardiosentinel.neural.resource_benchmark import (
+    load_locked_model,
+    validate_locked_model,
+)
+from cardiosentinel.neural.training import CheckpointTracker
+from cardiosentinel.neural.validation_challenge import (
+    CHALLENGE_EXPECTED_COUNTS,
+    CHALLENGE_TOTAL_WINDOWS,
+    build_validation_challenge_index,
+)
 
 CACHE_MANIFEST_NAME: Final = "P1_EMBEDDING_CACHE_MANIFEST.json"
 CACHE_ARRAY_NAME: Final = "p1_embeddings.npz"
+CACHE_CLAIM_NAME: Final = "P1_EMBEDDING_CACHE_CLAIM.json"
 
 RUN_MANIFEST_NAME: Final = "RUN_MANIFEST.json"
 EPOCH_HISTORY_NAME: Final = "EPOCH_HISTORY.json"
@@ -119,6 +133,9 @@ CHALLENGE_SELECTION_SHA256: Final = (
     "49899d1b59430ff22f70cdf509184e98caedbe0e2a8756939ee77e25210ee72a"
 )
 CHALLENGE_NAMES: Final = ("rate_related", "axis_shift", "conduction_change")
+FROZEN_DEPENDENCY_DIGEST: Final = (
+    "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
+)
 
 THRESHOLD_RULE: Final = (
     "maximum validation F1 over exact observed validation scores; "
@@ -259,6 +276,11 @@ def build_embedding_cache_manifest(
         "label_content_sha256": embedding_content_digest(
             np.asarray(labels, dtype=np.int64)
         ),
+        # Subject IDs drive subject-macro metrics, so their exact ordered
+        # content is bound too: a reassigned subject must not validate.
+        "ordered_subject_id_sha256": canonical_sha256(
+            {"order": "row_order", "subject_ids": [str(v) for v in subject_ids]}
+        ),
         "split_sha256": B4_SPLIT_SHA256,
         "feature_corpus_sha256": FEATURE_CORPUS_SHA256,
         "training_selection_sha256": (
@@ -275,8 +297,52 @@ def build_embedding_cache_manifest(
     return payload
 
 
+def load_official_b4b_encoder(b4b_run_dir: Path) -> nn.Module:
+    """Load the canonical B4-B encoder, proving its identity before use.
+
+    The official path must never receive an arbitrary preconstructed module and
+    then stamp it with the frozen checkpoint SHA.
+    """
+    lock = validate_locked_model(Path(b4b_run_dir), official_model="B4-B")
+    if lock["experiment_lock_sha256"] != B4B_EXPERIMENT_LOCK_SHA256:
+        raise P1ExecutionError("B4-B experiment lock SHA-256 is not the selected one.")
+    if lock["checkpoint_sha256"] != B4B_CHECKPOINT_SHA256:
+        raise P1ExecutionError("B4-B checkpoint SHA-256 is not the selected one.")
+    if lock.get("test") is not None:
+        raise P1ExecutionError("The B4-B lock must record test as null.")
+    encoder = load_locked_model(Path(b4b_run_dir), lock)
+    if type(encoder).__name__ != "B4BTransformerCNN":
+        raise P1ExecutionError("The locked B4-B model is not a B4BTransformerCNN.")
+    if not hasattr(encoder, "encode"):
+        raise P1ExecutionError("The locked B4-B model exposes no encode() tap.")
+    encoder.eval()
+    encoder.requires_grad_(False)
+    return encoder
+
+
+def _claim_cache_directory(directory: Path, partition: str) -> None:
+    """Refuse any pre-existing canonical cache directory, partial or complete."""
+    if directory.exists():
+        raise P1ExecutionError(
+            f"A canonical P1 embedding cache directory already exists at "
+            f"{directory}. It is never overwritten, even if partial: an "
+            "incomplete cache requires human review or explicit read-only "
+            "validation."
+        )
+    directory.mkdir(parents=True, exist_ok=False)
+    write_json_atomic(
+        directory / CACHE_CLAIM_NAME,
+        {
+            "claim": "p1_embedding_cache",
+            "partition": partition,
+            "claim_status": "STARTED",
+            "overwrite_permitted": False,
+        },
+    )
+
+
 def materialize_p1_embedding_cache(
-    encoder: nn.Module,
+    b4b_run_dir: Path,
     waveform_batches,
     *,
     partition: str,
@@ -286,24 +352,22 @@ def materialize_p1_embedding_cache(
     cache_root: Path,
     require_expected_population: bool = True,
 ) -> P1EmbeddingCache:
-    """Materialize one development embedding cache with the frozen encoder.
+    """Materialize one development embedding cache with the locked B4-B model.
 
     `waveform_batches` yields `[B, 1, 2500]` float32 tensors in the exact frozen
-    row order. The encoder is never fine-tuned and never enters an optimizer.
-    An existing canonical cache is refused, never overwritten.
+    row order. The encoder is loaded from the canonical B4-B run and proven
+    before use; it is never fine-tuned and never enters an optimizer. Any
+    pre-existing cache directory, complete or partial, is refused.
     """
     evaluated = require_p1_partition(partition)
     validate_p1_protocol()
     environment, dependency_digest = require_p1_runtime()
     provenance = require_clean_checkout()
+    encoder = load_official_b4b_encoder(b4b_run_dir)
 
     directory = Path(cache_root) / evaluated
     manifest_path = directory / CACHE_MANIFEST_NAME
-    if manifest_path.exists():
-        raise P1ExecutionError(
-            f"A canonical P1 embedding cache already exists at {manifest_path}; "
-            "it is never overwritten."
-        )
+    _claim_cache_directory(directory, evaluated)
 
     chunks: list[np.ndarray] = []
     receipt: dict[str, Any] = {}
@@ -328,15 +392,16 @@ def materialize_p1_embedding_cache(
     )
     manifest["environment"] = environment
 
-    directory.mkdir(parents=True, exist_ok=True)
     array_path = directory / CACHE_ARRAY_NAME
+    temporary = directory / f".{CACHE_ARRAY_NAME}.tmp.npz"
     np.savez_compressed(
-        array_path,
+        temporary,
         stable_id=np.asarray([str(v) for v in stable_ids], dtype=np.str_),
         subject_id=np.asarray([str(v) for v in subject_ids], dtype=np.str_),
         label=np.asarray(labels, dtype=np.int64),
         embedding=matrix,
     )
+    temporary.replace(array_path)
     manifest["artifact"] = CACHE_ARRAY_NAME
     manifest["artifact_sha256"] = sha256_file(array_path)
     manifest["cache_sha256"] = canonical_sha256(
@@ -383,6 +448,21 @@ def load_p1_embedding_cache(cache_root: Path, partition: str) -> P1EmbeddingCach
             )
     if manifest.get("git_dirty") is not False:
         raise P1ExecutionError("P1 embedding cache was built from a dirty checkout.")
+    if manifest.get("population") != EXPECTED_POPULATIONS[evaluated]:
+        raise P1ExecutionError(
+            f"P1 embedding cache population {manifest.get('population')} differs "
+            f"from the frozen identity {EXPECTED_POPULATIONS[evaluated]}."
+        )
+    if evaluated == "train" and (
+        manifest.get("training_selection_sha256") != TRAINING_SELECTION_SHA256
+    ):
+        raise P1ExecutionError(
+            "P1 train embedding cache does not bind the frozen training selection."
+        )
+    if manifest.get("environment_dependency_digest") != FROZEN_DEPENDENCY_DIGEST:
+        raise P1ExecutionError(
+            "P1 embedding cache does not bind the frozen dependency digest."
+        )
 
     array_path = directory / str(manifest["artifact"])
     if sha256_file(array_path) != manifest["artifact_sha256"]:
@@ -401,6 +481,13 @@ def load_p1_embedding_cache(cache_root: Path, partition: str) -> P1EmbeddingCach
         raise P1ExecutionError("P1 embedding content does not match its digest.")
     if embedding_content_digest(labels) != manifest["label_content_sha256"]:
         raise P1ExecutionError("P1 embedding cache labels do not match their digest.")
+    subject_digest = canonical_sha256(
+        {"order": "row_order", "subject_ids": [str(v) for v in subject_ids]}
+    )
+    if subject_digest != manifest["ordered_subject_id_sha256"]:
+        raise P1ExecutionError(
+            "P1 embedding cache subject assignment does not match its digest."
+        )
     if _population_of(labels, subject_ids) != manifest["population"]:
         raise P1ExecutionError("P1 embedding cache population does not match.")
     return P1EmbeddingCache(
@@ -411,6 +498,84 @@ def load_p1_embedding_cache(cache_root: Path, partition: str) -> P1EmbeddingCach
         subject_ids=subject_ids,
         manifest=manifest,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class P1PhysiologyBundle:
+    """Transformed physiology bound to an exact ordered stable-ID sequence.
+
+    A bare array cannot detect a row permutation; this carries the ordered IDs
+    and content digest so misalignment against the embedding cache is refused.
+    """
+
+    partition: str
+    stable_ids: tuple[str, ...]
+    values: np.ndarray
+    schema_sha256: str
+    transform_sha256: str
+
+    @property
+    def ordered_stable_id_sha256(self) -> str:
+        return ordered_stable_id_digest(self.stable_ids)
+
+    @property
+    def content_sha256(self) -> str:
+        return embedding_content_digest(self.values)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "partition": self.partition,
+            "rows": int(self.values.shape[0]),
+            "physiology_dim": int(self.values.shape[1]),
+            "ordered_stable_id_sha256": self.ordered_stable_id_sha256,
+            "content_sha256": self.content_sha256,
+            "schema_sha256": self.schema_sha256,
+            "transform_sha256": self.transform_sha256,
+        }
+
+
+def build_physiology_bundle(
+    *,
+    partition: str,
+    stable_ids,
+    raw_by_stable_id: dict[str, np.ndarray],
+    transform: PhysiologyTransform,
+) -> P1PhysiologyBundle:
+    """Join frozen morphology_v1 by stable ID, in the cache's exact row order."""
+    evaluated = require_p1_partition(partition)
+    identifiers = [str(v) for v in stable_ids]
+    missing = [key for key in identifiers if key not in raw_by_stable_id]
+    if missing:
+        raise P1ExecutionError(
+            f"{len(missing)} rows have no morphology_v1 record; the first is "
+            f"{missing[0]!r}."
+        )
+    raw = np.stack([np.asarray(raw_by_stable_id[key], dtype=np.float64)
+                    for key in identifiers])
+    if raw.shape[1] != PHYSIOLOGY_DIM:
+        raise P1ExecutionError(f"Physiology rows must be [N, {PHYSIOLOGY_DIM}].")
+    return P1PhysiologyBundle(
+        partition=evaluated,
+        stable_ids=tuple(identifiers),
+        values=transform.transform(raw),
+        schema_sha256=MORPHOLOGY_SCHEMA_SHA256,
+        transform_sha256=transform.as_dict()["transform_sha256"],
+    )
+
+
+def require_aligned_physiology(
+    bundle: P1PhysiologyBundle, stable_ids, partition: str
+) -> np.ndarray:
+    """Refuse physiology whose ordered identity differs from the cache's."""
+    if bundle.partition != partition:
+        raise P1ExecutionError(
+            f"Physiology bundle is for {bundle.partition!r}, not {partition!r}."
+        )
+    if bundle.ordered_stable_id_sha256 != ordered_stable_id_digest(stable_ids):
+        raise P1ExecutionError(
+            "Physiology rows are not in the embedding cache's exact row order."
+        )
+    return bundle.values
 
 
 # --------------------------------------------------------------------------
@@ -506,10 +671,12 @@ def train_p1_arm(
     targets = torch.from_numpy(np.asarray(train_labels, dtype=np.float32))
 
     history: list[dict[str, Any]] = []
-    best_auprc = -np.inf
-    best_epoch = 0
+    # Reuse the reviewed B4 tracker: checkpoint saving is a strict numerical
+    # maximum, while patience resets only on an improvement beyond the delta.
+    # A 5e-7 gain therefore becomes the selected checkpoint without resetting
+    # patience. Conflating the two was a real defect in the previous head.
+    tracker = CheckpointTracker()
     best_state: dict[str, Any] | None = None
-    patience = 0
 
     for epoch in range(1, max_epochs + 1):
         head.train()
@@ -530,23 +697,19 @@ def train_p1_arm(
         auprc = float(binary_metrics(validation_labels, scores, 0.5)["auprc"])
         _require_finite_state(head, mean_loss, auprc, epoch)
 
-        improved = auprc > best_auprc + P1_EARLY_STOPPING_DELTA
-        if improved:
-            best_auprc, best_epoch = auprc, epoch
+        decision = tracker.update(epoch, auprc)
+        if decision.save_checkpoint:
             best_state = {k: v.detach().clone() for k, v in head.state_dict().items()}
-            patience = 0
-        else:
-            patience += 1
         history.append(
             {
                 "epoch": epoch,
                 "mean_training_loss": mean_loss,
                 "validation_auprc": auprc,
-                "checkpoint_saved": improved,
-                "early_stopping_patience": patience,
+                "checkpoint_saved": decision.save_checkpoint,
+                "early_stopping_patience": decision.patience,
             }
         )
-        if patience >= P1_EARLY_STOPPING_PATIENCE:
+        if decision.stop_training:
             break
 
     if best_state is None:
@@ -555,12 +718,12 @@ def train_p1_arm(
     return {
         "head": head,
         "epoch_history": tuple(history),
-        "selected_epoch": best_epoch,
-        "selected_validation_auprc": best_auprc,
+        "selected_epoch": tracker.best_epoch,
+        "selected_validation_auprc": tracker.best_auprc,
         "completed_epochs": len(history),
         "stop_reason": (
             "early_stopping"
-            if patience >= P1_EARLY_STOPPING_PATIENCE
+            if tracker.patience >= P1_EARLY_STOPPING_PATIENCE
             else "max_epochs"
         ),
     }
@@ -633,6 +796,75 @@ def p1_challenge_evidence(
             "frozen_metric": measured,
         }
     return evidence
+
+
+@dataclass(frozen=True, slots=True)
+class P1ChallengeSet:
+    """The frozen validation challenge rows prepared for P1 scoring."""
+
+    stable_ids: tuple[str, ...]
+    target_families: tuple[str, ...]
+    subject_ids: tuple[str, ...]
+    embeddings: np.ndarray
+    physiology: P1PhysiologyBundle | None
+    selection_sha256: str
+    counts: dict[str, dict[str, int]]
+
+
+def prepare_p1_challenge_set(
+    feature_root: Path,
+    *,
+    embeddings_by_stable_id: dict[str, np.ndarray],
+    raw_physiology_by_stable_id: dict[str, np.ndarray],
+    transform: PhysiologyTransform,
+) -> P1ChallengeSet:
+    """Rebuild and verify the frozen validation challenge population for P1.
+
+    The identity is rebuilt through the reviewed B4 challenge index rather than
+    stamped, so an arbitrary row set cannot masquerade as the frozen selection.
+    """
+    require_p1_partition("validation")
+    index = build_validation_challenge_index(Path(feature_root))
+    if index.selection_sha256 != CHALLENGE_SELECTION_SHA256:
+        raise P1ExecutionError(
+            "Rebuilt challenge selection digest differs from the frozen identity."
+        )
+    if index.counts != {
+        family: dict(counts) for family, counts in CHALLENGE_EXPECTED_COUNTS.items()
+    }:
+        raise P1ExecutionError(
+            f"Challenge population {index.counts} differs from the frozen identity."
+        )
+    if len(index.references) != CHALLENGE_TOTAL_WINDOWS:
+        raise P1ExecutionError(
+            f"Expected {CHALLENGE_TOTAL_WINDOWS} challenge windows, "
+            f"observed {len(index.references)}."
+        )
+    stable_ids = tuple(item.stable_id for item in index.references)
+    missing = [key for key in stable_ids if key not in embeddings_by_stable_id]
+    if missing:
+        raise P1ExecutionError(
+            f"{len(missing)} challenge rows have no frozen B4-B embedding."
+        )
+    embeddings = np.stack(
+        [np.asarray(embeddings_by_stable_id[key], dtype=np.float32)
+         for key in stable_ids]
+    )
+    physiology = build_physiology_bundle(
+        partition="validation",
+        stable_ids=stable_ids,
+        raw_by_stable_id=raw_physiology_by_stable_id,
+        transform=transform,
+    )
+    return P1ChallengeSet(
+        stable_ids=stable_ids,
+        target_families=tuple(item.target_family for item in index.references),
+        subject_ids=tuple(item.subject_id for item in index.references),
+        embeddings=embeddings,
+        physiology=physiology,
+        selection_sha256=index.selection_sha256,
+        counts=index.counts,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -730,6 +962,15 @@ def validate_p1_lock(run_dir: Path) -> dict[str, Any]:
     if recorded is None or recorded != canonical_sha256(lock):
         raise P1ExecutionError("P1 experiment lock hash validation failed.")
     lock["experiment_lock_sha256"] = recorded
+    bound = lock.get("artifact_sha256", {})
+    if not bound:
+        raise P1ExecutionError("P1 lock binds no claim-bearing artifact hashes.")
+    for name, expected in bound.items():
+        path = Path(run_dir) / name
+        if not path.is_file():
+            raise P1ExecutionError(f"P1 locked artifact {name} is absent.")
+        if sha256_file(path) != expected:
+            raise P1ExecutionError(f"P1 locked artifact {name} failed hash validation.")
     if "test" not in lock or lock["test"] is not None:
         raise P1ExecutionError("P1 experiment lock must record test as null.")
     if lock.get("experiment_id") not in P1_ARM_ORDER:
@@ -754,9 +995,9 @@ def run_p1_arm(
     train_cache: P1EmbeddingCache,
     validation_cache: P1EmbeddingCache,
     transform: PhysiologyTransform | None,
-    train_physiology: np.ndarray | None = None,
-    validation_physiology: np.ndarray | None = None,
-    challenge: dict[str, Any] | None = None,
+    challenge: P1ChallengeSet,
+    train_physiology: P1PhysiologyBundle | None = None,
+    validation_physiology: P1PhysiologyBundle | None = None,
     command: str = "cardiosentinel p1 run-stage1",
 ) -> dict[str, Any]:
     """Execute and lock one canonical P1 arm. The claim is never released."""
@@ -775,11 +1016,26 @@ def run_p1_arm(
     )
     started = time.monotonic()
     try:
+        uses_physiology = experiment_id == P1B_EXPERIMENT_ID
+        train_values = (
+            require_aligned_physiology(
+                train_physiology, train_cache.stable_ids, "train"
+            )
+            if uses_physiology
+            else None
+        )
+        validation_values = (
+            require_aligned_physiology(
+                validation_physiology, validation_cache.stable_ids, "validation"
+            )
+            if uses_physiology
+            else None
+        )
         train_features = _features_for(
-            experiment_id, train_cache.embeddings, train_physiology
+            experiment_id, train_cache.embeddings, train_values
         )
         validation_features = _features_for(
-            experiment_id, validation_cache.embeddings, validation_physiology
+            experiment_id, validation_cache.embeddings, validation_values
         )
         result = train_p1_arm(
             experiment_id,
@@ -795,19 +1051,25 @@ def run_p1_arm(
             validation_cache.labels, scores, validation_cache.subject_ids, threshold
         )
 
-        challenge_evidence = None
-        if challenge is not None:
-            challenge_features = _features_for(
-                experiment_id,
-                np.asarray(challenge["embeddings"], dtype=np.float32),
-                challenge.get("physiology"),
+        if challenge.selection_sha256 != CHALLENGE_SELECTION_SHA256:
+            raise P1ExecutionError("P1 challenge set is not the frozen selection.")
+        challenge_values = (
+            require_aligned_physiology(
+                challenge.physiology, challenge.stable_ids, "validation"
             )
-            challenge_evidence = p1_challenge_evidence(
-                challenge["target_families"],
-                _scores(head, challenge_features),
-                challenge["subject_ids"],
-                threshold,
-            )
+            if uses_physiology
+            else None
+        )
+        challenge_features = _features_for(
+            experiment_id, challenge.embeddings, challenge_values
+        )
+        challenge_evidence = p1_challenge_evidence(
+            challenge.target_families,
+            _scores(head, challenge_features),
+            challenge.subject_ids,
+            threshold,
+        )
+        challenge_evidence["challenge_population"] = challenge.counts
 
         write_json_atomic(
             run_dir / EPOCH_HISTORY_NAME,
@@ -828,8 +1090,7 @@ def run_p1_arm(
             run_dir / PHYSIOLOGY_TRANSFORM_NAME,
             transform.as_dict() if transform else {"physiology_transform": None},
         )
-        if challenge_evidence is not None:
-            write_json_atomic(run_dir / CHALLENGE_METRICS_NAME, challenge_evidence)
+        write_json_atomic(run_dir / CHALLENGE_METRICS_NAME, challenge_evidence)
         np.savez_compressed(
             run_dir / VALIDATION_PREDICTIONS_NAME,
             stable_id=np.asarray(validation_cache.stable_ids, dtype=np.str_),
@@ -840,16 +1101,34 @@ def run_p1_arm(
         torch.save(head.state_dict(), run_dir / SELECTED_MODEL_NAME)
         torch.save(head.state_dict(), run_dir / TRAINING_CHECKPOINT_NAME)
 
+        write_json_atomic(
+            run_dir / RUN_MANIFEST_NAME,
+            {
+                "experiment_id": experiment_id,
+                "command": command,
+                "status": STATUS_COMPLETE,
+            },
+        )
+        # Every claim-bearing result file is bound, so tampering any of them is
+        # refused by the lock validator.
+        claim_bearing = (
+            EPOCH_HISTORY_NAME,
+            PHYSIOLOGY_TRANSFORM_NAME,
+            VALIDATION_METRICS_NAME,
+            VALIDATION_THRESHOLD_NAME,
+            VALIDATION_PREDICTIONS_NAME,
+            CHALLENGE_METRICS_NAME,
+            SELECTED_MODEL_NAME,
+            TRAINING_CHECKPOINT_NAME,
+            RUN_MANIFEST_NAME,
+        )
         artifacts = {
             "locked_inference_model": SELECTED_MODEL_NAME,
             "checkpoint_sha256": sha256_file(run_dir / SELECTED_MODEL_NAME),
             "checkpoint_bytes": (run_dir / SELECTED_MODEL_NAME).stat().st_size,
-            "training_checkpoint_sha256": sha256_file(
-                run_dir / TRAINING_CHECKPOINT_NAME
-            ),
-            "validation_predictions_sha256": sha256_file(
-                run_dir / VALIDATION_PREDICTIONS_NAME
-            ),
+            "artifact_sha256": {
+                name: sha256_file(run_dir / name) for name in claim_bearing
+            },
         }
         lock = build_p1_lock(
             experiment_id,
@@ -867,14 +1146,6 @@ def run_p1_arm(
             dependency_digest=dependency_digest,
         )
         write_json_atomic(run_dir / EXPERIMENT_LOCK_NAME, lock)
-        write_json_atomic(
-            run_dir / RUN_MANIFEST_NAME,
-            {
-                "experiment_id": experiment_id,
-                "command": command,
-                "status": STATUS_COMPLETE,
-            },
-        )
         write_p1_status(
             run_dir,
             STATUS_COMPLETE,
@@ -905,9 +1176,9 @@ def run_p1_stage1_suite(
     train_cache: P1EmbeddingCache,
     validation_cache: P1EmbeddingCache,
     transform: PhysiologyTransform,
-    train_physiology: np.ndarray,
-    validation_physiology: np.ndarray,
-    challenge: dict[str, Any] | None = None,
+    train_physiology: P1PhysiologyBundle,
+    validation_physiology: P1PhysiologyBundle,
+    challenge: P1ChallengeSet,
     command: str = "cardiosentinel p1 run-stage1",
 ) -> dict[str, Any]:
     """Run the official Stage P1-1 ablation. BOTH arms are mandatory.
@@ -920,26 +1191,24 @@ def run_p1_stage1_suite(
     provenance = require_clean_checkout()
     started = time.monotonic()
 
+    if challenge.selection_sha256 != CHALLENGE_SELECTION_SHA256:
+        raise P1ExecutionError(
+            "Stage P1-1 requires the frozen validation challenge selection."
+        )
     results: dict[str, Any] = {}
     for arm in P1_ARM_ORDER:
         uses_physiology = arm == P1B_EXPERIMENT_ID
-        challenge_payload = None
-        if challenge is not None:
-            challenge_payload = dict(challenge)
-            challenge_payload["physiology"] = (
-                challenge.get("physiology") if uses_physiology else None
-            )
         results[arm] = run_p1_arm(
             arm,
             run_root=run_root,
             train_cache=train_cache,
             validation_cache=validation_cache,
             transform=transform if uses_physiology else None,
+            challenge=challenge,
             train_physiology=train_physiology if uses_physiology else None,
             validation_physiology=(
                 validation_physiology if uses_physiology else None
             ),
-            challenge=challenge_payload,
             command=command,
         )
 
@@ -953,6 +1222,8 @@ def run_p1_stage1_suite(
         "encoder_checkpoint_sha256": B4B_CHECKPOINT_SHA256,
         "encoder_fine_tuned": False,
         "physiology_transform_sha256": transform.as_dict()["transform_sha256"],
+        "challenge_selection_sha256": challenge.selection_sha256,
+        "challenge_population": challenge.counts,
         "train_embedding_cache_sha256": train_cache.manifest["cache_sha256"],
         "validation_embedding_cache_sha256": validation_cache.manifest["cache_sha256"],
         "git_sha": provenance["git_sha"],
@@ -971,19 +1242,183 @@ def run_p1_stage1_suite(
     return suite
 
 
-def p1_preflight(run_root: Path, cache_root: Path) -> dict[str, Any]:
-    """Read-only Stage P1-1 readiness report. Creates nothing."""
+def execute_p1_stage1(
+    *,
+    run_root: Path,
+    cache_root: Path,
+    feature_root: Path,
+    b4b_run_dir: Path,
+    command: str = "cardiosentinel p1 run-stage1",
+) -> dict[str, Any]:
+    """Assemble every canonical input and run Stage P1-1.
+
+    This is the single official orchestration the CLI invokes: it validates the
+    caches, fits the train-only physiology transform, builds the stable-ID bound
+    physiology, rebuilds the frozen challenge population, and runs both arms.
+    No manual Python assembly step exists for the scientific run.
+    """
     validate_p1_protocol()
+    require_p1_runtime()
+    require_clean_checkout()
+    load_official_b4b_encoder(Path(b4b_run_dir))
+
+    train_cache = load_p1_embedding_cache(Path(cache_root), "train")
+    validation_cache = load_p1_embedding_cache(Path(cache_root), "validation")
+    raw_train = read_frozen_physiology(Path(feature_root), "train")
+    raw_validation = read_frozen_physiology(Path(feature_root), "validation")
+
+    transform = fit_physiology_transform(
+        np.stack([raw_train[key] for key in train_cache.stable_ids]),
+        partition="train",
+        training_selection_sha256=TRAINING_SELECTION_SHA256,
+    )
+    train_physiology = build_physiology_bundle(
+        partition="train",
+        stable_ids=train_cache.stable_ids,
+        raw_by_stable_id=raw_train,
+        transform=transform,
+    )
+    validation_physiology = build_physiology_bundle(
+        partition="validation",
+        stable_ids=validation_cache.stable_ids,
+        raw_by_stable_id=raw_validation,
+        transform=transform,
+    )
+    challenge = prepare_p1_challenge_set(
+        Path(feature_root),
+        embeddings_by_stable_id=dict(
+            zip(validation_cache.stable_ids, validation_cache.embeddings)
+        ),
+        raw_physiology_by_stable_id=raw_validation,
+        transform=transform,
+    )
+    return run_p1_stage1_suite(
+        run_root=Path(run_root),
+        train_cache=train_cache,
+        validation_cache=validation_cache,
+        transform=transform,
+        train_physiology=train_physiology,
+        validation_physiology=validation_physiology,
+        challenge=challenge,
+        command=command,
+    )
+
+
+def read_frozen_physiology(
+    feature_root: Path, partition: str
+) -> dict[str, np.ndarray]:
+    """Read frozen morphology_v1 rows by stable ID for one development partition."""
+    evaluated = require_p1_partition(partition)
+    columns = morphology_columns()
+    values: dict[str, np.ndarray] = {}
+    for path in sorted((Path(feature_root) / evaluated).glob("*.npz")):
+        with np.load(path, allow_pickle=False) as archive:
+            identifiers = archive["stable_ids"]
+            features = archive["features"][:, columns]
+            for index, key in enumerate(identifiers.tolist()):
+                values[str(key)] = np.asarray(features[index], dtype=np.float64)
+    if not values:
+        raise P1ExecutionError(
+            f"No frozen morphology_v1 rows found for {evaluated}."
+        )
+    return values
+
+
+def p1_preflight(
+    run_root: Path,
+    cache_root: Path,
+    *,
+    b4b_run_dir: Path | None = None,
+    feature_root: Path | None = None,
+) -> dict[str, Any]:
+    """Read-only Stage P1-1 readiness gate. Creates nothing.
+
+    This is a real gate: it reports `ready_for_canonical_p1_stage1` only when
+    both canonical embedding caches exist AND fully validate. Absent caches are
+    reported as requiring materialization, never as directly runnable.
+    """
+    validate_p1_protocol()
+    validate_physiology_schema(PHYSIOLOGY_FEATURE_NAMES)
     environment, dependency_digest = require_p1_runtime()
     provenance = require_clean_checkout()
-    claimed = {
-        arm: (Path(run_root) / arm).exists() for arm in P1_ARM_ORDER
-    }
-    caches = {
-        partition: (Path(cache_root) / partition / CACHE_MANIFEST_NAME).exists()
-        for partition in ("train", "validation")
-    }
+
+    claimed = {arm: (Path(run_root) / arm).exists() for arm in P1_ARM_ORDER}
+    caches: dict[str, Any] = {}
+    for partition in ("train", "validation"):
+        present = (Path(cache_root) / partition / CACHE_MANIFEST_NAME).exists()
+        entry: dict[str, Any] = {"present": present, "validated": False}
+        if present:
+            try:
+                cache = load_p1_embedding_cache(Path(cache_root), partition)
+                entry["validated"] = True
+                entry["population"] = cache.manifest["population"]
+                entry["cache_sha256"] = cache.manifest["cache_sha256"]
+            except Exception as error:  # surfaced, never silently ignored
+                entry["error"] = f"{type(error).__name__}: {error}"
+        caches[partition] = entry
+
+    encoder_state: dict[str, Any] = {"validated": False}
+    if b4b_run_dir is not None:
+        try:
+            lock = validate_locked_model(Path(b4b_run_dir), official_model="B4-B")
+            encoder_state = {
+                "validated": True,
+                "experiment_lock_sha256": lock["experiment_lock_sha256"],
+                "checkpoint_sha256": lock["checkpoint_sha256"],
+                "test": lock["test"],
+                "matches_selected_encoder": (
+                    lock["experiment_lock_sha256"] == B4B_EXPERIMENT_LOCK_SHA256
+                    and lock["checkpoint_sha256"] == B4B_CHECKPOINT_SHA256
+                    and lock["test"] is None
+                ),
+            }
+        except Exception as error:
+            encoder_state = {
+                "validated": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+
+    challenge_state: dict[str, Any] = {"validated": False}
+    if feature_root is not None:
+        try:
+            index = build_validation_challenge_index(Path(feature_root))
+            challenge_state = {
+                "validated": index.selection_sha256 == CHALLENGE_SELECTION_SHA256,
+                "selection_sha256": index.selection_sha256,
+                "counts": index.counts,
+            }
+        except Exception as error:
+            challenge_state = {
+                "validated": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+
+    test_artifacts = sorted(
+        path.name
+        for path in Path(REPOSITORY_ROOT).glob("cardiosentinel-runs/**/TEST_*")
+    )
+    caches_ready = all(entry["validated"] for entry in caches.values())
+    encoder_ready = bool(encoder_state.get("matches_selected_encoder"))
+    challenge_ready = bool(challenge_state.get("validated"))
+
+    if any(claimed.values()):
+        status = "attempt_already_claimed"
+    elif test_artifacts:
+        status = "test_artifact_present_human_review_required"
+    elif not caches_ready:
+        status = "embedding_cache_materialization_required"
+    elif b4b_run_dir is not None and not encoder_ready:
+        status = "selected_encoder_not_verified"
+    elif feature_root is not None and not challenge_ready:
+        status = "challenge_population_not_verified"
+    else:
+        status = "ready_for_canonical_p1_stage1"
+
     report = {
+        "selected_encoder": encoder_state,
+        "challenge_population": challenge_state,
+        "test_artifacts_present": test_artifacts,
+        "embedding_caches_ready": caches_ready,
         "command": "cardiosentinel p1 preflight",
         "p1_protocol_sha256": P1_PROTOCOL_SHA256,
         "b4_protocol_sha256": B4_PROTOCOL_SHA256,
@@ -998,16 +1433,12 @@ def p1_preflight(run_root: Path, cache_root: Path) -> dict[str, Any]:
         "runtime_environment": environment,
         "arm_order": list(P1_ARM_ORDER),
         "canonical_arm_claimed": claimed,
-        "embedding_cache_present": caches,
+        "embedding_cache": caches,
         "partitions_permitted": ["train", "validation"],
         "test_partition_access": None,
         "models_constructed": 0,
         "artifacts_created": 0,
-        "status": (
-            "ready_for_canonical_p1_stage1"
-            if not any(claimed.values())
-            else "attempt_already_claimed"
-        ),
+        "status": status,
     }
     report["preflight_sha256"] = canonical_sha256(report)
     return report
@@ -1015,6 +1446,14 @@ def p1_preflight(run_root: Path, cache_root: Path) -> dict[str, Any]:
 
 __all__ = [
     "CACHE_MANIFEST_NAME",
+    "P1ChallengeSet",
+    "P1PhysiologyBundle",
+    "build_physiology_bundle",
+    "load_official_b4b_encoder",
+    "execute_p1_stage1",
+    "prepare_p1_challenge_set",
+    "read_frozen_physiology",
+    "require_aligned_physiology",
     "CHALLENGE_SELECTION_SHA256",
     "EXPECTED_POPULATIONS",
     "P1EmbeddingCache",

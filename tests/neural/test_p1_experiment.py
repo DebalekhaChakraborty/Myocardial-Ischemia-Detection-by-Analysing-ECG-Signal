@@ -121,22 +121,59 @@ def caches(tmp_path):
     )
 
 
+def _raw_physiology(stable_ids, seed):
+    rng = np.random.default_rng(seed)
+    valid = p1.PHYSIOLOGY_FEATURE_NAMES.index("morphology_valid")
+    rows = {}
+    for index, key in enumerate(stable_ids):
+        row = rng.normal(size=p1.PHYSIOLOGY_DIM) + 5.0
+        row[valid] = 1.0
+        if index == 0:
+            row[3] = np.nan  # exercise imputation on the real path
+        rows[str(key)] = row
+    return rows
+
+
 @pytest.fixture
 def physiology(caches):
     train, validation = caches
-    rng = np.random.default_rng(11)
-    raw_train = rng.normal(size=(train.embeddings.shape[0], p1.PHYSIOLOGY_DIM)) + 5.0
-    raw_train[:, p1.PHYSIOLOGY_FEATURE_NAMES.index("morphology_valid")] = 1.0
-    raw_train[0, 3] = np.nan  # exercise imputation on the real path
-    transform = p1.fit_physiology_transform(raw_train)
-    raw_validation = (
-        rng.normal(size=(validation.embeddings.shape[0], p1.PHYSIOLOGY_DIM)) + 5.0
+    raw_train = _raw_physiology(train.stable_ids, 11)
+    raw_validation = _raw_physiology(validation.stable_ids, 12)
+    transform = p1.fit_physiology_transform(
+        np.stack([raw_train[k] for k in train.stable_ids])
     )
-    raw_validation[:, p1.PHYSIOLOGY_FEATURE_NAMES.index("morphology_valid")] = 1.0
-    return (
-        transform,
-        transform.transform(raw_train),
-        transform.transform(raw_validation),
+    train_bundle = p1x.build_physiology_bundle(
+        partition="train",
+        stable_ids=train.stable_ids,
+        raw_by_stable_id=raw_train,
+        transform=transform,
+    )
+    validation_bundle = p1x.build_physiology_bundle(
+        partition="validation",
+        stable_ids=validation.stable_ids,
+        raw_by_stable_id=raw_validation,
+        transform=transform,
+    )
+    return transform, train_bundle, validation_bundle
+
+
+@pytest.fixture
+def challenge_set(caches, physiology):
+    """A synthetic stand-in carrying the frozen selection identity."""
+    _, validation = caches
+    transform, _, validation_bundle = physiology
+    return p1x.P1ChallengeSet(
+        stable_ids=validation.stable_ids,
+        target_families=tuple(
+            ["rate_related_confounder"] * 30
+            + ["axis_shift_confounder"] * 20
+            + ["conduction_change_confounder"] * 14
+        ),
+        subject_ids=validation.subject_ids,
+        embeddings=validation.embeddings,
+        physiology=validation_bundle,
+        selection_sha256=p1x.CHALLENGE_SELECTION_SHA256,
+        counts={"rate_related_confounder": {"windows": 30, "subjects": 3}},
     )
 
 
@@ -251,8 +288,9 @@ def _materialize(tmp_path, monkeypatch, rows=ROWS_TRAIN):
     stable_ids, subject_ids, labels, _ = _population(rows, 32, 4, 5)
     batches = [torch.zeros(rows, 1, 2500)]
     monkeypatch.setattr(p1x, "validate_p1_protocol", lambda *a, **k: "p")
+    monkeypatch.setattr(p1x, "load_official_b4b_encoder", lambda d: _StubEncoder())
     return p1x.materialize_p1_embedding_cache(
-        _StubEncoder(),
+        tmp_path / "b4b",
         batches,
         partition="train",
         stable_ids=stable_ids,
@@ -266,6 +304,7 @@ def test_materialized_cache_round_trips_and_revalidates(tmp_path, monkeypatch) -
     cache = _materialize(tmp_path, monkeypatch)
     assert cache.embeddings.shape == (ROWS_TRAIN, 128)
     monkeypatch.setattr(p1x, "P1_PROTOCOL_SHA256", cache.manifest["p1_protocol_sha256"])
+    monkeypatch.setattr(p1x, "FROZEN_DEPENDENCY_DIGEST", "digest-abc")
     reloaded = p1x.load_p1_embedding_cache(tmp_path / "cache", "train")
     assert reloaded.stable_ids == cache.stable_ids
     assert np.array_equal(reloaded.embeddings, cache.embeddings)
@@ -277,9 +316,20 @@ def test_existing_cache_is_refused_not_overwritten(tmp_path, monkeypatch) -> Non
         _materialize(tmp_path, monkeypatch)
 
 
+def test_partial_cache_directory_blocks_overwrite(tmp_path, monkeypatch) -> None:
+    """A crashed run leaves a directory with no manifest; it must still block."""
+    directory = tmp_path / "cache" / "train"
+    directory.mkdir(parents=True)
+    (directory / p1x.CACHE_ARRAY_NAME).write_bytes(b"partial")
+    with pytest.raises(p1x.P1ExecutionError, match="even if partial"):
+        _materialize(tmp_path, monkeypatch)
+    assert (directory / p1x.CACHE_ARRAY_NAME).read_bytes() == b"partial"
+
+
 def test_tampered_cache_artifact_is_refused(tmp_path, monkeypatch) -> None:
     cache = _materialize(tmp_path, monkeypatch)
     monkeypatch.setattr(p1x, "P1_PROTOCOL_SHA256", cache.manifest["p1_protocol_sha256"])
+    monkeypatch.setattr(p1x, "FROZEN_DEPENDENCY_DIGEST", "digest-abc")
     array = tmp_path / "cache" / "train" / p1x.CACHE_ARRAY_NAME
     with np.load(array, allow_pickle=False) as archive:
         columns = {k: archive[k] for k in archive.files}
@@ -292,6 +342,7 @@ def test_tampered_cache_artifact_is_refused(tmp_path, monkeypatch) -> None:
 def test_cache_manifest_tamper_is_refused(tmp_path, monkeypatch) -> None:
     cache = _materialize(tmp_path, monkeypatch)
     monkeypatch.setattr(p1x, "P1_PROTOCOL_SHA256", cache.manifest["p1_protocol_sha256"])
+    monkeypatch.setattr(p1x, "FROZEN_DEPENDENCY_DIGEST", "digest-abc")
     path = tmp_path / "cache" / "train" / p1x.CACHE_MANIFEST_NAME
     manifest = json.loads(path.read_text())
     manifest["rows"] = 999
@@ -390,7 +441,8 @@ def test_non_finite_state_aborts_without_repair(caches) -> None:
 
 def test_p1a_refuses_physiology_and_p1b_requires_it(caches, physiology) -> None:
     train, _ = caches
-    _, train_physiology, _ = physiology
+    _, train_bundle, _ = physiology
+    train_physiology = train_bundle.values
     with pytest.raises(p1x.P1ExecutionError, match="neural-only control"):
         p1x._features_for(p1.P1A_EXPERIMENT_ID, train.embeddings, train_physiology)
     with pytest.raises(p1x.P1ExecutionError, match="requires transformed physiology"):
@@ -468,23 +520,24 @@ def test_challenge_evidence_uses_frozen_policy() -> None:
 # --------------------------------------------------------------------------
 
 
-def _run_suite(tmp_path, caches, physiology):
+def _run_suite(tmp_path, caches, physiology, challenge_set):
     train, validation = caches
-    transform, train_physiology, validation_physiology = physiology
+    transform, train_bundle, validation_bundle = physiology
     return p1x.run_p1_stage1_suite(
         run_root=tmp_path / "runs",
         train_cache=train,
         validation_cache=validation,
         transform=transform,
-        train_physiology=train_physiology,
-        validation_physiology=validation_physiology,
+        train_physiology=train_bundle,
+        validation_physiology=validation_bundle,
+        challenge=challenge_set,
     )
 
 
 def test_stage1_suite_runs_both_arms_and_locks_them(
-    tmp_path, caches, physiology
+    tmp_path, caches, physiology, challenge_set
 ) -> None:
-    suite = _run_suite(tmp_path, caches, physiology)
+    suite = _run_suite(tmp_path, caches, physiology, challenge_set)
     assert suite["arm_order"] == [p1.P1A_EXPERIMENT_ID, p1.P1B_EXPERIMENT_ID]
     assert set(suite["arm_results"]) == set(p1x.P1_ARM_ORDER)
     assert suite["physiology_retained"] is None
@@ -507,8 +560,10 @@ def test_stage1_suite_runs_both_arms_and_locks_them(
             assert (directory / name).exists(), f"{arm} missing {name}"
 
 
-def test_locks_validate_and_bind_provenance(tmp_path, caches, physiology) -> None:
-    _run_suite(tmp_path, caches, physiology)
+def test_locks_validate_and_bind_provenance(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
     for arm in p1x.P1_ARM_ORDER:
         lock = p1x.validate_p1_lock(tmp_path / "runs" / arm)
         assert lock["experiment_id"] == arm
@@ -524,8 +579,8 @@ def test_locks_validate_and_bind_provenance(tmp_path, caches, physiology) -> Non
             assert lock["head"]["input_dim"] == 128
 
 
-def test_tampered_lock_is_refused(tmp_path, caches, physiology) -> None:
-    _run_suite(tmp_path, caches, physiology)
+def test_tampered_lock_is_refused(tmp_path, caches, physiology, challenge_set) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
     path = tmp_path / "runs" / p1.P1A_EXPERIMENT_ID / p1x.EXPERIMENT_LOCK_NAME
     lock = json.loads(path.read_text())
     lock["selected_validation_auprc"] = 0.99
@@ -534,33 +589,43 @@ def test_tampered_lock_is_refused(tmp_path, caches, physiology) -> None:
         p1x.validate_p1_lock(tmp_path / "runs" / p1.P1A_EXPERIMENT_ID)
 
 
-def test_tampered_head_checkpoint_is_refused(tmp_path, caches, physiology) -> None:
-    _run_suite(tmp_path, caches, physiology)
+def test_tampered_head_checkpoint_is_refused(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
     directory = tmp_path / "runs" / p1.P1B_EXPERIMENT_ID
     (directory / p1x.SELECTED_MODEL_NAME).write_bytes(b"corrupt")
     with pytest.raises(p1x.P1ExecutionError, match="failed hash validation"):
         p1x.validate_p1_lock(directory)
 
 
-def test_claimed_arm_cannot_be_rerun(tmp_path, caches, physiology) -> None:
-    _run_suite(tmp_path, caches, physiology)
+def test_claimed_arm_cannot_be_rerun(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
     with pytest.raises(p1.PhysiologyFusionError, match="already been claimed"):
-        _run_suite(tmp_path, caches, physiology)
+        _run_suite(tmp_path, caches, physiology, challenge_set)
 
 
-def test_post_claim_failure_writes_failed_receipt(tmp_path, caches, physiology) -> None:
+def test_post_claim_failure_writes_failed_receipt(
+    tmp_path,
+    caches,
+    physiology,
+    challenge_set,
+) -> None:
     train, validation = caches
-    transform, train_physiology, _ = physiology
-    # Misaligned validation physiology fails after the claim exists.
-    with pytest.raises(p1x.P1ExecutionError):
+    transform, train_bundle, _ = physiology
+    # Train physiology supplied for validation: refused after the claim exists.
+    with pytest.raises(p1x.P1ExecutionError, match="Physiology bundle is for"):
         p1x.run_p1_arm(
             p1.P1B_EXPERIMENT_ID,
             run_root=tmp_path / "runs",
             train_cache=train,
             validation_cache=validation,
             transform=transform,
-            train_physiology=train_physiology,
-            validation_physiology=train_physiology,
+            challenge=challenge_set,
+            train_physiology=train_bundle,
+            validation_physiology=train_bundle,
         )
     directory = tmp_path / "runs" / p1.P1B_EXPERIMENT_ID
     status = json.loads((directory / "RUN_STATUS.json").read_text())
@@ -585,7 +650,10 @@ def test_suite_exposes_no_single_arm_or_retry_route() -> None:
 
 def test_preflight_is_read_only(tmp_path) -> None:
     report = p1x.p1_preflight(tmp_path / "runs", tmp_path / "cache")
-    assert report["status"] == "ready_for_canonical_p1_stage1"
+    # A real gate: absent caches must NOT be reported as directly runnable.
+    assert report["status"] == "embedding_cache_materialization_required"
+    assert report["embedding_caches_ready"] is False
+    assert report["embedding_cache"]["train"]["present"] is False
     assert report["models_constructed"] == 0
     assert report["artifacts_created"] == 0
     assert report["test_partition_access"] is None
@@ -594,8 +662,10 @@ def test_preflight_is_read_only(tmp_path) -> None:
     assert not (tmp_path / "cache").exists()
 
 
-def test_preflight_reports_a_claimed_attempt(tmp_path, caches, physiology) -> None:
-    _run_suite(tmp_path, caches, physiology)
+def test_preflight_reports_a_claimed_attempt(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
     report = p1x.p1_preflight(tmp_path / "runs", tmp_path / "cache")
     assert report["status"] == "attempt_already_claimed"
     assert all(report["canonical_arm_claimed"].values())
@@ -623,3 +693,160 @@ def test_official_module_never_names_sealed_test_machinery() -> None:
         "neural.sealed_test",
     ):
         assert forbidden not in source
+
+
+# --------------------------------------------------------------------------
+# Re-review blockers: binding, identity and checkpoint/patience separation
+# --------------------------------------------------------------------------
+
+
+def test_permuted_physiology_is_refused(caches, physiology) -> None:
+    """A row permutation must be detected, not silently misaligned."""
+    train, _ = caches
+    _, train_bundle, _ = physiology
+    permuted = p1x.P1PhysiologyBundle(
+        partition="train",
+        stable_ids=tuple(reversed(train_bundle.stable_ids)),
+        values=train_bundle.values,
+        schema_sha256=train_bundle.schema_sha256,
+        transform_sha256=train_bundle.transform_sha256,
+    )
+    with pytest.raises(p1x.P1ExecutionError, match="exact row order"):
+        p1x.require_aligned_physiology(permuted, train.stable_ids, "train")
+    assert p1x.require_aligned_physiology(
+        train_bundle, train.stable_ids, "train"
+    ) is train_bundle.values
+
+
+def test_physiology_join_refuses_missing_rows(caches, physiology) -> None:
+    train, _ = caches
+    transform, _, _ = physiology
+    raw = _raw_physiology(train.stable_ids, 3)
+    raw.pop(train.stable_ids[0])
+    with pytest.raises(p1x.P1ExecutionError, match="no morphology_v1 record"):
+        p1x.build_physiology_bundle(
+            partition="train",
+            stable_ids=train.stable_ids,
+            raw_by_stable_id=raw,
+            transform=transform,
+        )
+
+
+def test_wrong_challenge_selection_is_refused(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    forged = p1x.P1ChallengeSet(
+        stable_ids=challenge_set.stable_ids,
+        target_families=challenge_set.target_families,
+        subject_ids=challenge_set.subject_ids,
+        embeddings=challenge_set.embeddings,
+        physiology=challenge_set.physiology,
+        selection_sha256="0" * 64,
+        counts=challenge_set.counts,
+    )
+    train, validation = caches
+    transform, train_bundle, validation_bundle = physiology
+    with pytest.raises(p1x.P1ExecutionError, match="frozen validation challenge"):
+        p1x.run_p1_stage1_suite(
+            run_root=tmp_path / "runs",
+            train_cache=train,
+            validation_cache=validation,
+            transform=transform,
+            train_physiology=train_bundle,
+            validation_physiology=validation_bundle,
+            challenge=forged,
+        )
+
+
+def test_challenge_cannot_be_omitted_from_the_suite() -> None:
+    parameters = inspect.signature(p1x.run_p1_stage1_suite).parameters
+    assert parameters["challenge"].default is inspect.Parameter.empty
+    assert parameters["challenge"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_unlocked_encoder_cannot_be_stamped_as_official(tmp_path) -> None:
+    """An arbitrary directory is not the canonical B4-B run."""
+    (tmp_path / "b4b").mkdir()
+    with pytest.raises(Exception):
+        p1x.load_official_b4b_encoder(tmp_path / "b4b")
+    source = inspect.getsource(p1x.materialize_p1_embedding_cache)
+    assert "load_official_b4b_encoder" in source
+
+
+def test_checkpoint_saves_below_the_patience_delta() -> None:
+    """A 5e-7 gain selects a new checkpoint but must NOT reset patience.
+
+    Conflating checkpoint selection with the early-stopping delta was a real
+    defect in the previous head; this pins the reviewed B4 separation.
+    """
+    from cardiosentinel.neural.training import CheckpointTracker
+
+    tracker = CheckpointTracker()
+    first = tracker.update(1, 0.500000)
+    assert first.save_checkpoint is True and first.patience == 0
+    second = tracker.update(2, 0.500000 + 5e-7)
+    assert second.save_checkpoint is True, "a numerical maximum must be saved"
+    assert second.patience == 1, "a sub-delta gain must not reset patience"
+    assert tracker.best_epoch == 2
+    third = tracker.update(3, 0.400000)
+    assert third.save_checkpoint is False and third.patience == 2
+
+
+def test_official_stage1_orchestration_exists_without_manual_assembly() -> None:
+    import cardiosentinel.neural.cli as neural_cli
+
+    source = inspect.getsource(neural_cli.run_p1_command)
+    assert "execute_p1_stage1" in source
+    assert "SystemExit" not in source
+    parameters = inspect.signature(p1x.execute_p1_stage1).parameters
+    assert set(parameters) == {
+        "run_root",
+        "cache_root",
+        "feature_root",
+        "b4b_run_dir",
+        "command",
+    }
+    for forbidden in ("arm", "only", "force", "retry", "overwrite"):
+        assert forbidden not in parameters
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        "VALIDATION_METRICS.json",
+        "CHALLENGE_METRICS.json",
+        "EPOCH_HISTORY.json",
+        "PHYSIOLOGY_TRANSFORM.json",
+    ],
+)
+def test_tampering_any_claim_bearing_artifact_is_refused(
+    tmp_path, caches, physiology, challenge_set, artifact
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
+    directory = tmp_path / "runs" / p1.P1B_EXPERIMENT_ID
+    payload = json.loads((directory / artifact).read_text())
+    payload["tampered"] = True
+    (directory / artifact).write_text(json.dumps(payload))
+    with pytest.raises(p1x.P1ExecutionError, match="failed hash validation"):
+        p1x.validate_p1_lock(directory)
+
+
+def test_cache_load_refuses_altered_subject_assignment(tmp_path, monkeypatch) -> None:
+    cache = _materialize(tmp_path, monkeypatch)
+    monkeypatch.setattr(p1x, "P1_PROTOCOL_SHA256", cache.manifest["p1_protocol_sha256"])
+    monkeypatch.setattr(p1x, "FROZEN_DEPENDENCY_DIGEST", "digest-abc")
+    array = tmp_path / "cache" / "train" / p1x.CACHE_ARRAY_NAME
+    with np.load(array, allow_pickle=False) as archive:
+        columns = {k: archive[k] for k in archive.files}
+    columns["subject_id"] = np.asarray(
+        ["sX"] * len(columns["subject_id"]), dtype=np.str_
+    )
+    np.savez_compressed(array, **columns)
+    manifest_path = tmp_path / "cache" / "train" / p1x.CACHE_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifact_sha256"] = p1x.sha256_file(array)
+    manifest.pop("cache_sha256")
+    manifest["cache_sha256"] = canonical_sha256(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(p1x.P1ExecutionError, match="subject assignment"):
+        p1x.load_p1_embedding_cache(tmp_path / "cache", "train")

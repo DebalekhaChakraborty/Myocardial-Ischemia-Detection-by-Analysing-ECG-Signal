@@ -426,18 +426,25 @@ def add_p1_parser(subparsers: argparse._SubParsersAction) -> None:
         parser.add_argument("--cache-root", type=Path, default=DEFAULT_P1_CACHE_ROOT)
         parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
         parser.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
+        parser.add_argument("--b4b-run", type=Path, default=DEFAULT_B4B_RUN_DIR)
 
 
 def run_p1_command(args: argparse.Namespace) -> int:
-    from cardiosentinel.neural.p1_experiment import p1_preflight
+    from cardiosentinel.neural.p1_experiment import execute_p1_stage1, p1_preflight
 
     if args.p1_command == "preflight":
-        report = p1_preflight(args.run_root, args.cache_root)
+        report = p1_preflight(
+            args.run_root,
+            args.cache_root,
+            b4b_run_dir=args.b4b_run,
+            feature_root=args.feature_root,
+        )
     else:
-        raise SystemExit(
-            "cardiosentinel p1 run-stage1 requires the reviewed canonical "
-            "embedding caches and physiology transform; it is invoked from the "
-            "authorized scientific runner, not ad hoc."
+        report = execute_p1_stage1(
+            run_root=args.run_root,
+            cache_root=args.cache_root,
+            feature_root=args.feature_root,
+            b4b_run_dir=args.b4b_run,
         )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0
