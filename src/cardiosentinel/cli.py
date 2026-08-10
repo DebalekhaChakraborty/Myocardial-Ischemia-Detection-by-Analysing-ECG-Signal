@@ -18,7 +18,12 @@ from cardiosentinel.data.manifest import (
     write_manifest,
 )
 from cardiosentinel.data.remote import probe_remote, validate_remote_dataset
-from cardiosentinel.neural.cli import add_b4_parser, run_b4_command
+from cardiosentinel.neural.cli import (
+    add_b4_parser,
+    add_p1_parser,
+    run_b4_command,
+    run_p1_command,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
     info_parser.add_argument("--split", type=Path, required=True)
     add_baseline_parser(subparsers)
     add_b4_parser(subparsers)
+    add_p1_parser(subparsers)
     return parser
 
 
@@ -297,6 +303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "b4":
         return run_b4_command(args)
+    if args.command == "p1":
+        return run_p1_command(args)
 
     parser.print_help()
     return 0
