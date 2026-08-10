@@ -434,6 +434,74 @@ def add_p1_parser(subparsers: argparse._SubParsersAction) -> None:
         )
 
 
+DEFAULT_M1_RUN_ROOT = Path("cardiosentinel-runs/phase5-m1-dual-memory-v1")
+DEFAULT_M1_STREAM_CACHE_ROOT = Path("cardiosentinel-features/m1-stream-memory-v1")
+
+
+def add_m1_parser(subparsers: argparse._SubParsersAction) -> None:
+    """Register the M1 dual-memory development commands.
+
+    Only two official routes exist: a read-only preflight, and the Stage M1-1
+    suite that runs ALL THREE arms in the frozen order. There is deliberately
+    no single-arm route and no force/retry/overwrite/reseed option.
+    """
+    m1 = subparsers.add_parser(
+        "m1", help="Phase 5 M1 causal dual-memory development commands."
+    )
+    commands = m1.add_subparsers(dest="m1_command", required=True)
+    for name, description in (
+        (
+            "preflight",
+            "Read-only M1 Stage-1 readiness report. Creates no model and no "
+            "artifact, and does not access the test partition.",
+        ),
+        (
+            "run-stage1",
+            "Runs the one canonical M1S/M1L/M1D Stage-1 suite against the "
+            "frozen P1-B global control. All three arms are mandatory. Does "
+            "not access the test partition.",
+        ),
+    ):
+        parser = commands.add_parser(name, help=description)
+        parser.add_argument("--run-root", type=Path, default=DEFAULT_M1_RUN_ROOT)
+        parser.add_argument(
+            "--stream-cache-root",
+            type=Path,
+            default=DEFAULT_M1_STREAM_CACHE_ROOT,
+        )
+        parser.add_argument("--p1-run-root", type=Path, default=DEFAULT_P1_RUN_ROOT)
+        parser.add_argument("--cache-root", type=Path, default=DEFAULT_P1_CACHE_ROOT)
+        parser.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
+        parser.add_argument("--feature-root", type=Path, default=DEFAULT_FEATURE_ROOT)
+        parser.add_argument("--b4b-run", type=Path, default=DEFAULT_B4B_RUN_DIR)
+
+
+def run_m1_command(args: argparse.Namespace) -> int:
+    from cardiosentinel.neural.m1_experiment import execute_m1_stage1, m1_preflight
+
+    if args.m1_command == "preflight":
+        report = m1_preflight(
+            args.run_root,
+            args.stream_cache_root,
+            p1_run_root=args.p1_run_root,
+            b4b_run_dir=args.b4b_run,
+            feature_root=args.feature_root,
+            source=args.source,
+        )
+    else:
+        report = execute_m1_stage1(
+            run_root=args.run_root,
+            stream_cache_root=args.stream_cache_root,
+            cache_root=args.cache_root,
+            feature_root=args.feature_root,
+            source=args.source,
+            b4b_run_dir=args.b4b_run,
+            p1_run_root=args.p1_run_root,
+        )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 def run_p1_command(args: argparse.Namespace) -> int:
     from cardiosentinel.neural.p1_experiment import execute_p1_stage1, p1_preflight
 
