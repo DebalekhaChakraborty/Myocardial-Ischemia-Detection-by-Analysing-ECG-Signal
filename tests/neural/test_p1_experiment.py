@@ -520,6 +520,16 @@ def test_challenge_evidence_uses_frozen_policy() -> None:
 # --------------------------------------------------------------------------
 
 
+def _challenge_provenance():
+    return {
+        "ordered_stable_id_sha256": "o" * 64,
+        "embedding_content_sha256": "c" * 64,
+        "encoder_receipt": {"encoder_state_unchanged": True},
+        "waveform_reads": 24,
+        "source": "dedicated_validation_challenge_locked_encoder_path",
+    }
+
+
 def _run_suite(tmp_path, caches, physiology, challenge_set):
     train, validation = caches
     transform, train_bundle, validation_bundle = physiology
@@ -531,6 +541,9 @@ def _run_suite(tmp_path, caches, physiology, challenge_set):
         train_physiology=train_bundle,
         validation_physiology=validation_bundle,
         challenge=challenge_set,
+        challenge_embedding_provenance=_challenge_provenance(),
+        development_feature_integrity_sha256="feat-sha",
+        development_source_integrity_sha256="src-sha",
     )
 
 
@@ -755,13 +768,22 @@ def test_wrong_challenge_selection_is_refused(
             train_physiology=train_bundle,
             validation_physiology=validation_bundle,
             challenge=forged,
+            challenge_embedding_provenance=_challenge_provenance(),
+            development_feature_integrity_sha256="feat-sha",
+            development_source_integrity_sha256="src-sha",
         )
 
 
 def test_challenge_cannot_be_omitted_from_the_suite() -> None:
     parameters = inspect.signature(p1x.run_p1_stage1_suite).parameters
-    assert parameters["challenge"].default is inspect.Parameter.empty
-    assert parameters["challenge"].kind is inspect.Parameter.KEYWORD_ONLY
+    for name in (
+        "challenge",
+        "challenge_embedding_provenance",
+        "development_feature_integrity_sha256",
+        "development_source_integrity_sha256",
+    ):
+        assert parameters[name].default is inspect.Parameter.empty
+        assert parameters[name].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_unlocked_encoder_cannot_be_stamped_as_official(tmp_path) -> None:
@@ -984,6 +1006,9 @@ def test_both_arms_receive_the_same_challenge_embeddings(
         train_physiology=train_bundle,
         validation_physiology=validation_bundle,
         challenge=challenge,
+        challenge_embedding_provenance=_challenge_provenance(),
+        development_feature_integrity_sha256="feat-sha",
+        development_source_integrity_sha256="src-sha",
     )
     assert set(suite["arm_results"]) == set(p1x.P1_ARM_ORDER)
     for arm in p1x.P1_ARM_ORDER:
@@ -1076,3 +1101,118 @@ def test_partial_cache_stops_stage1_before_any_claim(tmp_path, monkeypatch) -> N
             waveform_cache_root=Path("unused"),
         )
     assert not (tmp_path / "runs").exists()
+
+
+# --------------------------------------------------------------------------
+# Stage-1 finalization: provenance must precede the digest and the write
+# --------------------------------------------------------------------------
+
+
+def test_persisted_stage1_equals_returned_object(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    suite = _run_suite(tmp_path, caches, physiology, challenge_set)
+    persisted = json.loads((tmp_path / "runs" / p1x.STAGE1_RESULTS_NAME).read_text())
+    assert persisted == suite
+
+
+def test_stage1_digest_re_derives_from_the_complete_object(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
+    persisted = json.loads((tmp_path / "runs" / p1x.STAGE1_RESULTS_NAME).read_text())
+    body = {k: v for k, v in persisted.items() if k != "p1_stage1_suite_sha256"}
+    assert canonical_sha256(body) == persisted["p1_stage1_suite_sha256"]
+
+
+def test_persisted_stage1_carries_final_provenance(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
+    persisted = json.loads((tmp_path / "runs" / p1x.STAGE1_RESULTS_NAME).read_text())
+    provenance = persisted["challenge_embedding_provenance"]
+    assert provenance["source"] == (
+        "dedicated_validation_challenge_locked_encoder_path"
+    )
+    for field in (
+        "ordered_stable_id_sha256",
+        "embedding_content_sha256",
+        "encoder_receipt",
+        "waveform_reads",
+    ):
+        assert field in provenance
+    assert persisted["development_feature_integrity_sha256"] == "feat-sha"
+    assert persisted["development_source_integrity_sha256"] == "src-sha"
+
+
+def test_suite_refuses_incomplete_challenge_provenance(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    train, validation = caches
+    transform, train_bundle, validation_bundle = physiology
+    broken = _challenge_provenance()
+    broken.pop("embedding_content_sha256")
+    with pytest.raises(p1x.P1ExecutionError, match="provenance is missing"):
+        p1x.run_p1_stage1_suite(
+            run_root=tmp_path / "runs",
+            train_cache=train,
+            validation_cache=validation,
+            transform=transform,
+            train_physiology=train_bundle,
+            validation_physiology=validation_bundle,
+            challenge=challenge_set,
+            challenge_embedding_provenance=broken,
+            development_feature_integrity_sha256="feat-sha",
+            development_source_integrity_sha256="src-sha",
+        )
+    assert not (tmp_path / "runs" / p1x.STAGE1_RESULTS_NAME).exists()
+
+
+def test_stage1_validator_accepts_a_complete_result(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
+    suite = p1x.validate_p1_stage1_results(tmp_path / "runs")
+    assert suite["arm_order"] == list(p1x.P1_ARM_ORDER)
+    assert suite["physiology_retained"] is None
+    assert suite["retention_decision_performed"] is False
+    assert suite["test_accessed"] is False
+    assert suite["sealed_test_state"] == "unopened"
+
+
+def test_tampered_challenge_provenance_fails_validation(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
+    path = tmp_path / "runs" / p1x.STAGE1_RESULTS_NAME
+    suite = json.loads(path.read_text())
+    suite["challenge_embedding_provenance"]["embedding_content_sha256"] = "0" * 64
+    path.write_text(json.dumps(suite))
+    with pytest.raises(p1x.P1ExecutionError, match="digest revalidation"):
+        p1x.validate_p1_stage1_results(tmp_path / "runs")
+
+
+def test_tampered_arm_lock_sha_fails_validation(
+    tmp_path, caches, physiology, challenge_set
+) -> None:
+    _run_suite(tmp_path, caches, physiology, challenge_set)
+    path = tmp_path / "runs" / p1x.STAGE1_RESULTS_NAME
+    suite = json.loads(path.read_text())
+    suite["arm_results"][p1.P1A_EXPERIMENT_ID]["experiment_lock_sha256"] = "0" * 64
+    suite.pop("p1_stage1_suite_sha256")
+    suite["p1_stage1_suite_sha256"] = canonical_sha256(suite)
+    path.write_text(json.dumps(suite))
+    with pytest.raises(p1x.P1ExecutionError, match="different .* experiment-lock"):
+        p1x.validate_p1_stage1_results(tmp_path / "runs")
+
+
+def test_no_post_digest_mutation_of_the_official_suite() -> None:
+    """The digest must be the last thing computed before the single write."""
+    suite_source = inspect.getsource(p1x.run_p1_stage1_suite)
+    assert suite_source.index("p1_stage1_suite_sha256") < suite_source.index(
+        "write_json_atomic"
+    )
+    execute_source = inspect.getsource(p1x.execute_p1_stage1)
+    # execute_p1_stage1 returns the suite directly; it never assigns into it.
+    assert "suite[" not in execute_source
+    assert "return run_p1_stage1_suite(" in execute_source

@@ -1190,9 +1190,18 @@ def run_p1_stage1_suite(
     train_physiology: P1PhysiologyBundle,
     validation_physiology: P1PhysiologyBundle,
     challenge: P1ChallengeSet,
+    challenge_embedding_provenance: dict[str, Any],
+    development_feature_integrity_sha256: str,
+    development_source_integrity_sha256: str,
     command: str = "cardiosentinel p1 run-stage1",
 ) -> dict[str, Any]:
     """Run the official Stage P1-1 ablation. BOTH arms are mandatory.
+
+    Final provenance is a **required argument**, not something a caller may
+    append afterwards: the complete payload is assembled first, digested once
+    and persisted once, so the official result can never be written without
+    challenge-embedding or development-integrity provenance, and the returned
+    object is byte-identical to the persisted one.
 
     There is deliberately no route that runs one arm alone and calls Stage P1-1
     complete, and no selective retry: a claimed arm is immutable.
@@ -1206,6 +1215,26 @@ def run_p1_stage1_suite(
         raise P1ExecutionError(
             "Stage P1-1 requires the frozen validation challenge selection."
         )
+    required_provenance = (
+        "ordered_stable_id_sha256",
+        "embedding_content_sha256",
+        "encoder_receipt",
+        "waveform_reads",
+        "source",
+    )
+    missing = [
+        field
+        for field in required_provenance
+        if field not in challenge_embedding_provenance
+    ]
+    if missing:
+        raise P1ExecutionError(
+            f"Challenge embedding provenance is missing {sorted(missing)}."
+        )
+    if not development_feature_integrity_sha256:
+        raise P1ExecutionError("Stage P1-1 requires the feature integrity digest.")
+    if not development_source_integrity_sha256:
+        raise P1ExecutionError("Stage P1-1 requires the source integrity digest.")
     results: dict[str, Any] = {}
     for arm in P1_ARM_ORDER:
         uses_physiology = arm == P1B_EXPERIMENT_ID
@@ -1242,6 +1271,9 @@ def run_p1_stage1_suite(
         "environment_dependency_digest": dependency_digest,
         "runtime_environment": environment,
         "arm_results": results,
+        "challenge_embedding_provenance": dict(challenge_embedding_provenance),
+        "development_feature_integrity_sha256": development_feature_integrity_sha256,
+        "development_source_integrity_sha256": development_source_integrity_sha256,
         "physiology_retained": None,
         "retention_decision_performed": False,
         "test_accessed": False,
@@ -1250,6 +1282,75 @@ def run_p1_stage1_suite(
     }
     suite["p1_stage1_suite_sha256"] = canonical_sha256(suite)
     write_json_atomic(Path(run_root) / STAGE1_RESULTS_NAME, suite)
+    return suite
+
+
+def validate_p1_stage1_results(run_root: Path) -> dict[str, Any]:
+    """Re-derive the Stage-1 digest and confirm every bound identity.
+
+    No scientific quantity is recomputed: this checks provenance only.
+    """
+    path = Path(run_root) / STAGE1_RESULTS_NAME
+    if not path.is_file():
+        raise P1ExecutionError(f"No Stage-1 result at {path}.")
+    suite = read_json(path)
+    recorded = suite.get("p1_stage1_suite_sha256")
+    body = {k: v for k, v in suite.items() if k != "p1_stage1_suite_sha256"}
+    if recorded is None or recorded != canonical_sha256(body):
+        raise P1ExecutionError("Stage-1 result failed digest revalidation.")
+    if suite.get("arm_order") != list(P1_ARM_ORDER):
+        raise P1ExecutionError("Stage-1 arm order is not P1-A then P1-B.")
+    results = suite.get("arm_results") or {}
+    if set(results) != set(P1_ARM_ORDER):
+        raise P1ExecutionError("Stage-1 result does not contain both arms.")
+    for arm in P1_ARM_ORDER:
+        lock = validate_p1_lock(Path(run_root) / arm)
+        if lock["experiment_lock_sha256"] != results[arm]["experiment_lock_sha256"]:
+            raise P1ExecutionError(
+                f"Stage-1 result records a different {arm} experiment-lock SHA."
+            )
+    for field, expected in (
+        ("p1_protocol_sha256", P1_PROTOCOL_SHA256),
+        ("b4_protocol_sha256", B4_PROTOCOL_SHA256),
+        ("encoder_checkpoint_sha256", B4B_CHECKPOINT_SHA256),
+        ("challenge_selection_sha256", CHALLENGE_SELECTION_SHA256),
+    ):
+        if suite.get(field) != expected:
+            raise P1ExecutionError(
+                f"Stage-1 result binds {field}={suite.get(field)!r}, expected "
+                f"{expected!r}."
+            )
+    if not suite.get("challenge_population"):
+        raise P1ExecutionError("Stage-1 result records no challenge population.")
+    for field in (
+        "train_embedding_cache_sha256",
+        "validation_embedding_cache_sha256",
+        "physiology_transform_sha256",
+        "development_feature_integrity_sha256",
+        "development_source_integrity_sha256",
+    ):
+        if not suite.get(field):
+            raise P1ExecutionError(f"Stage-1 result is missing {field}.")
+    provenance = suite.get("challenge_embedding_provenance") or {}
+    for field in (
+        "ordered_stable_id_sha256",
+        "embedding_content_sha256",
+        "encoder_receipt",
+        "waveform_reads",
+        "source",
+    ):
+        if field not in provenance:
+            raise P1ExecutionError(
+                f"Stage-1 challenge embedding provenance is missing {field}."
+            )
+    if suite.get("test_accessed") is not False:
+        raise P1ExecutionError("Stage-1 result claims test access.")
+    if suite.get("sealed_test_state") != "unopened":
+        raise P1ExecutionError("Stage-1 result does not record the test as unopened.")
+    if suite.get("physiology_retained") is not None:
+        raise P1ExecutionError("Stage-1 must not record a retention decision.")
+    if suite.get("retention_decision_performed") is not False:
+        raise P1ExecutionError("Stage-1 must not perform a retention decision.")
     return suite
 
 
@@ -1421,7 +1522,7 @@ def execute_p1_stage1(
         raw_physiology_by_stable_id=raw_validation,
         transform=transform,
     )
-    suite = run_p1_stage1_suite(
+    return run_p1_stage1_suite(
         run_root=Path(run_root),
         train_cache=train_cache,
         validation_cache=validation_cache,
@@ -1429,22 +1530,25 @@ def execute_p1_stage1(
         train_physiology=train_physiology,
         validation_physiology=validation_physiology,
         challenge=challenge,
+        challenge_embedding_provenance={
+            "ordered_stable_id_sha256": challenge_embeddings[
+                "ordered_stable_id_sha256"
+            ],
+            "embedding_content_sha256": challenge_embeddings[
+                "embedding_content_sha256"
+            ],
+            "encoder_receipt": challenge_embeddings["encoder_receipt"],
+            "waveform_reads": challenge_embeddings["waveform_reads"],
+            "source": "dedicated_validation_challenge_locked_encoder_path",
+        },
+        development_feature_integrity_sha256=feature_receipt[
+            "development_feature_integrity_sha256"
+        ],
+        development_source_integrity_sha256=source_receipt[
+            "development_source_integrity_sha256"
+        ],
         command=command,
     )
-    suite["challenge_embedding_provenance"] = {
-        "ordered_stable_id_sha256": challenge_embeddings["ordered_stable_id_sha256"],
-        "embedding_content_sha256": challenge_embeddings["embedding_content_sha256"],
-        "encoder_receipt": challenge_embeddings["encoder_receipt"],
-        "waveform_reads": challenge_embeddings["waveform_reads"],
-        "source": "dedicated_validation_challenge_locked_encoder_path",
-    }
-    suite["development_feature_integrity_sha256"] = feature_receipt[
-        "development_feature_integrity_sha256"
-    ]
-    suite["development_source_integrity_sha256"] = source_receipt[
-        "development_source_integrity_sha256"
-    ]
-    return suite
 
 
 def read_frozen_physiology(
@@ -1647,4 +1751,5 @@ __all__ = [
     "select_p1_threshold",
     "train_p1_arm",
     "validate_p1_lock",
+    "validate_p1_stage1_results",
 ]
