@@ -39,6 +39,27 @@ from cardiosentinel.neural.integrity import (
     validate_development_feature_integrity,
     validate_development_source_integrity,
 )
+from cardiosentinel.neural.m1_store import (
+    CHANNEL_INDEX_FILE,
+    COLD_START_BIN_FILE,
+    D_LONG_FILE,
+    D_SHORT_FILE,
+    DEFAULT_CHUNK_ROWS,
+    DISAGREEMENT_FILE,
+    M1_STREAM_CACHE_SCHEMA,
+    PAST_OBSERVED_FILE,
+    PAST_UPDATE_FILE,
+    RECORD_ID_FILE,
+    RECORDING_AGE_FILE,
+    REPRESENTATION_FILE,
+    STABLE_ID_FILE,
+    START_SAMPLE_FILE,
+    M1RowStore,
+    M1StoreSpec,
+    StreamingContentDigest,
+    locate_rows,
+    streaming_ordered_stable_id_digest,
+)
 from cardiosentinel.neural.metadata import B4WindowReference, load_b4_references
 from cardiosentinel.neural.p1_experiment import (
     CHALLENGE_METRICS_NAME,
@@ -85,14 +106,16 @@ from cardiosentinel.neural.patient_memory import (
     STREAM_CACHE_CLAIM_NAME,
     STREAM_CACHE_MANIFEST_NAME,
     UPDATE_POLICY,
+    DualTimescaleMemory,
     M1DistanceStandardizer,
     M1MemoryError,
     M1StreamMemory,
+    StreamKey,
     build_causal_streams,
     build_deterministic_m1_head,
     claim_m1_run_directory,
+    cold_start_bin,
     fit_distance_standardizer,
-    generate_stream_memory,
     m1_alpha_identity,
     m1_arm_features,
     m1_boundary_statement,
@@ -102,7 +125,7 @@ from cardiosentinel.neural.patient_memory import (
     record_m1_failure,
     require_m1_experiment,
     resolve_m1_run_dir,
-    select_rows,
+    stream_key,
     validate_m1_protocol,
     write_m1_status,
 )
@@ -120,6 +143,7 @@ from cardiosentinel.neural.physiology_fusion import (
     PHYSIOLOGY_DIM,
     PhysiologyTransform,
     extract_frozen_embeddings,
+    morphology_columns,
     require_p1_partition,
 )
 from cardiosentinel.neural.protocol import (
@@ -127,6 +151,7 @@ from cardiosentinel.neural.protocol import (
     B4_SPLIT_SHA256,
     FEATURE_CORPUS_SHA256,
     REPOSITORY_ROOT,
+    SAMPLING_FREQUENCY_HZ,
 )
 from cardiosentinel.neural.resource_benchmark import validate_locked_model
 from cardiosentinel.neural.training import CheckpointTracker
@@ -173,6 +198,13 @@ FROZEN_DEVELOPMENT_FEATURE_INTEGRITY_SHA256: Final = (
 FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256: Final = (
     "a56e283631c9db51762118d6574ae1171840836dd4ff1d33d952fb51442571c1"
 )
+
+# Attempt 1 of the canonical Stage-1 run was consumed without producing any
+# scientific artifact. Every future preflight reports this so no report can
+# imply that no execution has ever occurred. It does NOT authorize a
+# replacement run: human governance stays external.
+ATTEMPT1_FAILURE_DOCUMENT: Final = "docs/M1_STAGE1_ATTEMPT1_FAILURE.md"
+PRIOR_AUTHORIZED_INVOCATION_COUNT: Final = 1
 
 M1_SUITE_STATUS: Final = "locked_m1_development_result"
 M1_LOCK_STATUS: Final = LOCK_STATUS.replace("p1", "m1")
@@ -1451,7 +1483,8 @@ def validate_m1_stage1_results(
         )
     if stream_cache_root is not None:
         for partition, recorded in caches.items():
-            _, _, manifest = load_stream_cache(Path(stream_cache_root), partition)
+            store, manifest = load_stream_store(Path(stream_cache_root), partition)
+            store.close()
             _require_exact(
                 f"{partition} stream cache",
                 manifest["stream_cache_sha256"],
@@ -1459,6 +1492,985 @@ def validate_m1_stage1_results(
             )
     return payload
 
+
+
+# --------------------------------------------------------------------------
+# Bounded-memory production path
+#
+# Attempt 1 died with exit 137 after 6h41m, in a way strongly consistent with
+# host memory exhaustion, because the earlier implementation held the whole
+# corpus in Python objects before persisting anything. Everything below is
+# row-aligned and disk-backed: peak memory is a function of chunk size, stream
+# length and the SELECTED supervised populations, never of the full stream.
+#
+# The in-memory functions above are retained as a small, readable reference
+# implementation for the equivalence tests. They are no longer on the canonical
+# route.
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True, slots=True)
+class M1SelectedMemory:
+    """Memory columns for one bounded, already-selected evidence population.
+
+    The evidence helpers only ever read these fields, so the full-stream
+    `M1StreamMemory` never has to exist in RAM on the production route.
+    """
+
+    cold_start_bins: tuple[str, ...]
+    past_observed_count: np.ndarray
+    past_update_count: np.ndarray
+    d_short: np.ndarray
+    d_long: np.ndarray
+    prototype_disagreement: np.ndarray
+
+
+STAGING_PREFIX: Final = ".staging-"
+STAGING_CLAIM_NAME: Final = "M1_STAGING_CLAIM.json"
+
+
+def _ordered_stream_references(
+    feature_root: Path, partition: str
+) -> tuple[dict[StreamKey, tuple[B4WindowReference, ...]], list[B4WindowReference]]:
+    """Frozen metadata in canonical stream-then-start-sample order."""
+    references = load_b4_references(Path(feature_root), partition, primary_only=False)
+    streams = build_causal_streams(references)
+    ordered = [reference for key in sorted(streams) for reference in streams[key]]
+    return streams, ordered
+
+
+def _stream_slices(
+    ordered: Sequence[B4WindowReference],
+) -> list[tuple[StreamKey, int, int]]:
+    """Contiguous `[begin, end)` row ranges, one per causal stream.
+
+    Canonical order is stream-major, so every stream is already a contiguous
+    slice of the store. That is what lets memory generation read one stream at a
+    time instead of indexing a whole-corpus mapping.
+    """
+    slices: list[tuple[StreamKey, int, int]] = []
+    begin = 0
+    for position, reference in enumerate(ordered):
+        key = stream_key(reference)
+        if position and key != stream_key(ordered[position - 1]):
+            slices.append((stream_key(ordered[position - 1]), begin, position))
+            begin = position
+    if ordered:
+        slices.append((stream_key(ordered[-1]), begin, len(ordered)))
+    return slices
+
+
+def _sorted_id_index(store: M1RowStore) -> tuple[np.ndarray, np.ndarray]:
+    """A vectorised stable-ID index.
+
+    `np.argsort` over the identity column plus `searchsorted` replaces the
+    2.2 M-entry Python dictionary the old path built. The cost is two int64/str
+    arrays rather than millions of interned objects.
+    """
+    identifiers = np.asarray(store.array(STABLE_ID_FILE))
+    order = np.argsort(identifiers, kind="stable")
+    return identifiers[order], order
+
+
+def _positions_for(
+    sorted_ids: np.ndarray, order: np.ndarray, wanted: np.ndarray
+) -> np.ndarray:
+    """Row positions for a chunk of identifiers; -1 where absent."""
+    keys = np.asarray(wanted, dtype=sorted_ids.dtype)
+    slot = np.searchsorted(sorted_ids, keys)
+    slot = np.clip(slot, 0, max(sorted_ids.shape[0] - 1, 0))
+    hit = sorted_ids.shape[0] > 0
+    matched = (sorted_ids[slot] == keys) if hit else np.zeros(keys.shape, dtype=bool)
+    positions = np.where(matched, order[slot], -1)
+    return positions.astype(np.int64)
+
+
+def _write_identity_columns(
+    store: M1RowStore, ordered: Sequence[B4WindowReference], *, chunk_rows: int
+) -> None:
+    stable = store.array(STABLE_ID_FILE)
+    records = store.array(RECORD_ID_FILE)
+    channels = store.array(CHANNEL_INDEX_FILE)
+    starts = store.array(START_SAMPLE_FILE)
+    for begin in range(0, len(ordered), chunk_rows):
+        block = ordered[begin : begin + chunk_rows]
+        end = begin + len(block)
+        stable[begin:end] = np.asarray([r.stable_id for r in block], dtype=stable.dtype)
+        records[begin:end] = np.asarray(
+            [r.record_id for r in block], dtype=records.dtype
+        )
+        channels[begin:end] = np.asarray(
+            [int(r.channel_index) for r in block], dtype=np.int64
+        )
+        starts[begin:end] = np.asarray(
+            [int(r.start_sample) for r in block], dtype=np.int64
+        )
+    store.flush()
+
+
+def _fill_embeddings(
+    store: M1RowStore,
+    ordered: Sequence[B4WindowReference],
+    *,
+    cache: Any,
+    encoder,
+    source: Path,
+    partition: str,
+    waveform_batches_for,
+    chunk_rows: int,
+) -> dict[str, Any]:
+    """Write every 128-d embedding straight into its disk-backed row.
+
+    Primary rows are copied from the frozen P1 cache. Extra rows are read
+    through the reviewed waveform contract and encoded in batches of
+    `WAVEFORM_BATCH_SIZE`; each batch is written to disk and released, so no
+    `dict[str, ndarray]` of newly extracted rows ever exists.
+    """
+    representation = store.array(REPRESENTATION_FILE)
+    cache_position = {key: index for index, key in enumerate(cache.stable_ids)}
+    before = _model_state_digest(encoder)
+
+    extra_rows: list[int] = []
+    extra_refs: list[B4WindowReference] = []
+    # Each flush builds its own B4WaveformDataset, so `stats.source_reads` is
+    # cumulative WITHIN a flush and restarts at the next one. Taking max() across
+    # independent instances therefore reported roughly one batch, not the whole
+    # extraction. Per-flush totals are accumulated instead.
+    reads = 0
+    extracted = 0
+    extra_digest = StreamingContentDigest((0, EMBEDDING_DIM), np.float32)
+    extra_ids: list[str] = []
+
+    def flush_batch() -> None:
+        nonlocal reads, extracted
+        if not extra_refs:
+            return
+        batches = (
+            waveform_batches_for(partition, tuple(r.stable_id for r in extra_refs))
+            if waveform_batches_for is not None
+            else canonical_waveform_batches(
+                tuple(extra_refs), Path(source), batch_size=WAVEFORM_BATCH_SIZE
+            )
+        )
+        produced: set[str] = set()
+        cursor = 0
+        flush_reads = 0
+        for identifiers, waveforms, stats in batches:
+            embeddings, _ = extract_frozen_embeddings(encoder, waveforms)
+            block = embeddings.to(torch.float32).numpy()
+            flush_reads = max(flush_reads, int(getattr(stats, "source_reads", 0)))
+            for offset, key in enumerate(identifiers):
+                identifier = str(key)
+                if identifier in cache_position:
+                    raise M1MemoryError(
+                        f"Row {identifier} was re-extracted although it is "
+                        "already in the frozen P1 cache; the overlap must be "
+                        "reused, not duplicated."
+                    )
+                if identifier in produced:
+                    raise M1MemoryError(
+                        f"Row {identifier} was produced more than once."
+                    )
+                if identifier != extra_refs[cursor].stable_id:
+                    raise M1MemoryError(
+                        "The waveform iterator produced rows out of the "
+                        "requested order; row alignment cannot be proven."
+                    )
+                produced.add(identifier)
+                representation[extra_rows[cursor], :EMBEDDING_DIM] = block[offset]
+                cursor += 1
+                extracted += 1
+        if cursor != len(extra_refs):
+            raise M1MemoryError(
+                f"The waveform iterator produced {cursor} of "
+                f"{len(extra_refs)} requested rows."
+            )
+        reads += flush_reads
+        extra_refs.clear()
+        extra_rows.clear()
+
+    for begin in range(0, len(ordered), chunk_rows):
+        for offset, reference in enumerate(ordered[begin : begin + chunk_rows]):
+            row = begin + offset
+            position = cache_position.get(reference.stable_id)
+            if position is not None:
+                representation[row, :EMBEDDING_DIM] = cache.embeddings[position]
+                continue
+            extra_ids.append(reference.stable_id)
+            extra_rows.append(row)
+            extra_refs.append(reference)
+            if len(extra_refs) >= WAVEFORM_BATCH_SIZE:
+                flush_batch()
+    flush_batch()
+    store.flush()
+
+    after = _model_state_digest(encoder)
+    if before != after:
+        raise M1MemoryError(
+            "The locked B4-B encoder state changed during full-stream extraction."
+        )
+    if extracted != len(extra_ids):
+        raise M1MemoryError("Extra-row extraction count does not match the plan.")
+    if waveform_batches_for is None and reads != extracted:
+        raise M1MemoryError(
+            f"The canonical waveform route reported {reads} source reads for "
+            f"{extracted} extracted rows. One emitted row must correspond to "
+            "exactly one validated waveform read."
+        )
+
+    # Digest the extracted rows by re-reading them from disk in bounded blocks.
+    if extra_ids:
+        sorted_ids, order = _sorted_id_index(store)
+        positions = _positions_for(
+            sorted_ids, order, np.asarray(extra_ids, dtype=sorted_ids.dtype)
+        )
+        extra_digest = StreamingContentDigest(
+            (len(extra_ids), EMBEDDING_DIM), np.float32
+        )
+        for begin in range(0, len(extra_ids), chunk_rows):
+            rows = positions[begin : begin + chunk_rows]
+            extra_digest.update(
+                np.asarray(representation[rows, :EMBEDDING_DIM], dtype=np.float32)
+            )
+    return {
+        "primary_rows_reused": len(cache_position),
+        "rows_newly_extracted": extracted,
+        "extra_disjoint_from_primary_cache": True,
+        "extra_ordered_stable_id_sha256": (
+            streaming_ordered_stable_id_digest(iter(extra_ids)) if extra_ids else None
+        ),
+        "extra_embedding_content_sha256": (
+            extra_digest.hexdigest() if extra_ids else None
+        ),
+        "extraction_receipt": {
+            "encoder_state_sha256_before": before,
+            "encoder_state_sha256_after": after,
+            "encoder_state_unchanged": True,
+            "encoder_fine_tuned": False,
+            "embedding_tap": EMBEDDING_TAP,
+            "embedding_dim": EMBEDDING_DIM,
+            "batch_size": WAVEFORM_BATCH_SIZE,
+            "rows_extracted": extracted,
+            "waveform_source_reads": reads,
+        },
+    }
+
+
+def _audit_sample_references(
+    ordered: Sequence[B4WindowReference], cache: Any
+) -> list[B4WindowReference]:
+    """The deterministic audit sample, found without a full-corpus mapping.
+
+    The selection rule is unchanged: every `step`-th frozen primary ID that is
+    also present in the stream, truncated to `PRIMARY_AUDIT_ROWS`. Only those
+    candidate IDs are held, so this costs a set of at most a few dozen strings
+    instead of a `stable_id -> reference` dictionary over 2.2 M rows.
+    """
+    step = max(len(cache.stable_ids) // PRIMARY_AUDIT_ROWS, 1)
+    candidates = [
+        str(key) for index, key in enumerate(cache.stable_ids) if index % step == 0
+    ]
+    wanted = set(candidates)
+    found: dict[str, B4WindowReference] = {}
+    for reference in ordered:
+        if reference.stable_id in wanted and reference.stable_id not in found:
+            found[reference.stable_id] = reference
+    # Preserve the frozen cache order, then truncate exactly as before.
+    return [found[key] for key in candidates if key in found][:PRIMARY_AUDIT_ROWS]
+
+
+def _audit_primary_overlap(
+    store: M1RowStore,
+    ordered: Sequence[B4WindowReference],
+    *,
+    cache: Any,
+    encoder,
+    source: Path,
+    partition: str,
+    waveform_batches_for,
+) -> dict[str, Any]:
+    """Re-extract a deterministic primary sample and compare it to the cache.
+
+    The audit carries its own encoder-state proof and its own read receipt: it
+    runs the locked encoder just as the extraction does, so its provenance must
+    stand on its own rather than being inferred from the extraction pass.
+    """
+    empty = {
+        "re_extracted_primary_rows": 0,
+        "re_extracted_primary_bitwise_identical": None,
+        "re_extracted_primary_max_abs_deviation": None,
+        "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
+        "primary_audit_receipt": {
+            "rows_re_extracted": 0,
+            "waveform_source_reads": 0,
+            "encoder_state_sha256_before": None,
+            "encoder_state_sha256_after": None,
+            "encoder_state_unchanged": None,
+            "encoder_fine_tuned": False,
+            "embedding_tap": EMBEDDING_TAP,
+            "embedding_dim": EMBEDDING_DIM,
+        },
+    }
+    sample = _audit_sample_references(ordered, cache)
+    if not sample:
+        return empty
+
+    cache_position = {key: index for index, key in enumerate(cache.stable_ids)}
+    before = _model_state_digest(encoder)
+    batches = (
+        waveform_batches_for(partition, tuple(r.stable_id for r in sample))
+        if waveform_batches_for is not None
+        else canonical_waveform_batches(
+            tuple(sample), Path(source), batch_size=WAVEFORM_BATCH_SIZE
+        )
+    )
+    identical = True
+    deviation = 0.0
+    checked = 0
+    reads = 0
+    for identifiers, waveforms, stats in batches:
+        embeddings, _ = extract_frozen_embeddings(encoder, waveforms)
+        block = embeddings.to(torch.float32).numpy()
+        reads = max(reads, int(getattr(stats, "source_reads", 0)))
+        for offset, key in enumerate(identifiers):
+            frozen = cache.embeddings[cache_position[str(key)]]
+            identical = identical and bool(np.array_equal(block[offset], frozen))
+            deviation = max(
+                deviation,
+                float(
+                    np.max(
+                        np.abs(
+                            block[offset].astype(np.float64) - frozen.astype(np.float64)
+                        )
+                    )
+                ),
+            )
+            checked += 1
+    after = _model_state_digest(encoder)
+    if before != after:
+        raise M1MemoryError(
+            "The locked B4-B encoder state changed during the primary overlap "
+            "audit."
+        )
+    if checked != len(sample):
+        raise M1MemoryError(
+            f"The primary audit re-extracted {checked} of {len(sample)} sampled "
+            "rows."
+        )
+    if waveform_batches_for is None and reads != checked:
+        raise M1MemoryError(
+            f"The primary audit reported {reads} source reads for {checked} "
+            "re-extracted rows."
+        )
+    if deviation > PRIMARY_AUDIT_TOLERANCE:
+        raise M1MemoryError(
+            "Re-extracted primary embeddings differ from the frozen P1 cache by "
+            f"{deviation}, beyond the batch-grouping tolerance "
+            f"{PRIMARY_AUDIT_TOLERANCE}. The overlap identity is not exact: the "
+            "encoder, cache or waveform source differs."
+        )
+    return {
+        "re_extracted_primary_rows": checked,
+        "re_extracted_primary_bitwise_identical": identical,
+        "re_extracted_primary_max_abs_deviation": deviation,
+        "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
+        "primary_audit_receipt": {
+            "rows_re_extracted": checked,
+            "waveform_source_reads": reads,
+            "encoder_state_sha256_before": before,
+            "encoder_state_sha256_after": after,
+            "encoder_state_unchanged": True,
+            "encoder_fine_tuned": False,
+            "embedding_tap": EMBEDDING_TAP,
+            "embedding_dim": EMBEDDING_DIM,
+        },
+    }
+
+
+def _fill_physiology(
+    store: M1RowStore,
+    *,
+    feature_root: Path,
+    partition: str,
+    transform: PhysiologyTransform,
+    chunk_rows: int,
+) -> dict[str, Any]:
+    """Apply the exact frozen transform in bounded per-file chunks.
+
+    The transform itself is the reviewed frozen artifact and is never refitted;
+    only the plumbing changes. The old path built a whole-corpus
+    `dict[str, ndarray]` of raw morphology, which is one of the allocations
+    that exhausted memory.
+    """
+    evaluated = require_p1_partition(partition)
+    representation = store.array(REPRESENTATION_FILE)
+    sorted_ids, order = _sorted_id_index(store)
+    columns = list(morphology_columns())
+    filled = np.zeros(representation.shape[0], dtype=bool)
+    files = 0
+
+    for path in sorted((Path(feature_root) / evaluated).glob("*.npz")):
+        files += 1
+        with np.load(path, allow_pickle=False, mmap_mode="r") as archive:
+            identifiers = np.asarray(archive["stable_ids"])
+            features = archive["features"]
+            for begin in range(0, identifiers.shape[0], chunk_rows):
+                end = begin + chunk_rows
+                keys = np.asarray(identifiers[begin:end], dtype=sorted_ids.dtype)
+                positions = _positions_for(sorted_ids, order, keys)
+                present = positions >= 0
+                if not np.any(present):
+                    continue
+                raw = np.asarray(features[begin:end], dtype=np.float64)[:, columns]
+                values = transform.transform(raw[present])
+                representation[positions[present], EMBEDDING_DIM:] = values
+                filled[positions[present]] = True
+    store.flush()
+
+    missing = int(np.sum(~filled))
+    if missing:
+        raise M1MemoryError(
+            f"{missing} full-stream rows have no frozen morphology_v1 record."
+        )
+    return {
+        "physiology_files_read": files,
+        "physiology_dim": PHYSIOLOGY_DIM,
+        "physiology_refitted": False,
+        "physiology_transform_sha256": transform.as_dict()["transform_sha256"],
+        "physiology_schema_sha256": MORPHOLOGY_SCHEMA_SHA256,
+    }
+
+
+def _generate_memory_into_store(
+    store: M1RowStore,
+    slices: Sequence[tuple[StreamKey, int, int]],
+    standardizer: M1DistanceStandardizer,
+) -> None:
+    """Replay every causal stream, writing memory features straight to disk.
+
+    One stream at a time: each is a contiguous row range, so the working set is
+    one stream's representation rather than the corpus. Score-before-update is
+    unchanged — `DualTimescaleMemory.observe` is the same reviewed object.
+    """
+    representation = store.array(REPRESENTATION_FILE)
+    starts = store.array(START_SAMPLE_FILE)
+    d_short = store.array(D_SHORT_FILE)
+    d_long = store.array(D_LONG_FILE)
+    observed = store.array(PAST_OBSERVED_FILE)
+    updated = store.array(PAST_UPDATE_FILE)
+    disagreement = store.array(DISAGREEMENT_FILE)
+    ages = store.array(RECORDING_AGE_FILE)
+    bins = store.array(COLD_START_BIN_FILE)
+    prior = standardizer.prior_vector()
+
+    for _key, begin, end in slices:
+        memory = DualTimescaleMemory(prior)
+        block = np.asarray(representation[begin:end], dtype=np.float64)
+        standardized = standardizer.standardize(block)
+        origin = int(starts[begin])
+        for offset in range(end - begin):
+            features = memory.observe(standardized[offset])
+            row = begin + offset
+            d_short[row] = features.d_short
+            d_long[row] = features.d_long
+            observed[row] = features.past_observed_count
+            updated[row] = features.past_update_count
+            disagreement[row] = features.prototype_disagreement
+            age = (int(starts[row]) - origin) / SAMPLING_FREQUENCY_HZ
+            ages[row] = age
+            bins[row] = cold_start_bin(age)
+    store.flush()
+
+
+def _staging_directory(cache_root: Path, partition: str) -> Path:
+    return Path(cache_root) / f"{STAGING_PREFIX}{partition}"
+
+
+def scan_staging_directories(cache_root: Path) -> list[str]:
+    """Report partial staging areas. They are never resumed or deleted."""
+    root = Path(cache_root)
+    if not root.exists():
+        return []
+    return sorted(
+        str(path) for path in root.glob(f"{STAGING_PREFIX}*") if path.is_dir()
+    )
+
+
+def materialize_stream_store(
+    partition: str,
+    *,
+    cache_root: Path,
+    p1_cache_root: Path,
+    feature_root: Path,
+    source: Path,
+    b4b_run_dir: Path,
+    p1b_run_dir: Path,
+    standardizer: M1DistanceStandardizer | None,
+    manifest_fields: Mapping[str, Any],
+    chunk_rows: int = DEFAULT_CHUNK_ROWS,
+    _waveform_batches_for=None,
+) -> tuple[dict[str, Any], M1DistanceStandardizer]:
+    """Build one immutable, row-aligned, disk-backed stream cache.
+
+    Order: identity columns -> embeddings -> physiology -> (train only) fit the
+    standardizer -> causal memory -> manifest -> promote staging to canonical.
+    Nothing is promoted until every digest is written, so a crash leaves a
+    clearly-marked staging area rather than a plausible cache.
+    """
+    evaluated = require_p1_partition(partition)
+    final = Path(cache_root) / evaluated
+    if final.exists():
+        raise M1MemoryError(
+            f"An M1 stream cache already exists at {final}. A complete cache "
+            "must be reused and a partial cache requires documented human "
+            "review; it is never overwritten or automatically repaired."
+        )
+    staging = _staging_directory(cache_root, evaluated)
+    if staging.exists():
+        raise M1MemoryError(
+            f"A partial M1 staging area exists at {staging}. It is never "
+            "resumed, repaired or deleted automatically; human review is "
+            "required."
+        )
+
+    transform = load_frozen_physiology_transform(p1b_run_dir)
+    cache = load_p1_embedding_cache(Path(p1_cache_root), evaluated)
+    streams, ordered = _ordered_stream_references(feature_root, evaluated)
+    slices = _stream_slices(ordered)
+
+    staging.mkdir(parents=True, exist_ok=False)
+    write_json_atomic(
+        staging / STAGING_CLAIM_NAME,
+        {
+            "artifact_class": "m1_stream_cache_staging_area",
+            "is_a_valid_cache": False,
+            "partition": evaluated,
+            "schema": M1_STREAM_CACHE_SCHEMA,
+            "resume_permitted": False,
+            "automatic_repair_permitted": False,
+            "automatic_deletion_permitted": False,
+        },
+    )
+    spec = M1StoreSpec(rows=len(ordered), representation_dim=REPRESENTATION_DIM)
+    store = M1RowStore(staging, spec, create=True)
+    try:
+        _write_identity_columns(store, ordered, chunk_rows=chunk_rows)
+        encoder = load_official_b4b_encoder(Path(b4b_run_dir))
+        audit = _fill_embeddings(
+            store,
+            ordered,
+            cache=cache,
+            encoder=encoder,
+            source=source,
+            partition=evaluated,
+            waveform_batches_for=_waveform_batches_for,
+            chunk_rows=chunk_rows,
+        )
+        if audit["rows_newly_extracted"]:
+            audit.update(
+                _audit_primary_overlap(
+                    store,
+                    ordered,
+                    cache=cache,
+                    encoder=encoder,
+                    source=source,
+                    partition=evaluated,
+                    waveform_batches_for=_waveform_batches_for,
+                )
+            )
+        else:
+            audit.update(
+                {
+                    "re_extracted_primary_rows": 0,
+                    "re_extracted_primary_bitwise_identical": None,
+                    "re_extracted_primary_max_abs_deviation": None,
+                    "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
+                    "primary_audit_receipt": {
+                        "rows_re_extracted": 0,
+                        "waveform_source_reads": 0,
+                        "encoder_state_sha256_before": None,
+                        "encoder_state_sha256_after": None,
+                        "encoder_state_unchanged": None,
+                        "encoder_fine_tuned": False,
+                        "embedding_tap": EMBEDDING_TAP,
+                        "embedding_dim": EMBEDDING_DIM,
+                    },
+                }
+            )
+        # Total reads span BOTH locked-encoder passes.
+        audit["waveform_source_reads"] = int(
+            audit["extraction_receipt"]["waveform_source_reads"]
+        ) + int(audit["primary_audit_receipt"]["waveform_source_reads"])
+        del encoder
+        audit.update(
+            _fill_physiology(
+                store,
+                feature_root=feature_root,
+                partition=evaluated,
+                transform=transform,
+                chunk_rows=chunk_rows,
+            )
+        )
+        representation = store.array(REPRESENTATION_FILE)
+        for begin in range(0, representation.shape[0], chunk_rows):
+            block = np.asarray(representation[begin : begin + chunk_rows])
+            if not np.all(np.isfinite(block)):
+                raise M1MemoryError(
+                    "A non-finite fused representation was produced despite the "
+                    "frozen P1 transformation. M1 refuses rather than skipping "
+                    "the window."
+                )
+
+        if standardizer is None:
+            if evaluated != "train":
+                raise M1MemoryError(
+                    "The distance standardizer must be fitted from the train "
+                    "stream before any validation memory is generated."
+                )
+            positions = locate_rows(store, cache.stable_ids)
+            standardizer = build_distance_standardizer_from_rows(
+                np.asarray(
+                    store.gather(REPRESENTATION_FILE, positions), dtype=np.float64
+                ),
+                primary_train_stable_ids=cache.stable_ids,
+                upstream_identities=manifest_fields["upstream_identities"],
+            )
+            write_json_atomic(
+                Path(cache_root) / STANDARDIZER_NAME, standardizer.as_dict()
+            )
+            del positions
+
+        _generate_memory_into_store(store, slices, standardizer)
+        manifest = _bounded_stream_cache_manifest(
+            store,
+            partition=evaluated,
+            streams=len(slices),
+            record_ids=sorted({key[0] for key, _b, _e in slices}),
+            channel_indices=sorted({int(key[1]) for key, _b, _e in slices}),
+            audit=audit,
+            standardizer_sha256=standardizer.as_dict()["standardizer_sha256"],
+            manifest_fields=manifest_fields,
+        )
+        write_json_atomic(staging / STREAM_CACHE_MANIFEST_NAME, manifest)
+        store.close()
+        # The marker is rewritten rather than deleted: this module has no
+        # artifact-deletion path at all, so a promoted cache carries its own
+        # staging provenance instead.
+        write_json_atomic(
+            staging / STAGING_CLAIM_NAME,
+            {
+                "artifact_class": "m1_stream_cache_staging_area",
+                "is_a_valid_cache": True,
+                "promoted_to_canonical_cache": True,
+                "partition": evaluated,
+                "schema": M1_STREAM_CACHE_SCHEMA,
+                "resume_permitted": False,
+                "automatic_repair_permitted": False,
+                "automatic_deletion_permitted": False,
+            },
+        )
+        staging.rename(final)
+        return manifest, standardizer
+    except BaseException:
+        store.close()
+        # The staging area is deliberately left exactly as it is: no delete, no
+        # repair, no resume. Human review decides what happens to it.
+        raise
+
+
+def _bounded_stream_cache_manifest(
+    store: M1RowStore,
+    *,
+    partition: str,
+    streams: int,
+    record_ids: Sequence[str],
+    channel_indices: Sequence[int],
+    audit: Mapping[str, Any],
+    standardizer_sha256: str,
+    manifest_fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind every frozen identity, with all digests computed by streaming."""
+    fields = dict(manifest_fields)
+    manifest: dict[str, Any] = {
+        "artifact_class": "m1_full_stream_memory_cache",
+        "m1_stream_cache_schema": M1_STREAM_CACHE_SCHEMA,
+        "storage": "row_aligned_memmapped_npy_directory",
+        "partition": partition,
+        "m1_protocol_sha256": M1_PROTOCOL_SHA256,
+        "p1_protocol_sha256": P1_PROTOCOL_SHA256,
+        "p1_retention_decision_sha256": P1_RETENTION_DECISION_SHA256,
+        "p1_stage1_suite_sha256": fields["p1_stage1_suite_sha256"],
+        "p1b_experiment_lock_sha256": fields["p1b_lock_sha256"],
+        "encoder_checkpoint_sha256": B4B_CHECKPOINT_SHA256,
+        "encoder_experiment_lock_sha256": B4B_EXPERIMENT_LOCK_SHA256,
+        "embedding_tap": EMBEDDING_TAP,
+        "physiology_transform_sha256": fields["physiology_transform_sha256"],
+        "physiology_schema_sha256": MORPHOLOGY_SCHEMA_SHA256,
+        "p1_embedding_cache_sha256": fields["embedding_cache_sha256"],
+        "development_feature_integrity_sha256": fields["feature_integrity_sha256"],
+        "development_source_integrity_sha256": fields["source_integrity_sha256"],
+        "b4_protocol_sha256": B4_PROTOCOL_SHA256,
+        "split_sha256": B4_SPLIT_SHA256,
+        "feature_corpus_sha256": FEATURE_CORPUS_SHA256,
+        "distance_standardizer_sha256": standardizer_sha256,
+        "representation_dim": REPRESENTATION_DIM,
+        "full_stream_row_count": int(store.spec.rows),
+        "stream_count": int(streams),
+        "record_ids": list(record_ids),
+        "channel_indices": list(channel_indices),
+        "ordered_stable_id_sha256": store.stable_id_digest(),
+        "ordered_chronology_sha256": store.chronology_digest(),
+        "representation_content_sha256": store.content_digest(REPRESENTATION_FILE),
+        "d_short_content_sha256": store.content_digest(D_SHORT_FILE),
+        "d_long_content_sha256": store.content_digest(D_LONG_FILE),
+        "history_count_sha256": store.paired_content_digest(
+            PAST_OBSERVED_FILE, PAST_UPDATE_FILE
+        ),
+        "primary_rows_reused": audit["primary_rows_reused"],
+        "rows_newly_extracted": audit["rows_newly_extracted"],
+        "primary_overlap_audit": dict(audit),
+        "label_independent_history": True,
+        "update_policy": UPDATE_POLICY,
+        "contamination_safe": CONTAMINATION_SAFE,
+        "alpha_short": ALPHA_SHORT,
+        "alpha_long": ALPHA_LONG,
+        "memory_features": ["d_short", "d_long"],
+        "git_sha": fields["git_sha"],
+        "git_dirty": fields["git_dirty"],
+        "environment_dependency_digest": fields["dependency_digest"],
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "artifact_sha256": store.artifact_digests(),
+    }
+    manifest["stream_cache_sha256"] = canonical_sha256(manifest)
+    return manifest
+
+
+def load_stream_store(
+    cache_root: Path, partition: str, *, chunk_rows: int = DEFAULT_CHUNK_ROWS
+) -> tuple[M1RowStore, dict[str, Any]]:
+    """Open and fully re-verify a materialized store without loading it whole.
+
+    Every refusal the reviewed loader enforced still applies; only the memory
+    profile changes. Content digests are recomputed in bounded chunks and the
+    chronology digest is re-derived from the persisted arrays.
+    """
+    evaluated = require_p1_partition(partition)
+    directory = Path(cache_root) / evaluated
+    manifest_path = directory / STREAM_CACHE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        if directory.exists():
+            raise M1MemoryError(
+                f"A partial M1 stream cache exists at {directory} without a "
+                "manifest. This requires documented human review and is never "
+                "overwritten or automatically repaired."
+            )
+        raise M1MemoryError(f"No M1 stream cache manifest at {manifest_path}.")
+    manifest = read_json(manifest_path)
+    recorded = manifest.get("stream_cache_sha256")
+    body = {k: v for k, v in manifest.items() if k != "stream_cache_sha256"}
+    if recorded is None or recorded != canonical_sha256(body):
+        raise M1MemoryError("M1 stream cache manifest failed digest validation.")
+    if manifest.get("m1_stream_cache_schema") != M1_STREAM_CACHE_SCHEMA:
+        raise M1MemoryError(
+            f"M1 stream cache schema {manifest.get('m1_stream_cache_schema')!r} "
+            f"is not the supported {M1_STREAM_CACHE_SCHEMA}."
+        )
+    for field, expected in (
+        ("m1_protocol_sha256", M1_PROTOCOL_SHA256),
+        ("p1_protocol_sha256", P1_PROTOCOL_SHA256),
+        ("p1_retention_decision_sha256", P1_RETENTION_DECISION_SHA256),
+        ("p1_stage1_suite_sha256", FROZEN_P1_STAGE1_SUITE_SHA256),
+        ("p1b_experiment_lock_sha256", FROZEN_P1B_LOCK_SHA256),
+        ("physiology_transform_sha256", FROZEN_PHYSIOLOGY_TRANSFORM_SHA256),
+        ("p1_embedding_cache_sha256", FROZEN_P1_EMBEDDING_CACHE_SHA256[evaluated]),
+        (
+            "development_feature_integrity_sha256",
+            FROZEN_DEVELOPMENT_FEATURE_INTEGRITY_SHA256,
+        ),
+        (
+            "development_source_integrity_sha256",
+            FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256,
+        ),
+        ("encoder_checkpoint_sha256", B4B_CHECKPOINT_SHA256),
+        ("encoder_experiment_lock_sha256", B4B_EXPERIMENT_LOCK_SHA256),
+        ("split_sha256", B4_SPLIT_SHA256),
+        ("feature_corpus_sha256", FEATURE_CORPUS_SHA256),
+        ("physiology_schema_sha256", MORPHOLOGY_SCHEMA_SHA256),
+        ("update_policy", UPDATE_POLICY),
+        ("alpha_short", ALPHA_SHORT),
+        ("alpha_long", ALPHA_LONG),
+        ("representation_dim", REPRESENTATION_DIM),
+        ("contamination_safe", CONTAMINATION_SAFE),
+        ("label_independent_history", True),
+        ("partition", evaluated),
+    ):
+        if manifest.get(field) != expected:
+            raise M1MemoryError(
+                f"M1 stream cache binds {field}={manifest.get(field)!r}, "
+                f"expected {expected!r}."
+            )
+    if manifest.get("test_accessed") is not False:
+        raise M1MemoryError("M1 stream cache does not record test_accessed=false.")
+    if manifest.get("git_dirty") is not False:
+        raise M1MemoryError("M1 stream cache was built from a dirty checkout.")
+    if manifest.get("environment_dependency_digest") != FROZEN_DEPENDENCY_DIGEST:
+        raise M1MemoryError(
+            "M1 stream cache does not bind the frozen dependency digest."
+        )
+
+    spec = M1StoreSpec(
+        rows=int(manifest["full_stream_row_count"]),
+        representation_dim=REPRESENTATION_DIM,
+    )
+    store = M1RowStore(directory, spec, create=False)
+
+    # The physical artifact boundary is defined by the frozen schema, not by
+    # whatever the manifest happens to list. Iterating only the recorded keys
+    # would let a cache omit e.g. recording_age_seconds.npy or cold_start_bin.npy
+    # -- both of which feed supporting evidence -- and still validate.
+    recorded = dict(manifest["artifact_sha256"])
+    expected_files = set(spec.arrays())
+    if set(recorded) != expected_files:
+        missing = sorted(expected_files - set(recorded))
+        unexpected = sorted(set(recorded) - expected_files)
+        raise M1MemoryError(
+            "M1 stream cache does not bind exactly the schema's physical "
+            f"arrays; missing {missing}, unexpected {unexpected}."
+        )
+    for name, digest in recorded.items():
+        if sha256_file(directory / name) != digest:
+            raise M1MemoryError(f"M1 store array {name} does not match its digest.")
+    for field, name in (
+        ("representation_content_sha256", REPRESENTATION_FILE),
+        ("d_short_content_sha256", D_SHORT_FILE),
+        ("d_long_content_sha256", D_LONG_FILE),
+    ):
+        if store.content_digest(name, chunk_rows=chunk_rows) != manifest[field]:
+            raise M1MemoryError(f"M1 stream cache {field} does not match.")
+    if (
+        store.paired_content_digest(
+            PAST_OBSERVED_FILE, PAST_UPDATE_FILE, chunk_rows=chunk_rows
+        )
+        != manifest["history_count_sha256"]
+    ):
+        raise M1MemoryError("M1 stream cache history counts do not match.")
+    if store.stable_id_digest(chunk_rows=chunk_rows) != manifest[
+        "ordered_stable_id_sha256"
+    ]:
+        raise M1MemoryError("M1 stream cache row order does not match its identity.")
+    if store.chronology_digest(chunk_rows=chunk_rows) != manifest[
+        "ordered_chronology_sha256"
+    ]:
+        raise M1MemoryError(
+            "The chronology digest re-derived from the persisted stream cache "
+            "arrays does not match the manifest."
+        )
+    # Stream metadata is re-derived from the persisted identity columns rather
+    # than trusted from the manifest's descriptive copies. Canonical order is
+    # stream-major, so one chunked pass suffices and no 2.2 M-element Python
+    # structure is built.
+    observed_streams = 0
+    observed_records: set[str] = set()
+    observed_channels: set[int] = set()
+    previous: tuple[str, int] | None = None
+    records = store.array(RECORD_ID_FILE)
+    channels = store.array(CHANNEL_INDEX_FILE)
+    for begin in range(0, records.shape[0], chunk_rows):
+        end = begin + chunk_rows
+        record_block = np.asarray(records[begin:end])
+        channel_block = np.asarray(channels[begin:end])
+        observed_records.update(str(value) for value in np.unique(record_block))
+        observed_channels.update(int(value) for value in np.unique(channel_block))
+        for record, channel in zip(record_block, channel_block, strict=True):
+            key = (str(record), int(channel))
+            if key != previous:
+                observed_streams += 1
+                previous = key
+    if observed_streams != int(manifest["stream_count"]):
+        raise M1MemoryError(
+            f"The persisted stream cache contains {observed_streams} streams, "
+            f"but the manifest records {manifest['stream_count']}."
+        )
+    if sorted(observed_records) != list(manifest["record_ids"]):
+        raise M1MemoryError(
+            "The persisted record IDs differ from the manifest's record list."
+        )
+    if sorted(observed_channels) != list(manifest["channel_indices"]):
+        raise M1MemoryError(
+            "The persisted channel indices differ from the manifest's list."
+        )
+
+    standardizer_path = Path(cache_root) / STANDARDIZER_NAME
+    if not standardizer_path.is_file():
+        raise M1MemoryError(
+            f"M1 stream cache at {directory} has no distance standardizer at "
+            f"{standardizer_path}; human review is required."
+        )
+    standardizer = read_json(standardizer_path)
+    if standardizer.get("standardizer_sha256") != manifest[
+        "distance_standardizer_sha256"
+    ]:
+        raise M1MemoryError(
+            "The persisted distance standardizer differs from the one this "
+            "stream cache was built against."
+        )
+    M1DistanceStandardizer.from_dict(standardizer)
+    return store, manifest
+
+
+def build_distance_standardizer_from_rows(
+    matrix: np.ndarray,
+    *,
+    primary_train_stable_ids: Sequence[str],
+    upstream_identities: Mapping[str, Any],
+) -> M1DistanceStandardizer:
+    """Fit the frozen distance space from an already-gathered TRAIN matrix.
+
+    The 374,452 x 146 primary TRAIN population is bounded and small relative to
+    the full stream, so gathering exactly those rows into float64 is acceptable
+    and keeps the fit bit-identical to the reviewed implementation.
+    """
+    required = (
+        "p1_stage1_suite_sha256",
+        "p1b_experiment_lock_sha256",
+        "physiology_transform_sha256",
+        "p1_train_embedding_cache_sha256",
+        "encoder_checkpoint_sha256",
+    )
+    upstream = dict(upstream_identities)
+    missing = [key for key in required if not upstream.get(key)]
+    if missing:
+        raise M1MemoryError(
+            f"The distance standardizer must bind exact upstream identities; "
+            f"{missing} are absent or null."
+        )
+    expected = EXPECTED_POPULATIONS["train"]["total"]
+    if len(primary_train_stable_ids) != expected:
+        raise M1MemoryError(
+            f"The standardizer must be fitted on the frozen {expected} primary "
+            f"TRAIN rows, received {len(primary_train_stable_ids)}."
+        )
+    return fit_distance_standardizer(
+        np.asarray(matrix, dtype=np.float64),
+        partition="train",
+        input_identities={
+            "m1_protocol_sha256": M1_PROTOCOL_SHA256,
+            "p1_protocol_sha256": P1_PROTOCOL_SHA256,
+            "p1_stage1_suite_sha256": upstream["p1_stage1_suite_sha256"],
+            "p1b_experiment_lock_sha256": upstream["p1b_experiment_lock_sha256"],
+            "physiology_transform_sha256": upstream["physiology_transform_sha256"],
+            "p1_train_embedding_cache_sha256": upstream[
+                "p1_train_embedding_cache_sha256"
+            ],
+            "encoder_checkpoint_sha256": upstream["encoder_checkpoint_sha256"],
+            "ordered_stable_id_sha256": ordered_stable_id_digest(
+                primary_train_stable_ids
+            ),
+            "representation_content_sha256": embedding_content_digest(
+                np.asarray(matrix, dtype=np.float64)
+            ),
+        },
+    )
 
 # --------------------------------------------------------------------------
 # Read-only preflight
@@ -1517,8 +2529,12 @@ def m1_preflight(
         }
         if entry["present"]:
             try:
-                _, _, manifest = load_stream_cache(Path(stream_cache_root), partition)
+                store, manifest = load_stream_store(
+                    Path(stream_cache_root), partition
+                )
+                store.close()
                 entry["validated"] = True
+                entry["schema"] = manifest["m1_stream_cache_schema"]
                 entry["stream_cache_sha256"] = manifest["stream_cache_sha256"]
                 entry["full_stream_row_count"] = manifest["full_stream_row_count"]
                 entry["stream_count"] = manifest["stream_count"]
@@ -1553,6 +2569,8 @@ def m1_preflight(
         "one_partition_only": bool(one_sided),
         "orphan_standardizer": bool(orphan_standardizer),
     }
+    staging = scan_staging_directories(Path(stream_cache_root))
+    cache_state["staging_directories"] = staging
     test_artifacts = scan_test_artifacts(
         Path(run_root), Path(stream_cache_root), p1_run_root
     )
@@ -1684,7 +2702,7 @@ def m1_preflight(
         status = "test_artifact_present_human_review_required"
     elif any(claimed.values()):
         status = "m1_arm_already_claimed"
-    elif partial_partitions:
+    elif partial_partitions or staging:
         status = "partial_stream_cache_human_review_required"
     elif one_sided or orphan_standardizer:
         status = "partial_stream_cache_human_review_required"
@@ -1705,9 +2723,18 @@ def m1_preflight(
         "representation_dim": REPRESENTATION_DIM,
         "memory": alphas,
         "boundary": m1_boundary_statement(),
+        "execution_governance": {
+            "prior_authorized_invocation_count": PRIOR_AUTHORIZED_INVOCATION_COUNT,
+            "prior_failed_preclaim_attempt_documented": True,
+            "prior_failed_attempt_document": ATTEMPT1_FAILURE_DOCUMENT,
+            "prior_attempt_scientific_artifacts_created": False,
+            "prior_attempt_arm_claims_created": False,
+            "replacement_execution_requires_new_human_authorization": True,
+        },
         "arm_claims": claimed,
         "stream_caches": caches,
         "stream_cache_state": cache_state,
+        "m1_stream_cache_schema": M1_STREAM_CACHE_SCHEMA,
         "p1_evidence": p1_state,
         "encoder": encoder_state,
         "chronology": chronology,
@@ -1940,93 +2967,55 @@ def execute_m1_stage1(
         )
     control_evidence = load_frozen_control_evidence(control_dir)
 
-    # --- full-stream memory caches -------------------------------------
-    memories: dict[str, M1StreamMemory] = {}
-    matrices: dict[str, np.ndarray] = {}
+    # --- full-stream memory caches (bounded, disk-backed) ---------------
+    manifest_fields = {
+        "upstream_identities": upstream,
+        "p1_stage1_suite_sha256": upstream["p1_stage1_suite_sha256"],
+        "p1b_lock_sha256": upstream["p1b_experiment_lock_sha256"],
+        "physiology_transform_sha256": upstream["physiology_transform_sha256"],
+        "feature_integrity_sha256": upstream["development_feature_integrity_sha256"],
+        "source_integrity_sha256": upstream["development_source_integrity_sha256"],
+        "git_sha": provenance["git_sha"],
+        "git_dirty": provenance["git_dirty"],
+        "dependency_digest": dependency_digest,
+    }
     manifests: dict[str, dict[str, Any]] = {}
-    standardizer_payload: dict[str, Any] | None = None
     standardizer: M1DistanceStandardizer | None = None
 
     for partition in ("train", "validation"):
         directory = Path(stream_cache_root) / partition
         if (directory / STREAM_CACHE_MANIFEST_NAME).is_file():
-            memory, matrix, manifest = load_stream_cache(
-                Path(stream_cache_root), partition
-            )
-            memories[partition] = memory
-            matrices[partition] = matrix
+            store, manifest = load_stream_store(Path(stream_cache_root), partition)
+            store.close()
             manifests[partition] = manifest
             continue
-
-        representation = prepare_stream_representations(
+        manifest, standardizer = materialize_stream_store(
             partition,
-            cache_root=Path(cache_root),
+            cache_root=Path(stream_cache_root),
+            p1_cache_root=Path(cache_root),
             feature_root=Path(feature_root),
             source=Path(source),
             b4b_run_dir=Path(b4b_run_dir),
             p1b_run_dir=Path(p1_run_root) / P1B_EXPERIMENT_ID,
+            standardizer=standardizer,
+            manifest_fields={
+                **manifest_fields,
+                "embedding_cache_sha256": embedding_caches[partition]["cache_sha256"],
+            },
             _waveform_batches_for=_waveform_batches_for,
         )
-        cache = load_p1_embedding_cache(Path(cache_root), partition)
-        if standardizer is None:
-            if partition != "train":
-                raise M1MemoryError(
-                    "The distance standardizer must be fitted from the train "
-                    "stream before any validation memory is generated."
-                )
-            standardizer = build_distance_standardizer(
-                representation,
-                primary_train_stable_ids=cache.stable_ids,
-                upstream_identities=upstream,
-            )
-            standardizer_payload = standardizer.as_dict()
-            write_json_atomic(
-                Path(stream_cache_root) / STANDARDIZER_NAME, standardizer_payload
-            )
-        memory = generate_stream_memory(
-            representation.streams,
-            partition=partition,
-            representations=representation.by_stable_id(),
-            standardizer=standardizer,
-        )
-        manifest = materialize_stream_cache(
-            memory,
-            representation,
-            cache_root=Path(stream_cache_root),
-            manifest_fields={
-                "standardizer_sha256": standardizer_payload["standardizer_sha256"],
-                "p1_stage1_suite_sha256": suite["p1_stage1_suite_sha256"],
-                "p1b_lock_sha256": p1b_lock_sha256,
-                "physiology_transform_sha256": transform_sha256,
-                "embedding_cache_sha256": cache.manifest["cache_sha256"],
-                "feature_integrity_sha256": upstream[
-                    "development_feature_integrity_sha256"
-                ],
-                "source_integrity_sha256": upstream[
-                    "development_source_integrity_sha256"
-                ],
-                "git_sha": provenance["git_sha"],
-                "git_dirty": provenance["git_dirty"],
-                "dependency_digest": dependency_digest,
-            },
-        )
-        memory, matrix, manifest = load_stream_cache(
-            Path(stream_cache_root), partition
-        )
-        memories[partition] = memory
-        matrices[partition] = matrix
+        # Re-open through the validating loader so the promoted cache is proven
+        # from disk, then release every construction object before the next
+        # partition begins.
+        store, manifest = load_stream_store(Path(stream_cache_root), partition)
+        store.close()
         manifests[partition] = manifest
 
-    if standardizer_payload is None:
-        standardizer_payload = read_json(Path(stream_cache_root) / STANDARDIZER_NAME)
+    standardizer_payload = read_json(Path(stream_cache_root) / STANDARDIZER_NAME)
 
-    # --- supervised membership -----------------------------------------
+    # --- supervised membership (bounded, targeted) ----------------------
     train_cache = load_p1_embedding_cache(Path(cache_root), "train")
     validation_cache = load_p1_embedding_cache(Path(cache_root), "validation")
-    train_rows = select_rows(memories["train"], train_cache.stable_ids)
-    validation_rows = select_rows(
-        memories["validation"], validation_cache.stable_ids
-    )
     challenge_ids = tuple(item.stable_id for item in challenge.references)
     if set(challenge_ids) & set(validation_cache.stable_ids):
         raise M1MemoryError(
@@ -2034,30 +3023,82 @@ def execute_m1_stage1(
             "disjoint; a shared row indicates a lookup built from the wrong "
             "population."
         )
-    challenge_rows = select_rows(memories["validation"], challenge_ids)
+
+    train_store, _ = load_stream_store(Path(stream_cache_root), "train")
+    train_rows = locate_rows(train_store, train_cache.stable_ids)
+    train_base = np.asarray(
+        train_store.gather(REPRESENTATION_FILE, train_rows), dtype=np.float32
+    )
+    train_memory_columns = {
+        "d_short": train_store.gather(D_SHORT_FILE, train_rows),
+        "d_long": train_store.gather(D_LONG_FILE, train_rows),
+    }
+    train_store.close()
+    del train_store, train_rows
+
+    validation_store, _ = load_stream_store(Path(stream_cache_root), "validation")
+    validation_rows = locate_rows(validation_store, validation_cache.stable_ids)
+    challenge_rows = locate_rows(validation_store, challenge_ids)
+    validation_base = np.asarray(
+        validation_store.gather(REPRESENTATION_FILE, validation_rows), dtype=np.float32
+    )
+    challenge_base = np.asarray(
+        validation_store.gather(REPRESENTATION_FILE, challenge_rows), dtype=np.float32
+    )
+    validation_memory_columns = {
+        "d_short": validation_store.gather(D_SHORT_FILE, validation_rows),
+        "d_long": validation_store.gather(D_LONG_FILE, validation_rows),
+    }
+    challenge_memory_columns = {
+        "d_short": validation_store.gather(D_SHORT_FILE, challenge_rows),
+        "d_long": validation_store.gather(D_LONG_FILE, challenge_rows),
+    }
+    validation_evidence_rows = M1SelectedMemory(
+        cold_start_bins=tuple(
+            str(value)
+            for value in validation_store.gather(
+                COLD_START_BIN_FILE, validation_rows
+            )
+        ),
+        past_observed_count=np.asarray(
+            validation_store.gather(PAST_OBSERVED_FILE, validation_rows),
+            dtype=np.int64,
+        ),
+        past_update_count=np.asarray(
+            validation_store.gather(PAST_UPDATE_FILE, validation_rows), dtype=np.int64
+        ),
+        d_short=np.asarray(validation_memory_columns["d_short"], dtype=np.float64),
+        d_long=np.asarray(validation_memory_columns["d_long"], dtype=np.float64),
+        prototype_disagreement=np.asarray(
+            validation_store.gather(DISAGREEMENT_FILE, validation_rows),
+            dtype=np.float64,
+        ),
+    )
+    validation_store.close()
+    del validation_store, validation_rows, challenge_rows
+
+    def arm_matrix(experiment_id: str, base, columns) -> np.ndarray:
+        selected = [columns[name] for name in M1_ARM_FEATURES[experiment_id]]
+        return m1_arm_features(
+            experiment_id, base, np.stack(selected, axis=1).astype(np.float32)
+        )
 
     locks: dict[str, dict[str, Any]] = {}
     for experiment_id in M1_ARM_ORDER:
         locks[experiment_id] = run_m1_arm(
             experiment_id,
             run_root=Path(run_root),
-            train_features=m1_arm_features(
-                experiment_id,
-                matrices["train"][train_rows],
-                memories["train"].memory_matrix(experiment_id)[train_rows],
+            train_features=arm_matrix(
+                experiment_id, train_base, train_memory_columns
             ),
             train_labels=train_cache.labels,
-            validation_features=m1_arm_features(
-                experiment_id,
-                matrices["validation"][validation_rows],
-                memories["validation"].memory_matrix(experiment_id)[validation_rows],
+            validation_features=arm_matrix(
+                experiment_id, validation_base, validation_memory_columns
             ),
             validation_labels=validation_cache.labels,
             validation_subject_ids=validation_cache.subject_ids,
-            challenge_features=m1_arm_features(
-                experiment_id,
-                matrices["validation"][challenge_rows],
-                memories["validation"].memory_matrix(experiment_id)[challenge_rows],
+            challenge_features=arm_matrix(
+                experiment_id, challenge_base, challenge_memory_columns
             ),
             challenge_families=tuple(
                 item.target_family for item in challenge.references
@@ -2065,12 +3106,14 @@ def execute_m1_stage1(
             challenge_subject_ids=tuple(
                 item.subject_id for item in challenge.references
             ),
-            validation_memory=memories["validation"],
-            validation_rows=validation_rows,
+            validation_memory=validation_evidence_rows,
+            validation_rows=np.arange(
+                validation_evidence_rows.d_short.shape[0], dtype=np.int64
+            ),
             train_cache={
                 "stream_cache_sha256": manifests["train"]["stream_cache_sha256"],
                 "full_stream_row_count": manifests["train"]["full_stream_row_count"],
-                "supervised_rows": int(train_rows.shape[0]),
+                "supervised_rows": int(train_base.shape[0]),
             },
             validation_cache={
                 "stream_cache_sha256": manifests["validation"][
@@ -2079,8 +3122,8 @@ def execute_m1_stage1(
                 "full_stream_row_count": manifests["validation"][
                     "full_stream_row_count"
                 ],
-                "primary_rows": int(validation_rows.shape[0]),
-                "challenge_rows": int(challenge_rows.shape[0]),
+                "primary_rows": int(validation_base.shape[0]),
+                "challenge_rows": int(challenge_base.shape[0]),
             },
             standardizer={
                 "standardizer_sha256": standardizer_payload["standardizer_sha256"],

@@ -268,9 +268,28 @@ def official(tmp_path, monkeypatch):
             _primary(ALL_ROWS[partition]) if primary_only else ALL_ROWS[partition]
         ),
     )
-    monkeypatch.setattr(
-        m1_experiment, "read_frozen_physiology", lambda _root, _partition: raw
-    )
+    # Write real per-record npz files so the production chunked physiology
+    # reader is exercised rather than stubbed.
+    from cardiosentinel.features.schema import COMBINED_V1
+    from cardiosentinel.neural.physiology_fusion import morphology_columns
+
+    columns = list(morphology_columns())
+    feature_root = tmp_path / "features"
+    for partition, rows in ALL_ROWS.items():
+        directory = feature_root / partition
+        directory.mkdir(parents=True, exist_ok=True)
+        for record in sorted({row.record_id for row in rows}):
+            block = [row for row in rows if row.record_id == record]
+            features = np.zeros((len(block), len(COMBINED_V1.names)), dtype=np.float64)
+            for position, row in enumerate(block):
+                features[position, columns] = raw[row.stable_id]
+            np.savez(
+                directory / f"{record}.npz",
+                stable_ids=np.asarray(
+                    [row.stable_id for row in block], dtype=np.str_
+                ),
+                features=features,
+            )
     monkeypatch.setattr(
         m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
     )
@@ -295,7 +314,7 @@ def official(tmp_path, monkeypatch):
         "run_root": tmp_path / "runs",
         "stream_cache_root": tmp_path / "caches",
         "cache_root": tmp_path / "p1-caches",
-        "feature_root": tmp_path / "features",
+        "feature_root": feature_root,
         "source": tmp_path / "source",
         "b4b_run_dir": tmp_path / "b4b",
         "p1_run_root": tmp_path / "p1",
@@ -415,12 +434,12 @@ def test_official_route_selects_only_primary_rows_for_supervision(official):
 
 def test_official_route_scores_challenge_rows_at_causal_positions(official):
     _run(official)
-    memory = np.load(
-        official["stream_cache_root"] / "validation" / "m1_stream_memory.npz",
-        allow_pickle=False,
-    )
-    identifiers = memory["stable_id"].tolist()
-    counts = memory["past_observed_count"]
+    directory = official["stream_cache_root"] / "validation"
+    identifiers = [
+        str(value)
+        for value in np.load(directory / "stable_id.npy", allow_pickle=False)
+    ]
+    counts = np.load(directory / "past_observed_count.npy", allow_pickle=False)
     for row in official["challenge"]:
         position = identifiers.index(row.stable_id)
         # A challenge window's history is exactly the windows before it in its
@@ -456,11 +475,13 @@ def test_official_route_reuses_a_validated_stream_cache(official):
         ).read_text()
     )["stream_cache_sha256"]
     # A completed cache is reused, never rebuilt or overwritten.
-    memory, _, manifest = m1_experiment.load_stream_cache(
+    store, manifest = m1_experiment.load_stream_store(
         official["stream_cache_root"], "train"
     )
     assert manifest["stream_cache_sha256"] == first
-    assert len(memory.stable_ids) == len(TRAIN_ROWS)
+    assert manifest["full_stream_row_count"] == len(TRAIN_ROWS)
+    assert manifest["m1_stream_cache_schema"] == m1_experiment.M1_STREAM_CACHE_SCHEMA
+    store.close()
 
 
 def test_tampered_stream_cache_is_refused(official):
@@ -470,7 +491,7 @@ def test_tampered_stream_cache_is_refused(official):
     manifest["p1b_experiment_lock_sha256"] = "0" * 64
     path.write_text(json.dumps(manifest))
     with pytest.raises(Exception, match="digest validation"):
-        m1_experiment.load_stream_cache(official["stream_cache_root"], "train")
+        m1_experiment.load_stream_store(official["stream_cache_root"], "train")
 
 
 def test_a_self_consistent_but_wrong_cache_is_refused(official):
@@ -485,7 +506,7 @@ def test_a_self_consistent_but_wrong_cache_is_refused(official):
     manifest["stream_cache_sha256"] = canonical_sha256(manifest)
     path.write_text(json.dumps(manifest))
     with pytest.raises(Exception, match="frozen M1 protocol binds|expected"):
-        m1_experiment.load_stream_cache(official["stream_cache_root"], "train")
+        m1_experiment.load_stream_store(official["stream_cache_root"], "train")
 
 
 def test_tampered_standardizer_is_refused(official):
@@ -495,14 +516,14 @@ def test_tampered_standardizer_is_refused(official):
     payload["means"][0] = 42.0
     path.write_text(json.dumps(payload))
     with pytest.raises(Exception, match="digest validation"):
-        m1_experiment.load_stream_cache(official["stream_cache_root"], "train")
+        m1_experiment.load_stream_store(official["stream_cache_root"], "train")
 
 
 def test_a_missing_standardizer_stops_for_human_review(official):
     _run(official)
     (official["stream_cache_root"] / "M1_DISTANCE_STANDARDIZER.json").unlink()
     with pytest.raises(Exception, match="human review"):
-        m1_experiment.load_stream_cache(official["stream_cache_root"], "train")
+        m1_experiment.load_stream_store(official["stream_cache_root"], "train")
 
 
 def test_tampered_history_counts_are_refused(official):
@@ -516,7 +537,7 @@ def test_tampered_history_counts_are_refused(official):
     manifest["stream_cache_sha256"] = canonical_sha256(manifest)
     path.write_text(json.dumps(manifest))
     with pytest.raises(Exception, match="history counts"):
-        m1_experiment.load_stream_cache(official["stream_cache_root"], "train")
+        m1_experiment.load_stream_store(official["stream_cache_root"], "train")
 
 
 def test_tampered_chronology_digest_is_refused(official):
@@ -530,7 +551,7 @@ def test_tampered_chronology_digest_is_refused(official):
     manifest["stream_cache_sha256"] = canonical_sha256(manifest)
     path.write_text(json.dumps(manifest))
     with pytest.raises(Exception, match="chronology digest re-derived"):
-        m1_experiment.load_stream_cache(official["stream_cache_root"], "train")
+        m1_experiment.load_stream_store(official["stream_cache_root"], "train")
 
 
 def test_cli_route_needs_no_externally_injected_waveform_callback():
