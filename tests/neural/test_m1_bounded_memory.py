@@ -1,0 +1,880 @@
+"""Bounded-memory M1 execution: digest and scientific-semantic equivalence.
+
+Attempt 1 of the canonical Stage-1 run was consumed by host memory exhaustion,
+so the production path was reworked to be row-aligned and disk-backed. The whole
+point is that *only* the memory profile changed, so this file proves two things
+the reviewer actually cares about:
+
+* every streaming digest reproduces its legacy identity byte-for-byte, so no
+  historical or frozen identity moves;
+* the bounded path and the retained in-memory reference implementation produce
+  identical scientific content on a corpus containing both 2- and 3-channel
+  records, primary rows, extra rows and interleaved challenge rows.
+
+Everything is synthetic. No real corpus, model, run directory, canonical cache
+or test partition is touched.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+from torch import nn
+
+from cardiosentinel.neural import m1_experiment, p1_experiment
+from cardiosentinel.neural.integrity import canonical_sha256
+from cardiosentinel.neural.m1_experiment import (
+    M1_STREAM_CACHE_SCHEMA,
+    STAGING_CLAIM_NAME,
+    STAGING_PREFIX,
+    _stream_slices,
+    build_distance_standardizer_from_rows,
+    load_stream_store,
+    materialize_stream_store,
+    prepare_stream_representations,
+    scan_staging_directories,
+)
+from cardiosentinel.neural.m1_store import (
+    COLD_START_BIN_FILE,
+    D_LONG_FILE,
+    D_SHORT_FILE,
+    PAST_OBSERVED_FILE,
+    PAST_UPDATE_FILE,
+    RECORDING_AGE_FILE,
+    REPRESENTATION_FILE,
+    STABLE_ID_FILE,
+    M1RowStore,
+    M1StoreError,
+    M1StoreSpec,
+    StreamingCanonicalArrayDigest,
+    StreamingContentDigest,
+    locate_rows,
+    streaming_chronology_digest,
+    streaming_ordered_stable_id_digest,
+)
+from cardiosentinel.neural.p1_experiment import (
+    P1EmbeddingCache,
+    embedding_content_digest,
+    ordered_stable_id_digest,
+)
+from cardiosentinel.neural.patient_memory import (
+    M1_ARM_FEATURES,
+    M1_EXPERIMENT_IDS,
+    REPRESENTATION_DIM,
+    build_causal_streams,
+    fit_distance_standardizer,
+    generate_stream_memory,
+    ordered_chronology_digest,
+)
+from cardiosentinel.neural.physiology_fusion import (
+    EMBEDDING_DIM,
+    PHYSIOLOGY_DIM,
+    PHYSIOLOGY_FEATURE_NAMES,
+    fit_physiology_transform,
+    morphology_columns,
+)
+from tests.neural.test_patient_memory import reference
+
+STUB_DIGEST = "0" * 64
+PRIMARY = ("background_negative", "ischemic_positive")
+CHALLENGE = ("rate_related", "axis_shift", "conduction_change")
+FAMILIES = (*PRIMARY, *CHALLENGE, "quality_excluded")
+WINDOWS = 12
+
+
+# --------------------------------------------------------------------------
+# Digest equivalence — the identities must not move
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dtype,shape",
+    [
+        ("float32", (37, 146)),
+        ("float64", (41, 3)),
+        ("int64", (53, 2)),
+        ("float32", (1, 146)),
+        ("int64", (64,)),
+        ("float64", (128, 7)),
+    ],
+)
+@pytest.mark.parametrize("chunk", [1, 7, 16, 64, 10_000])
+def test_streaming_content_digest_equals_legacy(dtype, shape, chunk):
+    values = (np.random.default_rng(3).normal(size=shape) * 100).astype(dtype)
+    legacy = embedding_content_digest(values)
+    digest = StreamingContentDigest(values.shape, values.dtype)
+    for start in range(0, values.shape[0], chunk):
+        digest.update(values[start : start + chunk])
+    assert digest.hexdigest() == legacy
+
+
+def test_streaming_content_digest_refuses_a_truncated_stream():
+    values = np.zeros((10, 4), dtype=np.float32)
+    digest = StreamingContentDigest(values.shape, values.dtype)
+    digest.update(values[:6])
+    with pytest.raises(M1StoreError, match="saw 6 rows"):
+        digest.hexdigest()
+
+
+def test_streaming_stable_id_digest_equals_legacy():
+    identifiers = [
+        f"ltstdb:r{index // 3}:{index % 3}:{index * 1250}:{index * 1250 + 2500}"
+        for index in range(211)
+    ]
+    assert streaming_ordered_stable_id_digest(iter(identifiers)) == (
+        ordered_stable_id_digest(identifiers)
+    )
+
+
+def test_streaming_stable_id_digest_refuses_duplicates():
+    with pytest.raises(M1StoreError, match="duplicates"):
+        streaming_ordered_stable_id_digest(iter(["a", "b", "a"]))
+
+
+def test_streaming_chronology_digest_equals_legacy():
+    rows = [
+        reference(record, channel, index)
+        for record in ("rA", "rB")
+        for channel in (0, 1, 2)
+        for index in range(7)
+    ]
+    streams = build_causal_streams(rows)
+    triples = [
+        (item.record_id, item.channel_index, item.start_sample)
+        for key in sorted(streams)
+        for item in streams[key]
+    ]
+    assert streaming_chronology_digest(iter(triples)) == ordered_chronology_digest(
+        streams
+    )
+
+
+def test_streaming_canonical_digest_matches_whole_object_serialization():
+    payload = {"order": "row_order", "stable_ids": ["a", "b", "c"]}
+    digest = StreamingCanonicalArrayDigest({"order": "row_order"}, "stable_ids")
+    for value in payload["stable_ids"]:
+        digest.append(value)
+    assert digest.hexdigest() == canonical_sha256(payload)
+
+
+def test_streaming_canonical_digest_handles_keys_around_the_list():
+    # `sort_keys=True` can place scalars on either side of the streamed list.
+    payload = {"aaa": 1, "rows": [[1, 2]], "zzz": {"b": 2, "a": 1}}
+    digest = StreamingCanonicalArrayDigest({"aaa": 1, "zzz": {"b": 2, "a": 1}}, "rows")
+    digest.append([1, 2])
+    assert digest.hexdigest() == canonical_sha256(payload)
+
+
+# --------------------------------------------------------------------------
+# Synthetic corpus: 2-channel and 3-channel records, mixed families
+# --------------------------------------------------------------------------
+
+
+class _StubEncoder(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.projection = nn.Linear(2500, EMBEDDING_DIM)
+
+    def encode(self, waveforms: torch.Tensor) -> torch.Tensor:
+        return self.projection(waveforms.squeeze(1))
+
+
+def _fixed_encoder() -> _StubEncoder:
+    torch.manual_seed(0)
+    return _StubEncoder()
+
+
+_ENCODER = _fixed_encoder()
+
+
+def _values(stable_id: str, width: int) -> np.ndarray:
+    seed = abs(hash(stable_id)) % (2**32)
+    return np.random.default_rng(seed).normal(size=width).astype(np.float32)
+
+
+def _waveform(stable_id: str) -> torch.Tensor:
+    return torch.from_numpy(_values(stable_id, 2500)).reshape(1, 2500)
+
+
+def _embedding(stable_id: str) -> np.ndarray:
+    with torch.no_grad():
+        return (
+            _ENCODER.encode(_waveform(stable_id).unsqueeze(0))
+            .to(torch.float32)
+            .numpy()[0]
+        )
+
+
+class _StubWaveformDataset:
+    def __init__(self, references, source):
+        self._references = tuple(references)
+        self.source = Path(source)
+        self.reads = 0
+
+    def read_waveform(self, item):
+        self.reads += 1
+        return _waveform(item.stable_id)
+
+    @property
+    def stats(self):
+        class _Stats:
+            source_reads = self.reads
+
+        return _Stats()
+
+
+def _corpus(partition: str, records: dict[str, int]):
+    rows = []
+    for position, (record, channels) in enumerate(sorted(records.items())):
+        for channel in range(channels):
+            for index in range(WINDOWS):
+                rows.append(
+                    reference(
+                        record,
+                        channel,
+                        index,
+                        subject=f"ltstdb:s{position:04d}",
+                        family=FAMILIES[index % len(FAMILIES)],
+                        partition=partition,
+                    )
+                )
+    return tuple(rows)
+
+
+# A 2-channel and a 3-channel record in each partition, exactly as the frozen
+# corpus mixes them.
+TRAIN_ROWS = _corpus("train", {"rA": 2, "rB": 3})
+VALIDATION_ROWS = _corpus("validation", {"rC": 2, "rD": 3})
+ALL_ROWS = {"train": TRAIN_ROWS, "validation": VALIDATION_ROWS}
+
+
+@pytest.fixture
+def corpus(tmp_path, monkeypatch):
+    primary = {
+        partition: tuple(r for r in rows if r.target_family in PRIMARY)
+        for partition, rows in ALL_ROWS.items()
+    }
+    raw = {
+        row.stable_id: _values(row.stable_id, PHYSIOLOGY_DIM).astype(np.float64)
+        for rows in ALL_ROWS.values()
+        for row in rows
+    }
+    validity = PHYSIOLOGY_FEATURE_NAMES.index("morphology_valid")
+    for values in raw.values():
+        values[validity] = 1.0
+    transform = fit_physiology_transform(
+        np.stack([raw[r.stable_id] for r in primary["train"]]), partition="train"
+    )
+
+    from cardiosentinel.features.schema import COMBINED_V1
+
+    columns = list(morphology_columns())
+    feature_root = tmp_path / "features"
+    for partition, rows in ALL_ROWS.items():
+        directory = feature_root / partition
+        directory.mkdir(parents=True, exist_ok=True)
+        for record in sorted({row.record_id for row in rows}):
+            block = [row for row in rows if row.record_id == record]
+            features = np.zeros((len(block), len(COMBINED_V1.names)), dtype=np.float64)
+            for offset, row in enumerate(block):
+                features[offset, columns] = raw[row.stable_id]
+            np.savez(
+                directory / f"{record}.npz",
+                stable_ids=np.asarray([r.stable_id for r in block], dtype=np.str_),
+                features=features,
+            )
+
+    def _cache(_root, partition):
+        rows = primary[partition]
+        return P1EmbeddingCache(
+            partition=partition,
+            stable_ids=tuple(r.stable_id for r in rows),
+            embeddings=np.stack([_embedding(r.stable_id) for r in rows]),
+            labels=np.asarray(
+                [int(r.target_family == "ischemic_positive") for r in rows],
+                dtype=np.int64,
+            ),
+            subject_ids=tuple(r.subject_id for r in rows),
+            manifest={
+                "cache_sha256": m1_experiment.FROZEN_P1_EMBEDDING_CACHE_SHA256[
+                    partition
+                ]
+            },
+        )
+
+    monkeypatch.setattr(
+        m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, STUB_DIGEST)
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "require_clean_checkout",
+        lambda: {"git_sha": "f" * 40, "git_dirty": False},
+    )
+    monkeypatch.setattr(m1_experiment, "FROZEN_DEPENDENCY_DIGEST", STUB_DIGEST)
+    monkeypatch.setattr(
+        m1_experiment,
+        "EXPECTED_POPULATIONS",
+        {"train": {"total": len(primary["train"])}},
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "FROZEN_PHYSIOLOGY_TRANSFORM_SHA256",
+        transform.as_dict()["transform_sha256"],
+    )
+    monkeypatch.setattr(
+        m1_experiment, "load_frozen_physiology_transform", lambda *_a: transform
+    )
+    monkeypatch.setattr(m1_experiment, "load_p1_embedding_cache", _cache)
+    monkeypatch.setattr(
+        p1_experiment, "load_p1_embedding_cache", _cache, raising=False
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "load_b4_references",
+        lambda _root, partition, primary_only=True: (
+            tuple(r for r in ALL_ROWS[partition] if r.target_family in PRIMARY)
+            if primary_only
+            else ALL_ROWS[partition]
+        ),
+    )
+    monkeypatch.setattr(
+        p1_experiment,
+        "read_frozen_physiology",
+        lambda _root, _partition: raw,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        m1_experiment, "read_frozen_physiology", lambda _root, _partition: raw
+    )
+    monkeypatch.setattr(
+        m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
+    )
+    monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+
+    return {
+        "cache_root": tmp_path / "caches",
+        "p1_cache_root": tmp_path / "p1",
+        "feature_root": feature_root,
+        "source": tmp_path / "source",
+        "b4b_run_dir": tmp_path / "b4b",
+        "p1b_run_dir": tmp_path / "p1b",
+        "primary": primary,
+        "transform": transform,
+    }
+
+
+UPSTREAM = {
+    "p1_stage1_suite_sha256": m1_experiment.FROZEN_P1_STAGE1_SUITE_SHA256,
+    "p1b_experiment_lock_sha256": m1_experiment.FROZEN_P1B_LOCK_SHA256,
+    "physiology_transform_sha256": m1_experiment.FROZEN_PHYSIOLOGY_TRANSFORM_SHA256,
+    "p1_train_embedding_cache_sha256": (
+        m1_experiment.FROZEN_P1_EMBEDDING_CACHE_SHA256["train"]
+    ),
+    "encoder_checkpoint_sha256": m1_experiment.B4B_CHECKPOINT_SHA256,
+    "development_feature_integrity_sha256": (
+        m1_experiment.FROZEN_DEVELOPMENT_FEATURE_INTEGRITY_SHA256
+    ),
+    "development_source_integrity_sha256": (
+        m1_experiment.FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256
+    ),
+}
+
+
+def _manifest_fields(partition: str) -> dict:
+    return {
+        "upstream_identities": {
+            **UPSTREAM,
+            "physiology_transform_sha256": (
+                m1_experiment.FROZEN_PHYSIOLOGY_TRANSFORM_SHA256
+            ),
+        },
+        "p1_stage1_suite_sha256": UPSTREAM["p1_stage1_suite_sha256"],
+        "p1b_lock_sha256": UPSTREAM["p1b_experiment_lock_sha256"],
+        "physiology_transform_sha256": (
+            m1_experiment.FROZEN_PHYSIOLOGY_TRANSFORM_SHA256
+        ),
+        "feature_integrity_sha256": UPSTREAM[
+            "development_feature_integrity_sha256"
+        ],
+        "source_integrity_sha256": UPSTREAM["development_source_integrity_sha256"],
+        "embedding_cache_sha256": m1_experiment.FROZEN_P1_EMBEDDING_CACHE_SHA256[
+            partition
+        ],
+        "git_sha": "f" * 40,
+        "git_dirty": False,
+        "dependency_digest": STUB_DIGEST,
+    }
+
+
+def _bounded(corpus, partition, standardizer=None):
+    fields = dict(_manifest_fields(partition))
+    fields["upstream_identities"] = {
+        **fields["upstream_identities"],
+        "physiology_transform_sha256": (
+            m1_experiment.FROZEN_PHYSIOLOGY_TRANSFORM_SHA256
+        ),
+    }
+    return materialize_stream_store(
+        partition,
+        cache_root=corpus["cache_root"],
+        p1_cache_root=corpus["p1_cache_root"],
+        feature_root=corpus["feature_root"],
+        source=corpus["source"],
+        b4b_run_dir=corpus["b4b_run_dir"],
+        p1b_run_dir=corpus["p1b_run_dir"],
+        standardizer=standardizer,
+        manifest_fields=fields,
+    )
+
+
+def _reference_path(corpus, partition, standardizer=None):
+    """The retained in-memory implementation, used only as a test oracle."""
+    representation = prepare_stream_representations(
+        partition,
+        cache_root=corpus["p1_cache_root"],
+        feature_root=corpus["feature_root"],
+        source=corpus["source"],
+        b4b_run_dir=corpus["b4b_run_dir"],
+        p1b_run_dir=corpus["p1b_run_dir"],
+    )
+    if standardizer is None:
+        lookup = representation.by_stable_id()
+        matrix = np.stack(
+            [
+                np.asarray(lookup[r.stable_id], dtype=np.float64)
+                for r in corpus["primary"]["train"]
+            ]
+        )
+        standardizer = fit_distance_standardizer(matrix, partition="train")
+    memory = generate_stream_memory(
+        representation.streams,
+        partition=partition,
+        representations=representation.by_stable_id(),
+        standardizer=standardizer,
+    )
+    return representation, memory, standardizer
+
+
+# --------------------------------------------------------------------------
+# Exact small-scale scientific equivalence
+# --------------------------------------------------------------------------
+
+
+def test_bounded_path_matches_the_reference_implementation_exactly(corpus):
+    manifest, standardizer = _bounded(corpus, "train")
+    store, reloaded = load_stream_store(corpus["cache_root"], "train")
+    representation, memory, reference_standardizer = _reference_path(corpus, "train")
+
+    # row order
+    stable = [str(v) for v in np.asarray(store.array(STABLE_ID_FILE))]
+    assert tuple(stable) == memory.stable_ids
+    assert tuple(stable) == representation.stable_ids
+
+    # fused z_t
+    lookup = representation.by_stable_id()
+    expected = np.stack([lookup[key] for key in stable])
+    np.testing.assert_array_equal(
+        np.asarray(store.array(REPRESENTATION_FILE)), expected
+    )
+
+    # standardizer statistics and cold-start prior
+    np.testing.assert_array_equal(
+        np.asarray(standardizer.means), np.asarray(reference_standardizer.means)
+    )
+    np.testing.assert_array_equal(
+        np.asarray(standardizer.scales), np.asarray(reference_standardizer.scales)
+    )
+    np.testing.assert_array_equal(
+        standardizer.prior_vector(), reference_standardizer.prior_vector()
+    )
+    assert standardizer.zero_variance_dimensions == (
+        reference_standardizer.zero_variance_dimensions
+    )
+
+    # causal memory
+    np.testing.assert_array_equal(
+        np.asarray(store.array(D_SHORT_FILE)), memory.d_short
+    )
+    np.testing.assert_array_equal(np.asarray(store.array(D_LONG_FILE)), memory.d_long)
+    np.testing.assert_array_equal(
+        np.asarray(store.array(PAST_OBSERVED_FILE)), memory.past_observed_count
+    )
+    np.testing.assert_array_equal(
+        np.asarray(store.array(PAST_UPDATE_FILE)), memory.past_update_count
+    )
+    np.testing.assert_array_equal(
+        np.asarray(store.array(RECORDING_AGE_FILE)), memory.recording_age_seconds
+    )
+    assert tuple(
+        str(v) for v in np.asarray(store.array(COLD_START_BIN_FILE))
+    ) == memory.cold_start_bins
+
+    # logical content identities
+    assert reloaded["ordered_stable_id_sha256"] == ordered_stable_id_digest(
+        memory.stable_ids
+    )
+    assert reloaded["ordered_chronology_sha256"] == memory.chronology_sha256
+    assert reloaded["representation_content_sha256"] == embedding_content_digest(
+        expected
+    )
+    assert reloaded["d_short_content_sha256"] == embedding_content_digest(
+        memory.d_short
+    )
+    assert reloaded["d_long_content_sha256"] == embedding_content_digest(memory.d_long)
+    assert reloaded["history_count_sha256"] == embedding_content_digest(
+        np.stack([memory.past_observed_count, memory.past_update_count], axis=1)
+    )
+    assert manifest["stream_cache_sha256"] == reloaded["stream_cache_sha256"]
+    store.close()
+
+
+def test_bounded_arm_feature_matrices_match_the_reference(corpus):
+    _manifest, standardizer = _bounded(corpus, "train")
+    store, _ = load_stream_store(corpus["cache_root"], "train")
+    representation, memory, _ = _reference_path(corpus, "train", standardizer)
+
+    primary_ids = [r.stable_id for r in corpus["primary"]["train"]]
+    positions = locate_rows(store, primary_ids)
+    base = np.asarray(store.gather(REPRESENTATION_FILE, positions), dtype=np.float32)
+    columns = {
+        "d_short": store.gather(D_SHORT_FILE, positions),
+        "d_long": store.gather(D_LONG_FILE, positions),
+    }
+
+    from cardiosentinel.neural.patient_memory import m1_arm_features, select_rows
+
+    reference_rows = select_rows(memory, primary_ids)
+    lookup = representation.by_stable_id()
+    reference_base = np.stack([lookup[key] for key in primary_ids])
+
+    for experiment_id in M1_EXPERIMENT_IDS:
+        bounded = m1_arm_features(
+            experiment_id,
+            base,
+            np.stack(
+                [columns[name] for name in M1_ARM_FEATURES[experiment_id]], axis=1
+            ).astype(np.float32),
+        )
+        expected = m1_arm_features(
+            experiment_id,
+            reference_base,
+            memory.memory_matrix(experiment_id)[reference_rows],
+        )
+        np.testing.assert_array_equal(bounded, expected)
+        assert bounded.shape[1] == REPRESENTATION_DIM + len(
+            M1_ARM_FEATURES[experiment_id]
+        )
+    store.close()
+
+
+def test_bounded_path_preserves_three_channel_stream_independence(corpus):
+    _bounded(corpus, "train")
+    store, manifest = load_stream_store(corpus["cache_root"], "train")
+    assert manifest["channel_indices"] == [0, 1, 2]
+    # rA has 2 channels, rB has 3 -> 5 independent streams.
+    assert manifest["stream_count"] == 5
+    channels = np.asarray(store.array("channel_index.npy"))
+    records = np.asarray(store.array("record_id.npy"))
+    assert sorted({int(v) for v in channels[records == "rB"]}) == [0, 1, 2]
+    assert sorted({int(v) for v in channels[records == "rA"]}) == [0, 1]
+    # every stream cold-starts independently
+    observed = np.asarray(store.array(PAST_OBSERVED_FILE))
+    assert int(np.sum(observed == 0)) == manifest["stream_count"]
+    store.close()
+
+
+def test_bounded_challenge_rows_keep_their_causal_positions(corpus):
+    _manifest, standardizer = _bounded(corpus, "train")
+    _bounded(corpus, "validation", standardizer)
+    store, _ = load_stream_store(corpus["cache_root"], "validation")
+    _representation, memory, _ = _reference_path(corpus, "validation", standardizer)
+
+    challenge_ids = [
+        r.stable_id for r in VALIDATION_ROWS if r.target_family in CHALLENGE
+    ]
+    positions = locate_rows(store, challenge_ids)
+    from cardiosentinel.neural.patient_memory import select_rows
+
+    reference_rows = select_rows(memory, challenge_ids)
+    np.testing.assert_array_equal(
+        np.asarray(store.gather(PAST_OBSERVED_FILE, positions)),
+        memory.past_observed_count[reference_rows],
+    )
+    np.testing.assert_array_equal(
+        np.asarray(store.gather(D_SHORT_FILE, positions)),
+        memory.d_short[reference_rows],
+    )
+    store.close()
+
+
+def test_bounded_history_is_label_independent(corpus):
+    """Every full-stream row participates, primary or not."""
+    _bounded(corpus, "train")
+    store, manifest = load_stream_store(corpus["cache_root"], "train")
+    assert manifest["full_stream_row_count"] == len(TRAIN_ROWS)
+    assert manifest["label_independent_history"] is True
+    assert manifest["primary_rows_reused"] == len(corpus["primary"]["train"])
+    assert manifest["rows_newly_extracted"] == len(TRAIN_ROWS) - len(
+        corpus["primary"]["train"]
+    )
+    store.close()
+
+
+def test_bounded_physiology_uses_the_exact_frozen_transform(corpus):
+    _bounded(corpus, "train")
+    store, manifest = load_stream_store(corpus["cache_root"], "train")
+    assert manifest["physiology_transform_sha256"] == (
+        corpus["transform"].as_dict()["transform_sha256"]
+    )
+    representation = np.asarray(store.array(REPRESENTATION_FILE))
+    _rep, _memory, _std = _reference_path(corpus, "train")
+    # The physiology block is bit-identical to the reference transform output.
+    assert representation.shape[1] == REPRESENTATION_DIM
+    assert np.all(np.isfinite(representation[:, EMBEDDING_DIM:]))
+    store.close()
+
+
+def test_bounded_standardizer_is_primary_train_only(corpus):
+    _bounded(corpus, "train")
+    payload = json.loads(
+        (corpus["cache_root"] / "M1_DISTANCE_STANDARDIZER.json").read_text()
+    )
+    assert payload["fitted_on_partition"] == "train"
+    assert payload["fitted_on_full_stream"] is False
+    assert payload["fitted_rows"] == len(corpus["primary"]["train"])
+    assert payload["validation_statistics_used"] is False
+    assert payload["input_identities"]["p1b_experiment_lock_sha256"] == (
+        m1_experiment.FROZEN_P1B_LOCK_SHA256
+    )
+
+
+def test_standardizer_from_rows_refuses_null_identities(corpus):
+    with pytest.raises(Exception, match="absent or null"):
+        build_distance_standardizer_from_rows(
+            np.zeros((len(corpus["primary"]["train"]), REPRESENTATION_DIM)),
+            primary_train_stable_ids=[
+                r.stable_id for r in corpus["primary"]["train"]
+            ],
+            upstream_identities={**UPSTREAM, "p1b_experiment_lock_sha256": None},
+        )
+
+
+# --------------------------------------------------------------------------
+# Extraction, reuse and encoder integrity
+# --------------------------------------------------------------------------
+
+
+def test_extra_rows_are_extracted_exactly_once_and_reuse_is_proven(corpus):
+    manifest, _ = _bounded(corpus, "train")
+    audit = manifest["primary_overlap_audit"]
+    extra = len(TRAIN_ROWS) - len(corpus["primary"]["train"])
+    assert audit["rows_newly_extracted"] == extra
+    assert audit["extraction_receipt"]["rows_extracted"] == extra
+    assert audit["extraction_receipt"]["batch_size"] == 256
+    assert audit["extra_disjoint_from_primary_cache"] is True
+    assert audit["extra_ordered_stable_id_sha256"] is not None
+    assert audit["extra_embedding_content_sha256"] is not None
+    assert audit["waveform_source_reads"] > 0
+
+
+def test_encoder_state_is_unchanged_by_extraction(corpus):
+    manifest, _ = _bounded(corpus, "train")
+    receipt = manifest["primary_overlap_audit"]["extraction_receipt"]
+    assert receipt["encoder_state_unchanged"] is True
+    assert receipt["encoder_fine_tuned"] is False
+    assert (
+        receipt["encoder_state_sha256_before"] == receipt["encoder_state_sha256_after"]
+    )
+
+
+def test_primary_rows_are_reused_not_regenerated(corpus):
+    manifest, _ = _bounded(corpus, "train")
+    audit = manifest["primary_overlap_audit"]
+    # Only the deliberate audit sample re-touches primary rows.
+    assert 0 < audit["re_extracted_primary_rows"] <= 64
+    assert audit["re_extracted_primary_max_abs_deviation"] <= (
+        m1_experiment.PRIMARY_AUDIT_TOLERANCE
+    )
+
+
+# --------------------------------------------------------------------------
+# Cache, staging and loader refusals
+# --------------------------------------------------------------------------
+
+
+def test_existing_cache_is_never_overwritten(corpus):
+    _bounded(corpus, "train")
+    with pytest.raises(Exception, match="never overwritten"):
+        _bounded(corpus, "train")
+
+
+def test_partial_staging_area_stops_for_human_review(corpus):
+    staging = corpus["cache_root"] / f"{STAGING_PREFIX}train"
+    staging.mkdir(parents=True)
+    (staging / STAGING_CLAIM_NAME).write_text("{}")
+    assert scan_staging_directories(corpus["cache_root"]) == [str(staging)]
+    with pytest.raises(Exception, match="never resumed"):
+        _bounded(corpus, "train")
+    # untouched: no delete, no repair, no resume
+    assert staging.is_dir()
+
+
+def test_promoted_cache_leaves_no_staging_directory(corpus):
+    _bounded(corpus, "train")
+    assert scan_staging_directories(corpus["cache_root"]) == []
+    claim = json.loads(
+        (corpus["cache_root"] / "train" / STAGING_CLAIM_NAME).read_text()
+    )
+    assert claim["promoted_to_canonical_cache"] is True
+    assert claim["resume_permitted"] is False
+    assert claim["automatic_deletion_permitted"] is False
+
+
+def test_loader_refuses_a_wrong_schema(corpus):
+    _bounded(corpus, "train")
+    path = corpus["cache_root"] / "train" / "M1_STREAM_CACHE_MANIFEST.json"
+    manifest = json.loads(path.read_text())
+    manifest["m1_stream_cache_schema"] = 99
+    manifest.pop("stream_cache_sha256")
+    manifest["stream_cache_sha256"] = canonical_sha256(manifest)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(Exception, match="is not the supported"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_refuses_a_mutated_array(corpus):
+    _bounded(corpus, "train")
+    target = corpus["cache_root"] / "train" / D_SHORT_FILE
+    values = np.load(target, allow_pickle=False)
+    values[0] += 1.0
+    np.save(target, values)
+    with pytest.raises(Exception, match="does not match its digest"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_opens_arrays_read_only(corpus):
+    _bounded(corpus, "train")
+    store, _ = load_stream_store(corpus["cache_root"], "train")
+    array = store.array(REPRESENTATION_FILE)
+    assert not array.flags.writeable, "a validated cache must be read-only"
+    store.close()
+
+
+def test_loader_refuses_the_test_partition(corpus):
+    with pytest.raises(Exception):
+        load_stream_store(corpus["cache_root"], "test")
+
+
+def test_locate_rows_refuses_unknown_and_duplicate_selections(corpus):
+    _bounded(corpus, "train")
+    store, _ = load_stream_store(corpus["cache_root"], "train")
+    with pytest.raises(M1StoreError, match="absent"):
+        locate_rows(store, ["ltstdb:zz:0:0:2500"])
+    first = TRAIN_ROWS[0].stable_id
+    with pytest.raises(M1StoreError, match="duplicates"):
+        locate_rows(store, [first, first])
+    store.close()
+
+
+def test_stream_slices_are_contiguous_and_cover_every_row():
+    rows = [
+        reference(record, channel, index)
+        for record in ("rA", "rB")
+        for channel in (0, 1, 2)
+        for index in range(4)
+    ]
+    streams = build_causal_streams(rows)
+    ordered = [item for key in sorted(streams) for item in streams[key]]
+    slices = _stream_slices(ordered)
+    assert len(slices) == 6
+    assert slices[0][1] == 0
+    assert slices[-1][2] == len(ordered)
+    for (_key, _begin, end), (_next_key, begin, _next_end) in zip(
+        slices, slices[1:], strict=False
+    ):
+        assert end == begin
+
+
+# --------------------------------------------------------------------------
+# Governance reporting
+# --------------------------------------------------------------------------
+
+
+def test_preflight_reports_the_attempt_one_governance_block(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, STUB_DIGEST)
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "require_clean_checkout",
+        lambda: {"git_sha": "f" * 40, "git_dirty": False},
+    )
+    report = m1_experiment.m1_preflight(tmp_path / "runs", tmp_path / "caches")
+    governance = report["execution_governance"]
+    assert governance["prior_authorized_invocation_count"] == 1
+    assert governance["prior_failed_preclaim_attempt_documented"] is True
+    assert governance["prior_failed_attempt_document"] == (
+        "docs/M1_STAGE1_ATTEMPT1_FAILURE.md"
+    )
+    assert governance["prior_attempt_scientific_artifacts_created"] is False
+    assert governance["prior_attempt_arm_claims_created"] is False
+    assert governance["replacement_execution_requires_new_human_authorization"] is True
+    assert report["m1_stream_cache_schema"] == M1_STREAM_CACHE_SCHEMA
+    # Reporting prior history must not itself authorize anything.
+    assert report["ready_for_canonical_m1_stage1"] is False
+
+
+def test_attempt_one_failure_document_exists_and_is_conservative():
+    document = Path("docs/M1_STAGE1_ATTEMPT1_FAILURE.md").read_text()
+    assert "strongly consistent with process termination under host memory" in document
+    assert "kernel OOM killer confirmed" not in document
+    assert "137" in document
+    assert "first human authorization is CONSUMED" in document.replace("**", "")
+
+
+def test_preflight_flags_a_staging_directory_for_human_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, STUB_DIGEST)
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "require_clean_checkout",
+        lambda: {"git_sha": "f" * 40, "git_dirty": False},
+    )
+    caches = tmp_path / "caches"
+    (caches / f"{STAGING_PREFIX}train").mkdir(parents=True)
+    report = m1_experiment.m1_preflight(tmp_path / "runs", caches)
+    assert report["status"] == "partial_stream_cache_human_review_required"
+    assert report["stream_cache_state"]["staging_directories"]
+    assert report["human_review_required"] is True
+
+
+# --------------------------------------------------------------------------
+# Store mechanics
+# --------------------------------------------------------------------------
+
+
+def test_row_store_round_trips_and_digests_in_chunks(tmp_path):
+    spec = M1StoreSpec(rows=1000, representation_dim=REPRESENTATION_DIM)
+    with M1RowStore(tmp_path / "store", spec, create=True) as store:
+        values = np.random.default_rng(1).normal(size=(1000, REPRESENTATION_DIM))
+        store.array(REPRESENTATION_FILE)[:] = values.astype(np.float32)
+        store.flush()
+        assert store.content_digest(REPRESENTATION_FILE) == embedding_content_digest(
+            values.astype(np.float32)
+        )
+        assert store.content_digest(REPRESENTATION_FILE, chunk_rows=7) == (
+            store.content_digest(REPRESENTATION_FILE, chunk_rows=999)
+        )
+
+
+def test_row_store_refuses_a_missing_array(tmp_path):
+    spec = M1StoreSpec(rows=8, representation_dim=REPRESENTATION_DIM)
+    M1RowStore(tmp_path / "store", spec, create=True).close()
+    (tmp_path / "store" / D_SHORT_FILE).unlink()
+    with pytest.raises(M1StoreError, match="missing"):
+        M1RowStore(tmp_path / "store", spec, create=False)
