@@ -1631,6 +1631,10 @@ def _fill_embeddings(
 
     extra_rows: list[int] = []
     extra_refs: list[B4WindowReference] = []
+    # Each flush builds its own B4WaveformDataset, so `stats.source_reads` is
+    # cumulative WITHIN a flush and restarts at the next one. Taking max() across
+    # independent instances therefore reported roughly one batch, not the whole
+    # extraction. Per-flush totals are accumulated instead.
     reads = 0
     extracted = 0
     extra_digest = StreamingContentDigest((0, EMBEDDING_DIM), np.float32)
@@ -1649,10 +1653,11 @@ def _fill_embeddings(
         )
         produced: set[str] = set()
         cursor = 0
+        flush_reads = 0
         for identifiers, waveforms, stats in batches:
             embeddings, _ = extract_frozen_embeddings(encoder, waveforms)
             block = embeddings.to(torch.float32).numpy()
-            reads = max(reads, int(getattr(stats, "source_reads", reads)))
+            flush_reads = max(flush_reads, int(getattr(stats, "source_reads", 0)))
             for offset, key in enumerate(identifiers):
                 identifier = str(key)
                 if identifier in cache_position:
@@ -1679,6 +1684,7 @@ def _fill_embeddings(
                 f"The waveform iterator produced {cursor} of "
                 f"{len(extra_refs)} requested rows."
             )
+        reads += flush_reads
         extra_refs.clear()
         extra_rows.clear()
 
@@ -1704,6 +1710,12 @@ def _fill_embeddings(
         )
     if extracted != len(extra_ids):
         raise M1MemoryError("Extra-row extraction count does not match the plan.")
+    if waveform_batches_for is None and reads != extracted:
+        raise M1MemoryError(
+            f"The canonical waveform route reported {reads} source reads for "
+            f"{extracted} extracted rows. One emitted row must correspond to "
+            "exactly one validated waveform read."
+        )
 
     # Digest the extracted rows by re-reading them from disk in bounded blocks.
     if extra_ids:
@@ -1729,7 +1741,6 @@ def _fill_embeddings(
         "extra_embedding_content_sha256": (
             extra_digest.hexdigest() if extra_ids else None
         ),
-        "waveform_source_reads": reads,
         "extraction_receipt": {
             "encoder_state_sha256_before": before,
             "encoder_state_sha256_after": after,
@@ -1739,8 +1750,32 @@ def _fill_embeddings(
             "embedding_dim": EMBEDDING_DIM,
             "batch_size": WAVEFORM_BATCH_SIZE,
             "rows_extracted": extracted,
+            "waveform_source_reads": reads,
         },
     }
+
+
+def _audit_sample_references(
+    ordered: Sequence[B4WindowReference], cache: Any
+) -> list[B4WindowReference]:
+    """The deterministic audit sample, found without a full-corpus mapping.
+
+    The selection rule is unchanged: every `step`-th frozen primary ID that is
+    also present in the stream, truncated to `PRIMARY_AUDIT_ROWS`. Only those
+    candidate IDs are held, so this costs a set of at most a few dozen strings
+    instead of a `stable_id -> reference` dictionary over 2.2 M rows.
+    """
+    step = max(len(cache.stable_ids) // PRIMARY_AUDIT_ROWS, 1)
+    candidates = [
+        str(key) for index, key in enumerate(cache.stable_ids) if index % step == 0
+    ]
+    wanted = set(candidates)
+    found: dict[str, B4WindowReference] = {}
+    for reference in ordered:
+        if reference.stable_id in wanted and reference.stable_id not in found:
+            found[reference.stable_id] = reference
+    # Preserve the frozen cache order, then truncate exactly as before.
+    return [found[key] for key in candidates if key in found][:PRIMARY_AUDIT_ROWS]
 
 
 def _audit_primary_overlap(
@@ -1753,22 +1788,34 @@ def _audit_primary_overlap(
     partition: str,
     waveform_batches_for,
 ) -> dict[str, Any]:
-    """Re-extract a deterministic primary sample and compare it to the cache."""
-    by_id = {reference.stable_id: reference for reference in ordered}
-    step = max(len(cache.stable_ids) // PRIMARY_AUDIT_ROWS, 1)
-    sample = [
-        by_id[key]
-        for index, key in enumerate(cache.stable_ids)
-        if index % step == 0 and key in by_id
-    ][:PRIMARY_AUDIT_ROWS]
+    """Re-extract a deterministic primary sample and compare it to the cache.
+
+    The audit carries its own encoder-state proof and its own read receipt: it
+    runs the locked encoder just as the extraction does, so its provenance must
+    stand on its own rather than being inferred from the extraction pass.
+    """
+    empty = {
+        "re_extracted_primary_rows": 0,
+        "re_extracted_primary_bitwise_identical": None,
+        "re_extracted_primary_max_abs_deviation": None,
+        "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
+        "primary_audit_receipt": {
+            "rows_re_extracted": 0,
+            "waveform_source_reads": 0,
+            "encoder_state_sha256_before": None,
+            "encoder_state_sha256_after": None,
+            "encoder_state_unchanged": None,
+            "encoder_fine_tuned": False,
+            "embedding_tap": EMBEDDING_TAP,
+            "embedding_dim": EMBEDDING_DIM,
+        },
+    }
+    sample = _audit_sample_references(ordered, cache)
     if not sample:
-        return {
-            "re_extracted_primary_rows": 0,
-            "re_extracted_primary_bitwise_identical": None,
-            "re_extracted_primary_max_abs_deviation": None,
-            "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
-        }
+        return empty
+
     cache_position = {key: index for index, key in enumerate(cache.stable_ids)}
+    before = _model_state_digest(encoder)
     batches = (
         waveform_batches_for(partition, tuple(r.stable_id for r in sample))
         if waveform_batches_for is not None
@@ -1779,9 +1826,11 @@ def _audit_primary_overlap(
     identical = True
     deviation = 0.0
     checked = 0
-    for identifiers, waveforms, _stats in batches:
+    reads = 0
+    for identifiers, waveforms, stats in batches:
         embeddings, _ = extract_frozen_embeddings(encoder, waveforms)
         block = embeddings.to(torch.float32).numpy()
+        reads = max(reads, int(getattr(stats, "source_reads", 0)))
         for offset, key in enumerate(identifiers):
             frozen = cache.embeddings[cache_position[str(key)]]
             identical = identical and bool(np.array_equal(block[offset], frozen))
@@ -1796,6 +1845,22 @@ def _audit_primary_overlap(
                 ),
             )
             checked += 1
+    after = _model_state_digest(encoder)
+    if before != after:
+        raise M1MemoryError(
+            "The locked B4-B encoder state changed during the primary overlap "
+            "audit."
+        )
+    if checked != len(sample):
+        raise M1MemoryError(
+            f"The primary audit re-extracted {checked} of {len(sample)} sampled "
+            "rows."
+        )
+    if waveform_batches_for is None and reads != checked:
+        raise M1MemoryError(
+            f"The primary audit reported {reads} source reads for {checked} "
+            "re-extracted rows."
+        )
     if deviation > PRIMARY_AUDIT_TOLERANCE:
         raise M1MemoryError(
             "Re-extracted primary embeddings differ from the frozen P1 cache by "
@@ -1808,6 +1873,16 @@ def _audit_primary_overlap(
         "re_extracted_primary_bitwise_identical": identical,
         "re_extracted_primary_max_abs_deviation": deviation,
         "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
+        "primary_audit_receipt": {
+            "rows_re_extracted": checked,
+            "waveform_source_reads": reads,
+            "encoder_state_sha256_before": before,
+            "encoder_state_sha256_after": after,
+            "encoder_state_unchanged": True,
+            "encoder_fine_tuned": False,
+            "embedding_tap": EMBEDDING_TAP,
+            "embedding_dim": EMBEDDING_DIM,
+        },
     }
 
 
@@ -2009,8 +2084,22 @@ def materialize_stream_store(
                     "re_extracted_primary_bitwise_identical": None,
                     "re_extracted_primary_max_abs_deviation": None,
                     "primary_audit_tolerance": PRIMARY_AUDIT_TOLERANCE,
+                    "primary_audit_receipt": {
+                        "rows_re_extracted": 0,
+                        "waveform_source_reads": 0,
+                        "encoder_state_sha256_before": None,
+                        "encoder_state_sha256_after": None,
+                        "encoder_state_unchanged": None,
+                        "encoder_fine_tuned": False,
+                        "embedding_tap": EMBEDDING_TAP,
+                        "embedding_dim": EMBEDDING_DIM,
+                    },
                 }
             )
+        # Total reads span BOTH locked-encoder passes.
+        audit["waveform_source_reads"] = int(
+            audit["extraction_receipt"]["waveform_source_reads"]
+        ) + int(audit["primary_audit_receipt"]["waveform_source_reads"])
         del encoder
         audit.update(
             _fill_physiology(
@@ -2234,8 +2323,22 @@ def load_stream_store(
         representation_dim=REPRESENTATION_DIM,
     )
     store = M1RowStore(directory, spec, create=False)
-    for name, expected in dict(manifest["artifact_sha256"]).items():
-        if sha256_file(directory / name) != expected:
+
+    # The physical artifact boundary is defined by the frozen schema, not by
+    # whatever the manifest happens to list. Iterating only the recorded keys
+    # would let a cache omit e.g. recording_age_seconds.npy or cold_start_bin.npy
+    # -- both of which feed supporting evidence -- and still validate.
+    recorded = dict(manifest["artifact_sha256"])
+    expected_files = set(spec.arrays())
+    if set(recorded) != expected_files:
+        missing = sorted(expected_files - set(recorded))
+        unexpected = sorted(set(recorded) - expected_files)
+        raise M1MemoryError(
+            "M1 stream cache does not bind exactly the schema's physical "
+            f"arrays; missing {missing}, unexpected {unexpected}."
+        )
+    for name, digest in recorded.items():
+        if sha256_file(directory / name) != digest:
             raise M1MemoryError(f"M1 store array {name} does not match its digest.")
     for field, name in (
         ("representation_content_sha256", REPRESENTATION_FILE),
@@ -2262,6 +2365,41 @@ def load_stream_store(
             "The chronology digest re-derived from the persisted stream cache "
             "arrays does not match the manifest."
         )
+    # Stream metadata is re-derived from the persisted identity columns rather
+    # than trusted from the manifest's descriptive copies. Canonical order is
+    # stream-major, so one chunked pass suffices and no 2.2 M-element Python
+    # structure is built.
+    observed_streams = 0
+    observed_records: set[str] = set()
+    observed_channels: set[int] = set()
+    previous: tuple[str, int] | None = None
+    records = store.array(RECORD_ID_FILE)
+    channels = store.array(CHANNEL_INDEX_FILE)
+    for begin in range(0, records.shape[0], chunk_rows):
+        end = begin + chunk_rows
+        record_block = np.asarray(records[begin:end])
+        channel_block = np.asarray(channels[begin:end])
+        observed_records.update(str(value) for value in np.unique(record_block))
+        observed_channels.update(int(value) for value in np.unique(channel_block))
+        for record, channel in zip(record_block, channel_block, strict=True):
+            key = (str(record), int(channel))
+            if key != previous:
+                observed_streams += 1
+                previous = key
+    if observed_streams != int(manifest["stream_count"]):
+        raise M1MemoryError(
+            f"The persisted stream cache contains {observed_streams} streams, "
+            f"but the manifest records {manifest['stream_count']}."
+        )
+    if sorted(observed_records) != list(manifest["record_ids"]):
+        raise M1MemoryError(
+            "The persisted record IDs differ from the manifest's record list."
+        )
+    if sorted(observed_channels) != list(manifest["channel_indices"]):
+        raise M1MemoryError(
+            "The persisted channel indices differ from the manifest's list."
+        )
+
     standardizer_path = Path(cache_root) / STANDARDIZER_NAME
     if not standardizer_path.is_file():
         raise M1MemoryError(

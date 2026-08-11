@@ -878,3 +878,308 @@ def test_row_store_refuses_a_missing_array(tmp_path):
     (tmp_path / "store" / D_SHORT_FILE).unlink()
     with pytest.raises(M1StoreError, match="missing"):
         M1RowStore(tmp_path / "store", spec, create=False)
+
+
+# --------------------------------------------------------------------------
+# Waveform source-read provenance
+#
+# The first bounded implementation called canonical_waveform_batches once per
+# <=256-row flush, each building its own B4WaveformDataset, and then took
+# max(stats.source_reads) across those independent instances. On the canonical
+# TRAIN corpus that would have recorded ~256 reads instead of ~1,833,979. These
+# tests use MORE THAN ONE flush and assert exact counts, so that bug fails here.
+# --------------------------------------------------------------------------
+
+WIDE_WINDOWS = 400  # 600 extra rows across two records => three flushes
+
+
+def _wide_corpus():
+    rows = []
+    for position, (record, channels) in enumerate((("wA", 1), ("wB", 1))):
+        for channel in range(channels):
+            for index in range(WIDE_WINDOWS):
+                rows.append(
+                    reference(
+                        record,
+                        channel,
+                        index,
+                        subject=f"ltstdb:s{position:04d}",
+                        # every 4th row is primary, so extras dominate
+                        family=(
+                            PRIMARY[index % 2]
+                            if index % 4 == 0
+                            else FAMILIES[2 + (index % 3)]
+                        ),
+                        partition="train",
+                    )
+                )
+    return tuple(rows)
+
+
+WIDE_ROWS = _wide_corpus()
+
+
+@pytest.fixture
+def wide(tmp_path, monkeypatch):
+    primary = tuple(r for r in WIDE_ROWS if r.target_family in PRIMARY)
+    raw = {
+        row.stable_id: _values(row.stable_id, PHYSIOLOGY_DIM).astype(np.float64)
+        for row in WIDE_ROWS
+    }
+    validity = PHYSIOLOGY_FEATURE_NAMES.index("morphology_valid")
+    for values in raw.values():
+        values[validity] = 1.0
+    transform = fit_physiology_transform(
+        np.stack([raw[r.stable_id] for r in primary]), partition="train"
+    )
+
+    from cardiosentinel.features.schema import COMBINED_V1
+
+    columns = list(morphology_columns())
+    feature_root = tmp_path / "features"
+    (feature_root / "train").mkdir(parents=True)
+    for record in sorted({r.record_id for r in WIDE_ROWS}):
+        block = [r for r in WIDE_ROWS if r.record_id == record]
+        features = np.zeros((len(block), len(COMBINED_V1.names)), dtype=np.float64)
+        for offset, row in enumerate(block):
+            features[offset, columns] = raw[row.stable_id]
+        np.savez(
+            feature_root / "train" / f"{record}.npz",
+            stable_ids=np.asarray([r.stable_id for r in block], dtype=np.str_),
+            features=features,
+        )
+
+    def _cache(_root, _partition):
+        return P1EmbeddingCache(
+            partition="train",
+            stable_ids=tuple(r.stable_id for r in primary),
+            embeddings=np.stack([_embedding(r.stable_id) for r in primary]),
+            labels=np.zeros(len(primary), dtype=np.int64),
+            subject_ids=tuple(r.subject_id for r in primary),
+            manifest={
+                "cache_sha256": m1_experiment.FROZEN_P1_EMBEDDING_CACHE_SHA256["train"]
+            },
+        )
+
+    monkeypatch.setattr(
+        m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, STUB_DIGEST)
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "require_clean_checkout",
+        lambda: {"git_sha": "f" * 40, "git_dirty": False},
+    )
+    monkeypatch.setattr(m1_experiment, "FROZEN_DEPENDENCY_DIGEST", STUB_DIGEST)
+    monkeypatch.setattr(
+        m1_experiment, "EXPECTED_POPULATIONS", {"train": {"total": len(primary)}}
+    )
+    monkeypatch.setattr(
+        m1_experiment,
+        "FROZEN_PHYSIOLOGY_TRANSFORM_SHA256",
+        transform.as_dict()["transform_sha256"],
+    )
+    monkeypatch.setattr(
+        m1_experiment, "load_frozen_physiology_transform", lambda *_a: transform
+    )
+    monkeypatch.setattr(m1_experiment, "load_p1_embedding_cache", _cache)
+    monkeypatch.setattr(
+        m1_experiment,
+        "load_b4_references",
+        lambda _root, _partition, primary_only=True: (
+            primary if primary_only else WIDE_ROWS
+        ),
+    )
+    monkeypatch.setattr(
+        m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
+    )
+    monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+    return {
+        "cache_root": tmp_path / "caches",
+        "p1_cache_root": tmp_path / "p1",
+        "feature_root": feature_root,
+        "source": tmp_path / "source",
+        "b4b_run_dir": tmp_path / "b4b",
+        "p1b_run_dir": tmp_path / "p1b",
+        "primary": {"train": primary},
+        "transform": transform,
+    }
+
+
+def test_extraction_reads_are_cumulative_across_multiple_flushes(wide):
+    manifest, _ = _bounded(wide, "train")
+    audit = manifest["primary_overlap_audit"]
+    extra = len(WIDE_ROWS) - len(wide["primary"]["train"])
+
+    assert extra > 512, "the fixture must force more than one 256-row flush"
+    assert audit["rows_newly_extracted"] == extra
+    # Exact, not `> 0`: one emitted row is one validated waveform read.
+    assert audit["extraction_receipt"]["waveform_source_reads"] == extra
+    assert audit["extraction_receipt"]["rows_extracted"] == extra
+    assert audit["extraction_receipt"]["batch_size"] == 256
+
+
+def test_primary_audit_read_count_is_exact(wide):
+    manifest, _ = _bounded(wide, "train")
+    audit = manifest["primary_overlap_audit"]
+    receipt = audit["primary_audit_receipt"]
+    assert receipt["rows_re_extracted"] == audit["re_extracted_primary_rows"]
+    assert receipt["waveform_source_reads"] == audit["re_extracted_primary_rows"]
+    assert receipt["rows_re_extracted"] > 0
+
+
+def test_total_reads_are_extraction_plus_audit(wide):
+    manifest, _ = _bounded(wide, "train")
+    audit = manifest["primary_overlap_audit"]
+    assert audit["waveform_source_reads"] == (
+        audit["extraction_receipt"]["waveform_source_reads"]
+        + audit["primary_audit_receipt"]["waveform_source_reads"]
+    )
+    extra = len(WIDE_ROWS) - len(wide["primary"]["train"])
+    assert audit["waveform_source_reads"] == extra + audit[
+        "re_extracted_primary_rows"
+    ]
+
+
+def test_primary_audit_proves_its_own_encoder_state(wide):
+    manifest, _ = _bounded(wide, "train")
+    receipt = manifest["primary_overlap_audit"]["primary_audit_receipt"]
+    assert receipt["encoder_state_unchanged"] is True
+    assert receipt["encoder_fine_tuned"] is False
+    assert receipt["encoder_state_sha256_before"] is not None
+    assert (
+        receipt["encoder_state_sha256_before"] == receipt["encoder_state_sha256_after"]
+    )
+    assert receipt["embedding_dim"] == EMBEDDING_DIM
+
+
+def test_audit_sample_matches_the_reference_selection_without_a_corpus_dict(wide):
+    """The bounded lookup must pick the identical deterministic rows."""
+    from cardiosentinel.neural.m1_experiment import _audit_sample_references
+
+    cache = m1_experiment.load_p1_embedding_cache(wide["p1_cache_root"], "train")
+    ordered = list(WIDE_ROWS)
+
+    # Retained reference rule, expressed with the full-corpus dictionary the
+    # production path is no longer allowed to build.
+    by_id = {r.stable_id: r for r in ordered}
+    step = max(len(cache.stable_ids) // m1_experiment.PRIMARY_AUDIT_ROWS, 1)
+    expected = [
+        by_id[key]
+        for index, key in enumerate(cache.stable_ids)
+        if index % step == 0 and key in by_id
+    ][: m1_experiment.PRIMARY_AUDIT_ROWS]
+
+    bounded = _audit_sample_references(ordered, cache)
+    assert [r.stable_id for r in bounded] == [r.stable_id for r in expected]
+    assert bounded
+
+
+def test_production_audit_builds_no_full_corpus_reference_dictionary():
+    import ast
+    from pathlib import Path as _Path
+
+    tree = ast.parse(_Path(m1_experiment.__file__).read_text())
+    for name in ("_audit_sample_references", "_audit_primary_overlap"):
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        for node in ast.walk(function):
+            if isinstance(node, ast.DictComp):
+                # A dict comprehension over every reference is exactly the
+                # allocation that has to stay gone.
+                source = ast.unparse(node)
+                assert "for reference in ordered" not in source, source
+                assert "for r in ordered" not in source, source
+
+
+# --------------------------------------------------------------------------
+# Schema-2 loader: complete physical artifact set + persisted stream metadata
+# --------------------------------------------------------------------------
+
+
+def _reseal(path: Path, mutate) -> None:
+    """Rewrite a manifest and recompute its own digest, so it stays consistent."""
+    manifest = json.loads(path.read_text())
+    mutate(manifest)
+    manifest.pop("stream_cache_sha256", None)
+    manifest["stream_cache_sha256"] = canonical_sha256(manifest)
+    path.write_text(json.dumps(manifest))
+
+
+def _manifest_path(corpus) -> Path:
+    return corpus["cache_root"] / "train" / "M1_STREAM_CACHE_MANIFEST.json"
+
+
+def test_manifest_binds_exactly_the_schema_artifact_set(corpus):
+    manifest, _ = _bounded(corpus, "train")
+    spec = M1StoreSpec(
+        rows=manifest["full_stream_row_count"],
+        representation_dim=REPRESENTATION_DIM,
+    )
+    assert set(manifest["artifact_sha256"]) == set(spec.arrays())
+    # The supporting-evidence arrays must be inside the integrity boundary.
+    for name in (
+        RECORDING_AGE_FILE,
+        COLD_START_BIN_FILE,
+        "prototype_disagreement.npy",
+    ):
+        assert name in manifest["artifact_sha256"]
+
+
+def test_loader_refuses_an_omitted_artifact_digest(corpus):
+    _bounded(corpus, "train")
+    _reseal(
+        _manifest_path(corpus),
+        lambda m: m["artifact_sha256"].pop(RECORDING_AGE_FILE),
+    )
+    with pytest.raises(Exception, match="exactly the schema's physical"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_refuses_an_unexpected_artifact_digest(corpus):
+    _bounded(corpus, "train")
+    _reseal(
+        _manifest_path(corpus),
+        lambda m: m["artifact_sha256"].update({"smuggled.npy": "0" * 64}),
+    )
+    with pytest.raises(Exception, match="exactly the schema's physical"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_refuses_a_self_consistent_wrong_stream_count(corpus):
+    _bounded(corpus, "train")
+    _reseal(_manifest_path(corpus), lambda m: m.update({"stream_count": 4}))
+    with pytest.raises(Exception, match="streams, but the manifest records"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_refuses_self_consistent_wrong_record_ids(corpus):
+    _bounded(corpus, "train")
+    _reseal(_manifest_path(corpus), lambda m: m.update({"record_ids": ["rA", "rZ"]}))
+    with pytest.raises(Exception, match="persisted record IDs differ"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_refuses_self_consistent_wrong_channel_indices(corpus):
+    _bounded(corpus, "train")
+    _reseal(_manifest_path(corpus), lambda m: m.update({"channel_indices": [0, 1]}))
+    with pytest.raises(Exception, match="persisted channel indices differ"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_a_self_consistent_manifest_alone_does_not_satisfy_the_loader(corpus):
+    """Re-digesting a tampered manifest must never launder it."""
+    _bounded(corpus, "train")
+    path = _manifest_path(corpus)
+    original = json.loads(path.read_text())
+    _reseal(path, lambda m: m.update({"stream_count": 99}))
+    resealed = json.loads(path.read_text())
+    # internally consistent...
+    body = {k: v for k, v in resealed.items() if k != "stream_cache_sha256"}
+    assert resealed["stream_cache_sha256"] == canonical_sha256(body)
+    assert resealed["stream_cache_sha256"] != original["stream_cache_sha256"]
+    # ...and still refused.
+    with pytest.raises(Exception):
+        load_stream_store(corpus["cache_root"], "train")
