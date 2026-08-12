@@ -1,0 +1,206 @@
+{
+  "base_scientific_tree": "8260b718ab235873bd8067ca3fbf14f158c71dcd",
+  "environment": {
+    "amp_enabled": false,
+    "dependency_digest": "78e838d2d41a0239f16dbfbaabdddc7efeaffac391ca13a8bbf1475c080cdc25",
+    "device": "cpu",
+    "numpy": "2.3.2",
+    "python": "3.12.6",
+    "torch": "2.13.0+cpu"
+  },
+  "full_train_stream_identity": {
+    "ordered_chronology_sha256": "99dff218c7ace0133800109bf0120963569534c3a62b2c6d7d7ee6cc96de3c1b",
+    "records": 60,
+    "rows": 2208431,
+    "stream_cache_sha256": "d006c698017110bfd95774ca207036a820139779b95cf1b3f3a36c06efa779a4",
+    "streams": 132
+  },
+  "g3_sqi": {
+    "combined_train_rejection_fraction": 0.038969295395690384,
+    "descriptive_distribution": {
+      "derivative_outlier_fraction": {
+        "max": 0.3217286914765906,
+        "median": 0.06802721088435375,
+        "min": 0.0,
+        "q95": 0.10364145658263306,
+        "q99": 0.12404961984793918
+      },
+      "flatline_fraction": {
+        "max": 0.7943177270908364,
+        "median": 0.2549019607843137,
+        "min": 0.0028011204481792717,
+        "q95": 0.42096838735494196,
+        "q99": 0.4853941576630652
+      },
+      "high_frequency_power_ratio": {
+        "max": 0.9881685867360547,
+        "median": 0.0029551207705663485,
+        "min": 2.5966067868771167e-06,
+        "q95": 0.013952450009392714,
+        "q99": 0.026922298961394597
+      },
+      "powerline_ratio_50hz": {
+        "max": 0.6067010746561601,
+        "median": 0.0001487123322009284,
+        "min": 1.555089936093512e-07,
+        "q95": 0.0008414981349524885,
+        "q99": 0.0017282393761769012
+      },
+      "powerline_ratio_60hz": {
+        "max": 0.40301891158205455,
+        "median": 5.742864386922327e-05,
+        "min": 7.515578186360381e-08,
+        "q95": 0.0005000504243690084,
+        "q99": 0.0012844103306429878
+      },
+      "repeated_value_fraction": {
+        "max": 0.7943177270908364,
+        "median": 0.2549019607843137,
+        "min": 0.0028011204481792717,
+        "q95": 0.42096838735494196,
+        "q99": 0.4853941576630652
+      }
+    },
+    "excluded_by_decision": [
+      "robust_amplitude_range_mv",
+      "robust_derivative_scale_mv_per_s"
+    ],
+    "frozen_upper_bounds_q99": {
+      "derivative_outlier_fraction": 0.12404961984793918,
+      "flatline_fraction": 0.4853941576630652,
+      "high_frequency_power_ratio": 0.026922298961394597,
+      "powerline_ratio_50hz": 0.0017282393761769012,
+      "powerline_ratio_60hz": 0.0012844103306429878,
+      "repeated_value_fraction": 0.4853941576630652
+    },
+    "hard_precondition": "finite_sample_fraction == 1.0",
+    "note_redundant_columns": "flatline_fraction and repeated_value_fraction are bitwise identical in the frozen corpus, so the six declared columns impose five independent constraints",
+    "population": {
+      "label_filtering": false,
+      "partition": "train",
+      "rows": 2208431,
+      "scope": "full_train_timeline_available_rows",
+      "target_family_filtering": false,
+      "test_rows_used": false,
+      "validation_rows_used": false
+    },
+    "quantile_rule": "numpy.quantile(values, 0.99, method='linear')",
+    "selected_columns": [
+      "flatline_fraction",
+      "repeated_value_fraction",
+      "derivative_outlier_fraction",
+      "high_frequency_power_ratio",
+      "powerline_ratio_50hz",
+      "powerline_ratio_60hz"
+    ],
+    "single_feature_train_rejection_fraction": {
+      "derivative_outlier_fraction": 0.00969421276915602,
+      "flatline_fraction": 0.009934202155285812,
+      "high_frequency_power_ratio": 0.010000312439012131,
+      "powerline_ratio_50hz": 0.010000312439012131,
+      "powerline_ratio_60hz": 0.010000312439012131,
+      "repeated_value_fraction": 0.009934202155285812
+    }
+  },
+  "g4_normal_evidence": {
+    "derivation_rule": "numpy.quantile(M1L_score_on_PRIMARY_TRAIN_background_negative, 0.50, method='linear')",
+    "descriptive_distribution": {
+      "max": 0.9998984336853027,
+      "min": 1.0448910181537485e-08,
+      "q10": 4.899580108030932e-06,
+      "q25": 2.4805917746562045e-05,
+      "q50": 0.0002997174742631614,
+      "q75": 0.006323484471067786,
+      "q90": 0.08905420750379593,
+      "q95": 0.29736625552177426,
+      "q99": 0.8172291195392608
+    },
+    "m1l_classification_threshold_for_non_equivalence_reference": 0.7554003000259399,
+    "normal_evidence_threshold": 0.0002997174742631614,
+    "population": {
+      "model_retrained": false,
+      "new_memory_replay": false,
+      "rows": 280839,
+      "scope": "primary_train_background_negative_only",
+      "test_scores_used": false,
+      "validation_scores_used": false
+    },
+    "score_semantics": "uncalibrated model score; not a probability, confidence, uncertainty or conformal score",
+    "strictly_below_classification_threshold": true
+  },
+  "g5_refractory": {
+    "armed_only_by": "score > normal_evidence_threshold on an AVAILABLE finite row",
+    "implemented_as_update_count": false,
+    "re_armable": true,
+    "refractory_duration_seconds": 60.0,
+    "semantics": "memory-update safety refractory; NOT NORMAL/WATCH/EVENT/RECOVERY episode reasoning",
+    "timing": "window availability time = (start_sample + 2500)/250.0 s"
+  },
+  "g6_morphology": {
+    "arms_refractory": false,
+    "included": true,
+    "is_availability": false,
+    "is_sqi": false,
+    "name": "morphology computability admission",
+    "rule": "morphology_valid == 1"
+  },
+  "m1_retention_decision_sha256": "a3685fc0f8ff1fa0dce2bf9954bb28a925787070c021f3e80ca5716a4fa5f0ed",
+  "m1_stage1_suite_sha256": "be36f0743dad649756626a981c3dd05ec6f54dc9c01150e70bb3caeb407bac0e",
+  "m1_v2_protocol_sha256": "31a81358870cd23c2258cf4f307ab8c4dc7bf245bc4bf18a4d1f48fe2aada39c",
+  "pr_head_at_derivation": "80b4b399598387914b43bbc2561b596bb763a8f9",
+  "primary_train_identity": {
+    "background_negative": 280839,
+    "p1_embedding_cache_sha256": "0a5f021b89597d245a2afdc51fe1a65ba5cd6a090beba429f38bbccff8c372dd",
+    "positive": 93613,
+    "rows": 374452,
+    "subjects": 56
+  },
+  "receipt_class": "m2_v1_train_only_gate_derivation",
+  "retained_m1l_checkpoint_sha256": "a26b6a18db8c005a051054417156068174a166062a5498f32fd48e473ad58510",
+  "retained_m1l_lock_sha256": "a2636855e14bdd54ff3b0a17f238579d097366bb64761e723003b6d6a13c75a5",
+  "rollback_core": false,
+  "signal_v1_schema_sha256": "25d05f8716340e0fcc9950590025e7c58dccbfe8d0e0475ccd36bd629d4c57d4",
+  "test_accessed": false,
+  "train_only_sanity": {
+    "cold_start_update_fraction": {
+      "0_5_minutes": {
+        "rows": 7920,
+        "update_fraction": 0.10063131313131313
+      },
+      "5_60_minutes": {
+        "rows": 87120,
+        "update_fraction": 0.12223370064279156
+      },
+      "over_60_minutes": {
+        "rows": 2113391,
+        "update_fraction": 0.2048546624831846
+      }
+    },
+    "combined_pre_refractory_admission_fraction": 0.43961663280401336,
+    "final_m2g_update_fraction_after_causal_refractory": 0.2012215912564169,
+    "g3_sqi_pass_fraction": 0.9610307046043096,
+    "g4_normal_evidence_pass_fraction_where_score_exists": 0.4622775173867782,
+    "g6_morphology_valid_fraction": 0.9999760010613871,
+    "per_stream_update_fraction": {
+      "max": 0.81940110218445,
+      "median": 0.1263517737543369,
+      "min": 0.0,
+      "q10": 0.001282445143441349,
+      "q90": 0.5090025572351337,
+      "streams": 132
+    },
+    "physical_available_fraction": 1.0,
+    "population": "train_full_timeline_only",
+    "refractory_blocked_fraction": 0.7786487329692438,
+    "refusal_fractions": {
+      "morphology": 2.3998938612979078e-05,
+      "normal_evidence": 0.5377224826132218,
+      "refractory": 0.23839504154759647,
+      "sqi": 0.038969295395690426
+    },
+    "rows": 2208431,
+    "test_accessed": false,
+    "validation_accessed": false
+  },
+  "validation_accessed": false
+}

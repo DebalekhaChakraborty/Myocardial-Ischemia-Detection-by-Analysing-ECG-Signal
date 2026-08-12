@@ -90,9 +90,9 @@ def test_validator_refuses_a_missing_result(tmp_path):
         validate_retained_m1_arm(tmp_path)
 
 
-def test_m2_protocol_is_marked_proposed_and_defers_absent_capabilities():
+def test_m2_protocol_is_frozen_and_defers_absent_capabilities():
     text = Path("docs/M2_CONTAMINATION_SAFE_MEMORY_PROTOCOL_V1.md").read_text()
-    assert "PROPOSED — HUMAN REVIEW REQUIRED" in text
+    assert "FROZEN SCIENTIFIC PROTOCOL" in text
     # capabilities that provably do not exist must be deferred, not assumed
     assert "DEFERRED → U1/U2" in text
     assert "DEFERRED → T1" in text
@@ -100,4 +100,5 @@ def test_m2_protocol_is_marked_proposed_and_defers_absent_capabilities():
     # a challenge annotation is never a deployment warning
     assert "not a deployment-observable warning" in text
     # the classification threshold is not the memory-admission threshold
-    assert "must NOT be reused as the" in text
+    # the classification threshold is not the memory-admission threshold
+    assert "is NOT the\nmemory-admission threshold" in text

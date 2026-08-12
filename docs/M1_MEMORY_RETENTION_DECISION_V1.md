@@ -61,7 +61,7 @@ Frozen P1-B global control versus the retained M1L:
 | specificity | 0.958511 | 0.960605 | +0.002094 |
 | PPV | 0.345929 | 0.355064 | +0.009135 |
 | MCC | 0.365247 | 0.368887 | +0.003640 |
-| primary-background FPR | — | 0.039395 | **−0.002094** abs |
+| primary-background FPR | 0.041489 | 0.039395 | **−0.002094** abs |
 | rate-related challenge FPR | 0.398753 | 0.393927 | **−0.004826** abs |
 | axis-shift challenge FPR | 0.075333 | 0.071333 | **−0.004000** abs |
 
@@ -69,6 +69,11 @@ Conduction-change evidence is **exploratory/descriptive only** (one validation
 subject) and carried no weight.
 
 ## 4. Bounded-Pareto rationale
+
+The P1-B primary-background FPR is `1 − specificity` over the primary
+validation negatives (`1 − 0.9585114168780084 = 0.041489`); the identity is
+confirmed on M1L, whose stored `pooled_background_negative_fpr` equals
+`1 − 0.960605` exactly.
 
 M1L provides the strongest alignment with the prespecified M1 objective:
 **improved primary discrimination together with more favourable false-alarm

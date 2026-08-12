@@ -1,13 +1,13 @@
 # M2 Contamination-Safe Continual Adaptation Protocol V1
 
-> **STATUS: PROPOSED — HUMAN REVIEW REQUIRED.**
-> No M2 scientific execution has occurred. No M2 result exists. Sections marked
-> **OPEN** contain unresolved scientific choices and must be closed by human
-> decision before any M2 implementation or run is authorized.
+> **STATUS: FROZEN SCIENTIFIC PROTOCOL — IMPLEMENTATION NOT YET AUTHORIZED.**
+> Every scientific choice is closed. No M2 scientific execution has occurred and
+> no M2 result exists. Implementation requires separate human authorization.
 
 ## 0. Purpose and scope
 
-M1 established that patient-specific memory helps, and that M1-v2 is
+M1 provided development evidence that the retained long-timescale patient-memory
+arm improved the prespecified operating trade-off, and established that M1-v2 is
 **explicitly not contamination-safe**: any available finite observation updates
 the prototypes, so a developing ischemic event, a severe artifact or a
 confounded window can be learned as the patient's new normal.
@@ -18,7 +18,7 @@ else.
 M2 **does not** reopen memory-family selection. `M1L_long_memory_v2` is frozen
 and retained by
 `docs/M1_MEMORY_RETENTION_DECISION_V1.md`
-(`45b29cd83ecfc60b43639be5569075a9cf561650f58a9812ade3051467f11b51`).
+(`a3685fc0f8ff1fa0dce2bf9954bb28a925787070c021f3e80ca5716a4fa5f0ed`).
 M1S and M1D are frozen ablation evidence and are **not** re-compared as
 candidate architectures.
 
@@ -34,6 +34,11 @@ candidate architectures.
 | `SIGNAL_V1` schema | `25d05f8716340e0fcc9950590025e7c58dccbfe8d0e0475ccd36bd629d4c57d4` |
 | `MORPHOLOGY_V1` schema | `13f60be400b5b957c1eb592bbafd8206d4d2855c1aa657a058671fb8d7cab434` |
 | `COMBINED_V1` schema | `6b1517cb6ffd5d113a385bb252a90630f75beec4da7345185e74dda0eff98a34` |
+| **TRAIN-only gate derivation receipt** | **`3befd05dc7e9c51ddfed99078d3020375fd610b328d19e64fc7ee3cc745f398e`** |
+
+`docs/M2_GATE_DERIVATION_RECEIPT_V1.json` binds every constant below to the
+TRAIN population it was derived from. **No validation or test data was accessed
+in any derivation.**
 
 ## 1. Causal signal inventory (measured from this repository)
 
@@ -85,7 +90,7 @@ waveform-derived, causal and deployment-observable, and a window whose
 morphology cannot be computed contributes an 18-d physiology block made entirely
 of train-median imputations, which is a weak basis for moving a patient
 prototype. It is **not** a quality score and must never be described as one.
-Whether to include it is **OPEN** (§4.4).
+**Resolved: included as G6** (§4.4). The trade-off is real — gating on it could refuse to learn during exactly the rhythms a patient-specific baseline should represent — and the human decision accepted that cost so a prototype is never moved by an imputation-dominated representation.
 
 ### E. Deployment-observable confounder warnings — **DO NOT EXIST**
 
@@ -120,7 +125,7 @@ There is no NORMAL / WATCH / EVENT / RECOVERY machine. M2 must not invent one.
 | Waveform-only SQI (`SIGNAL_V1`) | **AVAILABLE NOW** | frozen schema, causal, in corpus |
 | Normal-evidence margin (M1L score) | **AVAILABLE NOW** | causal, past-only |
 | Memory-update refractory | **AVAILABLE NOW** (mechanism only) | derivable from causal state alone |
-| `morphology_valid` | **AVAILABLE NOW**, inclusion **OPEN** | computability, not quality |
+| `morphology_valid` | **NOW**, included as G6 | computability, not quality |
 | **Calibrated uncertainty admission** | **DEFERRED → U1/U2** | no calibration exists |
 | **WATCH/EVENT episode state** | **DEFERRED → T1** | no state machine exists |
 | **Learned longitudinal confounder state** | **DEFERRED → T1/T2 or MT1** | no causal confounder warning exists |
@@ -145,148 +150,247 @@ MECHANISM STRESS TEST** and may never be presented as deployable behaviour.
 Patient identity is never a predictive or gating feature. No test label, test
 waveform, test prediction or test metric is accessed.
 
-## 4. Proposed M2 core admission gate
+## 4. M2-G core admission gate (FROZEN)
 
-A memory update at time *t* is admitted **only if all** of the following hold.
-Every condition is causal, past-only and label-free.
+A memory update at time *t* is admitted **only if all six conditions hold**.
+Every condition is causal, past-only and label-free at runtime.
 
-| # | Condition | Source | Status |
-|---|---|---|---|
-| G1 | `observation_state == AVAILABLE` | schema-3 state | **FROZEN** (inherited from M1-v2) |
-| G2 | fused `z_t` finite | representation | **FROZEN** (inherited) |
-| G3 | waveform SQI admissible | `SIGNAL_V1` | **OPEN** — §4.2 |
-| G4 | normal-evidence margin satisfied | M1L score | **OPEN** — §4.3 |
-| G5 | not in memory-update refractory | causal state | **OPEN** — §5 |
-| G6 | `morphology_valid == 1` | `MORPHOLOGY_V1` | **OPEN** — §4.4, may be excluded |
+| # | Condition | Source |
+|---|---|---|
+| G1 | `observation_state == AVAILABLE` | schema-3 state (inherited from M1-v2) |
+| G2 | fused `z_t` finite | representation (inherited) |
+| G3 | waveform SQI admissible | `SIGNAL_V1` — §4.2 |
+| G4 | `score_t <= NORMAL_EVIDENCE_THRESHOLD` | frozen M1L score — §4.3 |
+| G5 | not currently in memory-update refractory | §5 |
+| G6 | `morphology_valid == 1` | §4.4 |
 
-G1 and G2 are already frozen M1-v2 behaviour. **G3–G6 are the new content and
-none may be finalized without the derivations below.**
+### 4.2 G3 — waveform SQI (FROZEN)
 
-### 4.2 SQI gate derivation rule (OPEN)
+Hard precondition: **`finite_sample_fraction == 1.0`**.
 
-No arbitrary "good SQI" constant is permitted. Any threshold must state its
-source feature, physical meaning, and a **prospective TRAIN-only** derivation.
+Then each of six `SIGNAL_V1` columns must be **at or below** its frozen TRAIN
+upper bound, derived as `numpy.quantile(values, 0.99, method="linear")` over the
+**full TRAIN timeline, physically AVAILABLE rows only**, with **no** target
+family, ischemic/background, challenge or quality-label filtering, and **no**
+validation or test rows.
 
-Proposed form — to be frozen before any M2 result exists:
+| Column | Frozen Q99 upper bound |
+|---|---|
+| `flatline_fraction` | `0.4853941576630652` |
+| `repeated_value_fraction` | `0.4853941576630652` |
+| `derivative_outlier_fraction` | `0.12404961984793918` |
+| `high_frequency_power_ratio` | `0.026922298961394597` |
+| `powerline_ratio_50hz` | `0.0017282393761769012` |
+| `powerline_ratio_60hz` | `0.0012844103306429878` |
 
-> For a chosen subset of `SIGNAL_V1` columns, compute the distribution over the
-> **frozen primary TRAIN population only** and admit a window when each selected
-> column lies within a fixed, prospectively declared quantile bound of that
-> TRAIN distribution.
+`robust_amplitude_range_mv` and `robust_derivative_scale_mv_per_s` are
+**deliberately excluded**: they vary legitimately with patient physiology, and
+G3 screens artifact/noise rather than selecting a physiological phenotype.
 
-**Unresolved:** which columns; one-sided or two-sided; the exact quantile. These
-must be chosen on physical reasoning and TRAIN distribution shape, **never** by
-sweeping M2 validation outcomes. Quality *annotations* remain evaluation
-evidence only and are not gate inputs.
+**Recorded observation.** `flatline_fraction` and `repeated_value_fraction` are
+**bitwise identical** in the frozen corpus, so the six declared columns impose
+**five independent constraints**. Both are retained as declared; this is noted
+so the gate is never described as six independent checks.
 
-### 4.3 Normal-evidence gate derivation rule (OPEN)
+Combined G3 TRAIN rejection fraction: **0.038969**.
 
-**The M1 validation-selected F1 threshold must NOT be reused as the
-memory-admission threshold.** They are conceptually different objects: one
-chooses an operating point for *classification*, the other decides what is safe
-to *learn as normal*. Admitting normal memory should be strictly more
-conservative than declaring a window negative.
+### 4.3 G4 — deterministic normal-evidence margin (FROZEN)
 
-Proposed form:
+**The M1L classification threshold `0.7554003000259399` is NOT the
+memory-admission threshold.** Choosing an operating point for *classification*
+and deciding what is safe to *learn as normal* are different problems, and
+admitting normal memory is deliberately the stricter of the two.
 
-> Derive a conservative normal-admission threshold from the **frozen TRAIN**
-> score distribution of the retained M1L model — for example a low quantile of
-> the TRAIN background-negative score distribution, or a fixed margin below the
-> classification threshold — declared prospectively.
+```
+NORMAL_EVIDENCE_THRESHOLD = numpy.quantile(
+    M1L_score_on_PRIMARY_TRAIN_background_negative, 0.50, method="linear")
+```
 
-**Unresolved:** the exact quantile or margin. **No threshold sweep using M2
-validation outcomes is permitted.**
+**`NORMAL_EVIDENCE_THRESHOLD = 0.0002997174742631614`**
 
-Because no calibrated uncertainty exists, this is a **deterministic
-normal-evidence margin**, not an uncertainty gate, and must be named that way.
-The score is never called a probability.
+Derived over the 280,839 frozen PRIMARY TRAIN background-negative rows using the
+frozen retained M1L model and the frozen M1-v2 naive TRAIN representation and
+memory features. No retraining, no new memory replay, no validation scores, no
+test scores. It is strictly below the classification threshold (margin
+0.755101).
 
-### 4.4 `morphology_valid` (OPEN)
+Runtime condition: `score_t <= NORMAL_EVIDENCE_THRESHOLD`.
 
-Include as G6 or not. Argument for: a window whose 18-d physiology is entirely
-train-median imputation is a weak basis for moving a patient prototype.
-Argument against: it is a computability flag, its failure correlates with
-genuinely abnormal rhythm, and gating on it could systematically refuse to learn
-during exactly the rhythms a patient-specific baseline should represent. This is
-a real scientific trade-off and is left to human decision.
+This is a **DETERMINISTIC NORMAL-EVIDENCE MARGIN**. It is **not** a calibrated
+probability, confidence, uncertainty or conformal score, and the underlying
+score is never called a probability.
 
-## 5. Memory-update refractory / suspicion freeze (OPEN)
+### 4.3.1 Label-derivation boundary
 
-Purpose: prevent immediate re-entry into memory updating right after a
-suspicious observation, so a developing event cannot be absorbed window by
-window as its score drifts back under the margin.
+Runtime memory admission uses **no labels whatsoever** — the gate observes only
+the frozen model score.
 
-Explicitly named a **memory-update refractory/freeze state**. It is **not**
-WATCH/EVENT episode reasoning, carries no clinical semantics, and does not
-anticipate T1.
+The G4 constant is derived **once, offline, prospectively** from frozen PRIMARY
+TRAIN background-negative membership. That supervised TRAIN membership is
+permitted **solely** for this global fixed development-time threshold
+derivation. Validation and test labels never derive or alter it. Labels are
+never operational gate inputs.
 
-Proposed form: after a window fails G4, refuse updates for a fixed number of
-subsequent windows in the same `(record_id, channel_index)` stream, prospectively
-declared and **never tuned on validation**.
+### 4.4 G6 — morphology computability admission (FROZEN)
 
-**Unresolved:** the duration. Rationale for any choice must be argued from the
-M1 memory time constants — the short half-life is 60 updates (~5 min) and the
-long half-life 720 updates (~60 min) at the 5 s stride — not from M2 outcomes.
+**Included:** `morphology_valid == 1`.
 
-## 6. Rollback inventory and semantics (OPEN)
+Named **MORPHOLOGY COMPUTABILITY ADMISSION** — it is not SQI, not physical
+availability, not normality and not uncertainty. When `morphology_valid == 0`
+the 18-d physiology block rests substantially on the frozen TRAIN-median
+imputation policy rather than a valid window-specific morphology estimate. Such
+a representation may still be **scored** by the frozen classifier, but it must
+not **move the patient prototype**.
 
-**Finding: no real delayed contradictory or cloud signal exists in this system.**
-There is no channel that could operationally trigger rollback in deployment.
+Runtime: `morphology_valid == 0` → score still produced → memory update refused
+→ **no refractory is triggered by this alone**. No morphology threshold other
+than the frozen binary flag exists.
 
-Therefore M2-v1 **must not claim deployable automatic rollback.** What may
-legitimately be built and evaluated:
+## 5. G5 — memory-update safety refractory (FROZEN)
 
-- **snapshot mechanics** — periodic immutable prototype snapshots with a
-  deterministic restore API;
-- **a deterministic rollback API** operating on those snapshots;
-- **a synthetic/oracle contamination-recovery stress test** measuring whether
-  rollback *can* restore a contaminated prototype.
+**`REFRACTORY_DURATION_SECONDS = 60.0`**, measured in **real elapsed physical
+time**, not in AVAILABLE-row counts and not in admitted updates. Window
+availability time is `(start_sample + 2500) / 250.0` seconds.
 
-Oracle-triggered rollback is **MECHANISM EVIDENCE ONLY** and must be labelled as
-such wherever reported. Per the exit rule, rollback is retained only if it adds
-recovery value beyond gating alone.
+When an AVAILABLE finite row is scored and `score_t > NORMAL_EVIDENCE_THRESHOLD`:
 
-## 7. Prospective experiment design
+- the current row is **not** updated;
+- the refractory is set or **re-armed**:
+  `refractory_until = max(refractory_until, available_time_t + 60.0)`.
 
-Three arms, all built on the **frozen retained M1L** — the encoder, physiology
-transform, representation, alphas and head are unchanged. Only the update policy
-differs.
+Any later row whose availability time is before `refractory_until` fails G5.
+Scores are still computed for AVAILABLE finite rows during refractory, so
+**sustained suspicious evidence keeps re-arming the freeze** without creating
+episode semantics.
+
+A row failing **only** SQI, morphology or physical availability does **not** by
+itself start a refractory. If G4 also fails, G4 re-arms it.
+
+> **THIS IS A MEMORY-UPDATE SAFETY REFRACTORY. IT IS NOT NORMAL/WATCH/EVENT/
+> RECOVERY, NOT EPISODE REASONING AND NOT CLINICAL PERSISTENCE LOGIC.**
+
+Rationale: 60 s is short relative to the retained 720-update (~60 minute)
+long-memory half-life, while preventing immediate window-by-window re-entry
+after suspicious evidence. **No validation tuning was used.**
+
+## 5.1 Exact causal update order (FROZEN)
+
+For every timeline row:
+
+**A.** row becomes available → **B.** determine physical observation state.
+If unavailable: no representation, no score, no update; real time still
+advances, the refractory clock advances naturally, and **no new refractory is
+triggered**.
+
+If available: **C.** construct the frozen M1 representation `z_t` → **D.**
+compute `d_long(t)` against the current prototype **before** any update →
+**E.** compute the frozen M1L score from `[z_t ; d_long(t)]` → **F.**
+independently evaluate G3, G4, G5 (prior state) and G6 → **G.** update the
+prototype **only if G1–G6 all hold** → **H.** *after* deciding the current
+row, if `score_t > NORMAL_EVIDENCE_THRESHOLD`, re-arm the refractory for
+**future** rows.
+
+No row can affect its own `d_long` or its own score. No future information is
+used.
+
+## 6. Rollback — excluded from the claim-bearing core (FROZEN)
+
+**There is no M2-GR claim-bearing arm in M2-v1**, because no real
+deployment-observable delayed contradictory or cloud confirmation signal exists
+in this system.
+
+Rollback is **DEFERRED FOR OPERATIONAL INTEGRATION**. An optional future
+`M2-RB-ORACLE` may test snapshot/restore mechanics as **MECHANISM EVIDENCE
+ONLY**: it does not participate in M2 retention, cannot support a deployable
+rollback claim, and must not delay M2-G. It is **not** implemented here.
+
+## 7. Prospective experiment design (FROZEN)
+
+Two arms, both on the **frozen retained M1L**. The encoder, physiology
+transform, representation, alphas and **head weights** are unchanged and **no
+classifier is retrained** — M2 isolates UPDATE POLICY.
 
 | Arm | Policy |
 |---|---|
 | **M2-0** | frozen M1L naive always-update control (reproduces M1-v2 behaviour) |
-| **M2-G** | gated adaptation (G1–G5, plus G6 if adopted) |
-| **M2-GR** | gated + rollback — **conditional** on §6 resolving to legitimate semantics |
+| **M2-G** | identical system with the frozen G1–G6 gate |
 
-### Evidence to report for every arm
+### 7.1 Primary contamination evidence — natural longitudinal stress
 
-Prototype displacement/drift · recovery behaviour · pooled and subject-macro
-AUPRC · sensitivity preservation · background FPR · subject-wise FPR
-distribution · rate FPR · axis FPR · conduction descriptive evidence ·
-**update-admission fraction** · **freeze fraction** · **memory update count** ·
-**time since last admitted update** · cold-start behaviour by the frozen bins.
+Arbitrary synthetic corruption severity is **not** part of core gate selection.
+Primary evaluation uses **real frozen DEVELOPMENT longitudinal stress
+intervals already present in the corpus**. Gate execution stays entirely
+**label-blind**; annotations are used only *after* replay to define evaluation
+strata:
 
-### Controlled contamination injections
+1. annotated ischemic ST-event intervals;
+2. rate-related challenge intervals;
+3. axis-shift challenge intervals;
+4. quality/noise intervals where the existing annotation source permits a
+   reproducible evaluation definition;
+5. conduction-change — **exploratory/descriptive only** (one-subject support).
 
-Artifact/noise corruption · rate-related stress · axis-shift stress · event-like
-sustained abnormal segments.
+These annotation states are **never** used to admit or refuse an update.
 
-**Injection rules must be defined prospectively.** Contamination severity must
-**not** be optimized against validation outcomes. Labels may identify evaluation
-or stress regions but **never** gate updates.
+### 7.2 Prototype contamination metric (FROZEN)
 
-## 8. Exit rule (prospective)
+For each eligible annotated stress interval and each policy, `mu_ref` is the
+long-memory prototype immediately **before** the first stress window, using only
+past causal history. At later time *t*, in the same standardized 146-d memory
+space:
 
-> **M2-G is retained only if it is materially safer than M1L naive
-> always-update**, demonstrated by reduced prototype contamination/drift and/or
-> an improved false-alarm versus event-detectability trade-off, **without
-> unacceptable sensitivity loss**.
+```
+prototype_drift(t) = sqrt(mean((mu_long(t) - mu_ref) ** 2))
+```
+
+Report: peak drift during stress; mean drift during stress; drift at stress end;
+residual drift at the first eligible point ≥ 5 minutes after stress end; and
+≥ 30 minutes after stress end, where sufficient causal follow-up exists.
+
+If no valid pre-stress prototype or follow-up exists, that interval is **excluded
+from that specific statistic with a recorded reason**. Follow-up is never
+fabricated. No tuned recovery threshold is defined.
+
+### 7.3 Core evidence for both arms
+
+Pooled and subject-macro validation AUPRC · AUROC · sensitivity · specificity ·
+PPV · MCC · background FPR · subject-level FPR distribution · rate challenge FPR
+· axis challenge FPR · conduction descriptive FPR · cold-start evidence ·
+update-admission fraction · freeze fraction · SQI-refusal fraction ·
+normal-evidence-refusal fraction · morphology-refusal fraction ·
+refractory-refusal fraction · memory update count · time since last admitted
+update · prototype drift evidence per §7.2.
+
+## 8. Exit rule (prospective, FROZEN)
+
+> **M2-G may be retained only if human bounded-Pareto review finds development
+> evidence that it is materially safer than M2-0** — through reduced prototype
+> contamination/drift and/or improved false-alarm behaviour — **while preserving
+> event detectability without unacceptable sensitivity loss.**
 >
-> **M2-GR is retained only if rollback provides additional recovery value beyond
-> M2-G.**
+> **The gate must additionally not collapse adaptation into a trivial
+> never-update policy.** Admission and update coverage must be reported
+> explicitly.
 
-No weighted score. No automatic preference for the more complex policy. Bounded
-Pareto judgement by a human. **No test partition is involved at any point.**
+No weighted score. No automatic preference for M2-G. No significance claim
+unless later statistics actually support one. **No test access.**
+
+### 8.1 TRAIN-only sanity evidence (descriptive; no rule was altered by it)
+
+| Quantity | TRAIN |
+|---|---|
+| physically AVAILABLE | 1.000000 |
+| G3 SQI pass | 0.961031 |
+| G4 normal-evidence pass (where a score exists) | 0.462278 |
+| G6 `morphology_valid` | 0.999976 |
+| combined pre-refractory admission | 0.439617 |
+| **final M2-G update fraction after causal refractory replay** | **0.201222** |
+| per-stream update fraction (132 streams) | min 0.000000, q10 0.001282, median 0.126352, q90 0.509003, max 0.819401 |
+| cold-start update fraction 0–5 / 5–60 / >60 min | 0.100631 / 0.122234 / 0.204855 |
+
+The gate does **not** collapse adaptation: about one in five timeline rows still
+admits an update. One stream reaches a 0.000000 update fraction, which must be
+reported in M2 results rather than smoothed over.
 
 ## 9. Known inherited limitation
 
@@ -296,14 +400,13 @@ protocol. Gating can only make early adaptation more conservative, so M2 should
 be expected to leave cold-start behaviour unchanged or slightly worse, and must
 report it rather than obscure it. No cold-start threshold change is authorized.
 
-## 10. What must be closed before implementation
+## 10. Implementation readiness
 
-1. §4.2 SQI columns, bound direction and quantile.
-2. §4.3 normal-evidence margin derivation.
-3. §4.4 whether `morphology_valid` enters the gate.
-4. §5 refractory duration and its rationale.
-5. §6 whether rollback proceeds as mechanism-only evidence.
+**Every scientific choice is closed.** The SQI columns and bounds, the
+normal-evidence margin, `morphology_valid` inclusion, the refractory duration
+and semantics, and the exclusion of rollback from the claim-bearing core are all
+frozen above and bound by the derivation receipt.
 
-**No M2 implementation code should be written until these are frozen**, because
-each is a scientific choice that would otherwise be made implicitly by whoever
-writes the code first.
+**No unresolved scientific choice remains for implementing M2-G.**
+Implementation is nonetheless **not yet authorized** and requires a separate
+human decision.
