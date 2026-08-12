@@ -513,10 +513,17 @@ def test_j_an_abnormal_like_observation_still_enters_memory(standardizer):
 def test_j_boundary_statement_declares_the_limitation():
     boundary = m1_boundary_statement()
     assert boundary["contamination_safe"] is False
-    assert boundary["update_policy"] == "finite_observation_always_update"
+    assert boundary["update_policy"] == "available_finite_observation_always_update"
     assert boundary["m2_required_before_safe_adaptation_claim"] is True
     assert boundary["label_gated_update"] is False
     assert boundary["score_gated_update"] is False
+    # M1-v2: physical availability is decided before the encoder runs.
+    assert boundary["physical_availability_decided_before_encoder"] is True
+    assert boundary["unavailable_row_updates_memory"] is False
+    assert boundary["unavailable_row_increments_counters"] is False
+    assert boundary["unavailable_row_preserves_elapsed_time"] is True
+    assert boundary["b4_input_contract_weakened"] is False
+    assert boundary["alpha_time_rescaled"] is False
 
 
 # --------------------------------------------------------------------------

@@ -47,6 +47,7 @@ from cardiosentinel.neural.m1_store import (
     DEFAULT_CHUNK_ROWS,
     DISAGREEMENT_FILE,
     M1_STREAM_CACHE_SCHEMA,
+    OBSERVATION_STATE_FILE,
     PAST_OBSERVED_FILE,
     PAST_UPDATE_FILE,
     RECORD_ID_FILE,
@@ -97,9 +98,19 @@ from cardiosentinel.neural.patient_memory import (
     CONTAMINATION_SAFE,
     GLOBAL_CONTROL_EXPERIMENT_ID,
     M1_ARM_FEATURES,
+    M1_ATTEMPT2_CENSUS_SHA256,
+    M1_ATTEMPT2_FAILURE_SHA256,
     M1_EXPERIMENT_IDS,
+    M1_PHYSICAL_OBSERVATION_DECISION_SHA256,
     M1_PROTOCOL_SHA256,
+    M1_PROTOCOL_V1_SHA256,
+    OBSERVATION_AVAILABLE,
+    OBSERVATION_STATE_ENUM,
+    OBSERVATION_STATE_VERSION,
+    OBSERVATION_UNAVAILABLE_EXACT_FLAT,
+    OBSERVATION_UNINITIALIZED,
     P1_RETENTION_DECISION_SHA256,
+    PHYSICAL_OBSERVATION_CONTRACT,
     REPRESENTATION_DIM,
     STANDARDIZER_NAME,
     STREAM_CACHE_ARRAY_NAME,
@@ -115,6 +126,7 @@ from cardiosentinel.neural.patient_memory import (
     build_deterministic_m1_head,
     claim_m1_run_directory,
     cold_start_bin,
+    exact_flat_unavailable,
     fit_distance_standardizer,
     m1_alpha_identity,
     m1_arm_features,
@@ -149,9 +161,11 @@ from cardiosentinel.neural.physiology_fusion import (
 from cardiosentinel.neural.protocol import (
     B4_PROTOCOL_SHA256,
     B4_SPLIT_SHA256,
+    DATASET,
     FEATURE_CORPUS_SHA256,
     REPOSITORY_ROOT,
     SAMPLING_FREQUENCY_HZ,
+    WINDOW_SAMPLES,
 )
 from cardiosentinel.neural.resource_benchmark import validate_locked_model
 from cardiosentinel.neural.training import CheckpointTracker
@@ -204,7 +218,16 @@ FROZEN_DEVELOPMENT_SOURCE_INTEGRITY_SHA256: Final = (
 # imply that no execution has ever occurred. It does NOT authorize a
 # replacement run: human governance stays external.
 ATTEMPT1_FAILURE_DOCUMENT: Final = "docs/M1_STAGE1_ATTEMPT1_FAILURE.md"
-PRIOR_AUTHORIZED_INVOCATION_COUNT: Final = 1
+ATTEMPT2_FAILURE_DOCUMENT: Final = "docs/M1_STAGE1_ATTEMPT2_FAILURE.md"
+ATTEMPT2_CENSUS_DOCUMENT: Final = (
+    "docs/M1_ATTEMPT2_VALIDATION_ADMISSIBILITY_CENSUS.md"
+)
+PHYSICAL_OBSERVATION_DECISION_DOCUMENT: Final = (
+    "docs/M1_PHYSICAL_OBSERVATION_DECISION_V1.md"
+)
+M1_V1_RUN_ROOT: Final = "cardiosentinel-runs/phase5-m1-dual-memory-v1"
+M1_V1_STREAM_CACHE_ROOT: Final = "cardiosentinel-features/m1-stream-memory-v1"
+PRIOR_AUTHORIZED_INVOCATION_COUNT: Final = 2
 
 M1_SUITE_STATUS: Final = "locked_m1_development_result"
 M1_LOCK_STATUS: Final = LOCK_STATUS.replace("p1", "m1")
@@ -325,6 +348,93 @@ def canonical_waveform_batches(
         block = tuple(references[start : start + batch_size])
         waveforms = torch.stack([dataset.read_waveform(item) for item in block])
         yield tuple(item.stable_id for item in block), waveforms, dataset.stats
+
+
+def physical_observation_batches(
+    references: Sequence[B4WindowReference],
+    source: Path,
+    *,
+    batch_size: int = WAVEFORM_BATCH_SIZE,
+):
+    """Read each window once and classify its PHYSICAL AVAILABILITY.
+
+    M1-v2 decides whether an observation exists *before* encoder inference, so
+    the read cannot go through `read_waveform`: that path raises on an
+    exact-flat segment. Every other validity check is unchanged and every other
+    failure class stays fatal — only the dynamic-variation refusal is turned
+    into an observable state.
+
+    Yields `(reference, waveform_or_None, available)` one row at a time; the
+    caller batches available rows for the encoder.
+    """
+    import wfdb
+
+    from cardiosentinel.signal.catalog import dataset_spec, subject_id_for_record
+    from cardiosentinel.signal.io import _selected_metadata, _validate_interval
+    from cardiosentinel.signal.models import WaveformSegment
+    from cardiosentinel.signal.validation import (
+        CANONICAL_PHYSICAL_UNIT,
+        convert_to_millivolts,
+        validate_header_calibration,
+        validate_waveform_segment,
+    )
+
+    if not references:
+        return
+    spec = dataset_spec(DATASET)
+    root = Path(source)
+    for reference in references:
+        record_path = str((root / reference.record_id).resolve())
+        header = wfdb.rdheader(record_path)
+        names, units, gains = _selected_metadata(header, (reference.channel_index,))
+        validate_header_calibration(gains, units)
+        _validate_interval(
+            reference.start_sample, reference.end_sample, int(header.sig_len)
+        )
+        record = wfdb.rdrecord(
+            record_path,
+            sampfrom=reference.start_sample,
+            sampto=reference.end_sample,
+            channels=[reference.channel_index],
+            physical=True,
+        )
+        if record.p_signal is None:
+            raise M1MemoryError(
+                "WFDB did not return calibrated physical samples for "
+                f"{reference.stable_id}."
+            )
+        values = convert_to_millivolts(record.p_signal, units)
+        segment = WaveformSegment(
+            dataset_id=DATASET,
+            dataset_version=spec.version,
+            record_id=reference.record_id,
+            subject_id=subject_id_for_record(DATASET, reference.record_id),
+            sampling_frequency_hz=float(header.fs),
+            start_sample=reference.start_sample,
+            end_sample=reference.end_sample,
+            start_seconds=reference.start_sample / float(header.fs),
+            end_seconds=reference.end_sample / float(header.fs),
+            signal_names=names,
+            lead_names=names,
+            physical_units=(CANONICAL_PHYSICAL_UNIT,),
+            source_physical_units=(str(units[0]),),
+            values=values,
+            source=record_path,
+            provenance={"reader": "wfdb.rdrecord", "physical_calibration": "wfdb"},
+        )
+        # Every existing check EXCEPT dynamic variation; all remain fatal.
+        validate_waveform_segment(segment, require_dynamic=False)
+        if values.shape[0] != WINDOW_SAMPLES:
+            raise M1MemoryError(
+                f"{reference.stable_id} did not yield {WINDOW_SAMPLES} samples."
+            )
+        if exact_flat_unavailable(values):
+            yield reference, None, False
+            continue
+        waveform = torch.from_numpy(
+            np.ascontiguousarray(values[:, 0], dtype=np.float32)
+        ).reshape(1, WINDOW_SAMPLES)
+        yield reference, waveform, True
 
 
 def _extract_through_encoder(
@@ -1618,89 +1728,108 @@ def _fill_embeddings(
     waveform_batches_for,
     chunk_rows: int,
 ) -> dict[str, Any]:
-    """Write every 128-d embedding straight into its disk-backed row.
+    """Decide physical availability, then embed only what is available.
 
-    Primary rows are copied from the frozen P1 cache. Extra rows are read
-    through the reviewed waveform contract and encoded in batches of
-    `WAVEFORM_BATCH_SIZE`; each batch is written to disk and released, so no
-    `dict[str, ndarray]` of newly extracted rows ever exists.
+    Primary rows are copied from the frozen P1 cache and inherit
+    `AVAILABLE`: each already carries a frozen B4-B embedding produced through
+    the reviewed B4 waveform route, so no cached primary row can be silently
+    marked unavailable.
+
+    Every extra row gets exactly one bounded physical read. An available row is
+    batched to the frozen encoder and written to its disk row. An unavailable
+    row is never sent to B4-B at all — its whole 146-d representation stays
+    canonical NaN.
     """
     representation = store.array(REPRESENTATION_FILE)
+    states = store.array(OBSERVATION_STATE_FILE)
     cache_position = {key: index for index, key in enumerate(cache.stable_ids)}
     before = _model_state_digest(encoder)
 
-    extra_rows: list[int] = []
-    extra_refs: list[B4WindowReference] = []
-    # Each flush builds its own B4WaveformDataset, so `stats.source_reads` is
-    # cumulative WITHIN a flush and restarts at the next one. Taking max() across
-    # independent instances therefore reported roughly one batch, not the whole
-    # extraction. Per-flush totals are accumulated instead.
+    extra: list[tuple[int, B4WindowReference]] = []
+    for row, reference in enumerate(ordered):
+        position = cache_position.get(reference.stable_id)
+        if position is not None:
+            representation[row, :EMBEDDING_DIM] = cache.embeddings[position]
+            states[row] = OBSERVATION_AVAILABLE
+            continue
+        extra.append((row, reference))
+
     reads = 0
     extracted = 0
-    extra_digest = StreamingContentDigest((0, EMBEDDING_DIM), np.float32)
-    extra_ids: list[str] = []
+    unavailable_ids: list[str] = []
+    available_ids: list[str] = []
+    pending_rows: list[int] = []
+    pending_waves: list[Any] = []
 
-    def flush_batch() -> None:
-        nonlocal reads, extracted
-        if not extra_refs:
+    def flush() -> None:
+        nonlocal extracted
+        if not pending_rows:
             return
-        batches = (
-            waveform_batches_for(partition, tuple(r.stable_id for r in extra_refs))
+        embeddings, _ = extract_frozen_embeddings(encoder, torch.stack(pending_waves))
+        block = embeddings.to(torch.float32).numpy()
+        for offset, row in enumerate(pending_rows):
+            representation[row, :EMBEDDING_DIM] = block[offset]
+            states[row] = OBSERVATION_AVAILABLE
+            extracted += 1
+        pending_rows.clear()
+        pending_waves.clear()
+
+    if extra:
+        rows_by_id = {reference.stable_id: row for row, reference in extra}
+        stream = (
+            waveform_batches_for(partition, tuple(r.stable_id for _row, r in extra))
             if waveform_batches_for is not None
-            else canonical_waveform_batches(
-                tuple(extra_refs), Path(source), batch_size=WAVEFORM_BATCH_SIZE
+            else physical_observation_batches(
+                tuple(r for _row, r in extra),
+                Path(source),
+                batch_size=WAVEFORM_BATCH_SIZE,
             )
         )
-        produced: set[str] = set()
-        cursor = 0
-        flush_reads = 0
-        for identifiers, waveforms, stats in batches:
-            embeddings, _ = extract_frozen_embeddings(encoder, waveforms)
-            block = embeddings.to(torch.float32).numpy()
-            flush_reads = max(flush_reads, int(getattr(stats, "source_reads", 0)))
-            for offset, key in enumerate(identifiers):
-                identifier = str(key)
-                if identifier in cache_position:
+        seen: set[str] = set()
+        for reference, waveform, available in stream:
+            identifier = str(reference.stable_id)
+            if identifier in cache_position:
+                raise M1MemoryError(
+                    f"Row {identifier} was re-read although it is already in the "
+                    "frozen P1 cache; the overlap must be reused, not duplicated."
+                )
+            if identifier in seen:
+                raise M1MemoryError(f"Row {identifier} was produced more than once.")
+            if identifier not in rows_by_id:
+                raise M1MemoryError(
+                    f"The physical reader produced unexpected row {identifier}."
+                )
+            seen.add(identifier)
+            reads += 1
+            row = rows_by_id[identifier]
+            if available:
+                if waveform is None:
                     raise M1MemoryError(
-                        f"Row {identifier} was re-extracted although it is "
-                        "already in the frozen P1 cache; the overlap must be "
-                        "reused, not duplicated."
+                        f"Row {identifier} is available but carries no waveform."
                     )
-                if identifier in produced:
+                available_ids.append(identifier)
+                pending_rows.append(row)
+                pending_waves.append(waveform)
+                if len(pending_rows) >= WAVEFORM_BATCH_SIZE:
+                    flush()
+            else:
+                if waveform is not None:
                     raise M1MemoryError(
-                        f"Row {identifier} was produced more than once."
+                        f"Row {identifier} is unavailable but carries a waveform; "
+                        "an unavailable observation must never reach B4-B."
                     )
-                if identifier != extra_refs[cursor].stable_id:
-                    raise M1MemoryError(
-                        "The waveform iterator produced rows out of the "
-                        "requested order; row alignment cannot be proven."
-                    )
-                produced.add(identifier)
-                representation[extra_rows[cursor], :EMBEDDING_DIM] = block[offset]
-                cursor += 1
-                extracted += 1
-        if cursor != len(extra_refs):
+                unavailable_ids.append(identifier)
+                # Canonical NaN: no representation, no physiology, nothing
+                # synthesized, carried forward or zero-filled.
+                representation[row, :] = np.float32("nan")
+                states[row] = OBSERVATION_UNAVAILABLE_EXACT_FLAT
+        flush()
+        missing = [key for key in rows_by_id if key not in seen]
+        if missing:
             raise M1MemoryError(
-                f"The waveform iterator produced {cursor} of "
-                f"{len(extra_refs)} requested rows."
+                f"{len(missing)} extra rows were never physically read; the "
+                f"first is {missing[0]!r}."
             )
-        reads += flush_reads
-        extra_refs.clear()
-        extra_rows.clear()
-
-    for begin in range(0, len(ordered), chunk_rows):
-        for offset, reference in enumerate(ordered[begin : begin + chunk_rows]):
-            row = begin + offset
-            position = cache_position.get(reference.stable_id)
-            if position is not None:
-                representation[row, :EMBEDDING_DIM] = cache.embeddings[position]
-                continue
-            extra_ids.append(reference.stable_id)
-            extra_rows.append(row)
-            extra_refs.append(reference)
-            if len(extra_refs) >= WAVEFORM_BATCH_SIZE:
-                flush_batch()
-    flush_batch()
     store.flush()
 
     after = _model_state_digest(encoder)
@@ -1708,39 +1837,56 @@ def _fill_embeddings(
         raise M1MemoryError(
             "The locked B4-B encoder state changed during full-stream extraction."
         )
-    if extracted != len(extra_ids):
-        raise M1MemoryError("Extra-row extraction count does not match the plan.")
-    if waveform_batches_for is None and reads != extracted:
+    if reads != len(extra):
         raise M1MemoryError(
-            f"The canonical waveform route reported {reads} source reads for "
-            f"{extracted} extracted rows. One emitted row must correspond to "
-            "exactly one validated waveform read."
+            f"{reads} physical source reads for {len(extra)} extra rows; every "
+            "extra row must be read exactly once, available or not."
         )
+    if extracted != len(available_ids):
+        raise M1MemoryError(
+            f"{extracted} encoder extractions for {len(available_ids)} available "
+            "rows."
+        )
+    if len(available_ids) + len(unavailable_ids) != len(extra):
+        raise M1MemoryError("Available and unavailable counts do not partition.")
 
-    # Digest the extracted rows by re-reading them from disk in bounded blocks.
-    if extra_ids:
+    extra_digest = None
+    if available_ids:
         sorted_ids, order = _sorted_id_index(store)
         positions = _positions_for(
-            sorted_ids, order, np.asarray(extra_ids, dtype=sorted_ids.dtype)
+            sorted_ids, order, np.asarray(available_ids, dtype=sorted_ids.dtype)
         )
-        extra_digest = StreamingContentDigest(
-            (len(extra_ids), EMBEDDING_DIM), np.float32
+        digest = StreamingContentDigest(
+            (len(available_ids), EMBEDDING_DIM), np.float32
         )
-        for begin in range(0, len(extra_ids), chunk_rows):
+        for begin in range(0, len(available_ids), chunk_rows):
             rows = positions[begin : begin + chunk_rows]
-            extra_digest.update(
+            digest.update(
                 np.asarray(representation[rows, :EMBEDDING_DIM], dtype=np.float32)
             )
+        extra_digest = digest.hexdigest()
+
     return {
         "primary_rows_reused": len(cache_position),
+        "extra_rows_total": len(extra),
+        "physical_source_reads": reads,
+        "available_extra_rows": len(available_ids),
+        "encoder_extracted_rows": extracted,
+        "unavailable_exact_flat_rows": len(unavailable_ids),
         "rows_newly_extracted": extracted,
         "extra_disjoint_from_primary_cache": True,
         "extra_ordered_stable_id_sha256": (
-            streaming_ordered_stable_id_digest(iter(extra_ids)) if extra_ids else None
+            streaming_ordered_stable_id_digest(iter(available_ids))
+            if available_ids
+            else None
         ),
-        "extra_embedding_content_sha256": (
-            extra_digest.hexdigest() if extra_ids else None
+        "unavailable_ordered_stable_id_sha256": (
+            streaming_ordered_stable_id_digest(iter(unavailable_ids))
+            if unavailable_ids
+            else None
         ),
+        "unavailable_stable_ids": list(unavailable_ids),
+        "extra_embedding_content_sha256": extra_digest,
         "extraction_receipt": {
             "encoder_state_sha256_before": before,
             "encoder_state_sha256_after": after,
@@ -1751,6 +1897,7 @@ def _fill_embeddings(
             "batch_size": WAVEFORM_BATCH_SIZE,
             "rows_extracted": extracted,
             "waveform_source_reads": reads,
+            "unavailable_rows_not_encoded": len(unavailable_ids),
         },
     }
 
@@ -1947,12 +2094,15 @@ def _generate_memory_into_store(
 ) -> None:
     """Replay every causal stream, writing memory features straight to disk.
 
-    One stream at a time: each is a contiguous row range, so the working set is
-    one stream's representation rather than the corpus. Score-before-update is
-    unchanged — `DualTimescaleMemory.observe` is the same reviewed object.
+    An UNAVAILABLE row is not an observation: it is never standardized, never
+    scored, never passed to `DualTimescaleMemory.observe`, and it leaves both
+    prototypes and both counters exactly as they were. Only real elapsed time
+    and the cold-start bin advance, so the timeline is preserved without any
+    synthetic catch-up update.
     """
     representation = store.array(REPRESENTATION_FILE)
     starts = store.array(START_SAMPLE_FILE)
+    states = store.array(OBSERVATION_STATE_FILE)
     d_short = store.array(D_SHORT_FILE)
     d_long = store.array(D_LONG_FILE)
     observed = store.array(PAST_OBSERVED_FILE)
@@ -1961,23 +2111,41 @@ def _generate_memory_into_store(
     ages = store.array(RECORDING_AGE_FILE)
     bins = store.array(COLD_START_BIN_FILE)
     prior = standardizer.prior_vector()
+    nan = float("nan")
 
     for _key, begin, end in slices:
         memory = DualTimescaleMemory(prior)
         block = np.asarray(representation[begin:end], dtype=np.float64)
-        standardized = standardizer.standardize(block)
+        state_block = np.asarray(states[begin:end], dtype=np.uint8)
+        available = state_block == OBSERVATION_AVAILABLE
+        standardized = np.full(block.shape, np.nan, dtype=np.float64)
+        if np.any(available):
+            standardized[available] = standardizer.standardize(block[available])
         origin = int(starts[begin])
         for offset in range(end - begin):
-            features = memory.observe(standardized[offset])
             row = begin + offset
+            age = (int(starts[row]) - origin) / SAMPLING_FREQUENCY_HZ
+            ages[row] = age
+            bins[row] = cold_start_bin(age)
+            if state_block[offset] == OBSERVATION_UNAVAILABLE_EXACT_FLAT:
+                d_short[row] = nan
+                d_long[row] = nan
+                disagreement[row] = nan
+                # Counters carry the UNCHANGED prior state across the slot.
+                observed[row] = memory.past_observed_count
+                updated[row] = memory.past_update_count
+                continue
+            if state_block[offset] != OBSERVATION_AVAILABLE:
+                raise M1MemoryError(
+                    f"Row {row} has uninitialized observation state during memory "
+                    "replay."
+                )
+            features = memory.observe(standardized[offset])
             d_short[row] = features.d_short
             d_long[row] = features.d_long
             observed[row] = features.past_observed_count
             updated[row] = features.past_update_count
             disagreement[row] = features.prototype_disagreement
-            age = (int(starts[row]) - origin) / SAMPLING_FREQUENCY_HZ
-            ages[row] = age
-            bins[row] = cold_start_bin(age)
     store.flush()
 
 
@@ -2127,6 +2295,9 @@ def materialize_stream_store(
                     "stream before any validation memory is generated."
                 )
             positions = locate_rows(store, cache.stable_ids)
+            require_available_rows(
+                store, positions, "distance-standardizer TRAIN fit population"
+            )
             standardizer = build_distance_standardizer_from_rows(
                 np.asarray(
                     store.gather(REPRESENTATION_FILE, positions), dtype=np.float64
@@ -2227,6 +2398,32 @@ def _bounded_stream_cache_manifest(
         ),
         "primary_rows_reused": audit["primary_rows_reused"],
         "rows_newly_extracted": audit["rows_newly_extracted"],
+        "physical_observation_contract": PHYSICAL_OBSERVATION_CONTRACT,
+        "observation_state_enum": dict(OBSERVATION_STATE_ENUM),
+        "observation_state_version": OBSERVATION_STATE_VERSION,
+        "available_row_count": int(
+            np.count_nonzero(
+                np.asarray(store.array(OBSERVATION_STATE_FILE)) == OBSERVATION_AVAILABLE
+            )
+        ),
+        "unavailable_exact_flat_row_count": int(
+            np.count_nonzero(
+                np.asarray(store.array(OBSERVATION_STATE_FILE))
+                == OBSERVATION_UNAVAILABLE_EXACT_FLAT
+            )
+        ),
+        "observation_state_content_sha256": store.content_digest(
+            OBSERVATION_STATE_FILE
+        ),
+        "unavailable_ordered_stable_id_sha256": audit.get(
+            "unavailable_ordered_stable_id_sha256"
+        ),
+        "m1_protocol_v1_sha256": M1_PROTOCOL_V1_SHA256,
+        "m1_physical_observation_decision_sha256": (
+            M1_PHYSICAL_OBSERVATION_DECISION_SHA256
+        ),
+        "m1_attempt2_census_sha256": M1_ATTEMPT2_CENSUS_SHA256,
+        "m1_attempt2_failure_sha256": M1_ATTEMPT2_FAILURE_SHA256,
         "primary_overlap_audit": dict(audit),
         "label_independent_history": True,
         "update_policy": UPDATE_POLICY,
@@ -2400,6 +2597,73 @@ def load_stream_store(
             "The persisted channel indices differ from the manifest's list."
         )
 
+    # Schema 3: per-row physical observation state must be complete and its
+    # sentinels exact. A completed cache may contain no UNINITIALIZED row.
+    states = np.asarray(store.array(OBSERVATION_STATE_FILE))
+    if store.content_digest(OBSERVATION_STATE_FILE, chunk_rows=chunk_rows) != (
+        manifest["observation_state_content_sha256"]
+    ):
+        raise M1MemoryError("M1 stream cache observation state does not match.")
+    if int(np.count_nonzero(states == OBSERVATION_UNINITIALIZED)):
+        raise M1MemoryError(
+            "M1 stream cache contains UNINITIALIZED observation state; a "
+            "completed cache must classify every row."
+        )
+    available = states == OBSERVATION_AVAILABLE
+    unavailable = states == OBSERVATION_UNAVAILABLE_EXACT_FLAT
+    if int(np.count_nonzero(~(available | unavailable))):
+        raise M1MemoryError("M1 stream cache contains an unknown observation state.")
+    if int(np.count_nonzero(available)) != int(manifest["available_row_count"]):
+        raise M1MemoryError("M1 stream cache available-row count does not match.")
+    if int(np.count_nonzero(unavailable)) != int(
+        manifest["unavailable_exact_flat_row_count"]
+    ):
+        raise M1MemoryError("M1 stream cache unavailable-row count does not match.")
+
+    rep = store.array(REPRESENTATION_FILE)
+    short = store.array(D_SHORT_FILE)
+    long = store.array(D_LONG_FILE)
+    dis = store.array(DISAGREEMENT_FILE)
+    age = store.array(RECORDING_AGE_FILE)
+    obs = store.array(PAST_OBSERVED_FILE)
+    upd = store.array(PAST_UPDATE_FILE)
+    for begin in range(0, states.shape[0], chunk_rows):
+        end = begin + chunk_rows
+        block_state = states[begin:end]
+        block_rep = np.asarray(rep[begin:end])
+        finite_rep = np.all(np.isfinite(block_rep), axis=1)
+        ok = block_state == OBSERVATION_AVAILABLE
+        bad = block_state == OBSERVATION_UNAVAILABLE_EXACT_FLAT
+        if np.any(ok & ~finite_rep):
+            raise M1MemoryError(
+                "An AVAILABLE row carries a non-finite representation."
+            )
+        if np.any(bad & finite_rep):
+            raise M1MemoryError(
+                "An UNAVAILABLE row must carry the canonical NaN representation."
+            )
+        for name, values in (
+            ("d_short", np.asarray(short[begin:end])),
+            ("d_long", np.asarray(long[begin:end])),
+            ("prototype_disagreement", np.asarray(dis[begin:end])),
+        ):
+            if np.any(ok & ~np.isfinite(values)):
+                raise M1MemoryError(f"An AVAILABLE row has non-finite {name}.")
+            if np.any(bad & np.isfinite(values)):
+                raise M1MemoryError(f"An UNAVAILABLE row must have NaN {name}.")
+        block_age = np.asarray(age[begin:end])
+        if not np.all(np.isfinite(block_age)):
+            raise M1MemoryError(
+                "Recording age must be finite for every timeline row, including "
+                "physically unavailable ones."
+            )
+        for name, values in (
+            ("past_observed_count", np.asarray(obs[begin:end])),
+            ("past_update_count", np.asarray(upd[begin:end])),
+        ):
+            if np.any(values < 0):
+                raise M1MemoryError(f"{name} must be non-negative.")
+
     standardizer_path = Path(cache_root) / STANDARDIZER_NAME
     if not standardizer_path.is_file():
         raise M1MemoryError(
@@ -2416,6 +2680,29 @@ def load_stream_store(
         )
     M1DistanceStandardizer.from_dict(standardizer)
     return store, manifest
+
+
+def require_available_rows(
+    store: M1RowStore, positions: np.ndarray, purpose: str
+) -> None:
+    """Refuse a score-bearing selection containing an unavailable observation.
+
+    A row without a physical observation cannot produce an M1 score. This is an
+    explicit governance refusal rather than a downstream NaN failure, so the
+    evaluation population is never silently altered.
+    """
+    states = np.asarray(
+        store.gather(OBSERVATION_STATE_FILE, np.asarray(positions, dtype=np.int64))
+    )
+    offending = int(np.count_nonzero(states != OBSERVATION_AVAILABLE))
+    if offending:
+        raise M1MemoryError(
+            f"Score-bearing M1 population contains a physically unavailable "
+            f"observation: {offending} of {states.size} selected rows in "
+            f"{purpose} are not AVAILABLE. STOP FOR HUMAN REVIEW. The row is "
+            "never dropped from a metric, no prediction is invented and no "
+            "denominator is altered automatically."
+        )
 
 
 def build_distance_standardizer_from_rows(
@@ -2724,11 +3011,38 @@ def m1_preflight(
         "memory": alphas,
         "boundary": m1_boundary_statement(),
         "execution_governance": {
+            "active_protocol": "M1-v2",
+            "m1_protocol_v1_sha256": M1_PROTOCOL_V1_SHA256,
+            "m1_protocol_v2_sha256": M1_PROTOCOL_SHA256,
             "prior_authorized_invocation_count": PRIOR_AUTHORIZED_INVOCATION_COUNT,
             "prior_failed_preclaim_attempt_documented": True,
-            "prior_failed_attempt_document": ATTEMPT1_FAILURE_DOCUMENT,
+            "prior_failed_attempts": [
+                {
+                    "attempt": 1,
+                    "document": ATTEMPT1_FAILURE_DOCUMENT,
+                    "class": "pre_claim_memory_exhaustion",
+                },
+                {
+                    "attempt": 2,
+                    "document": ATTEMPT2_FAILURE_DOCUMENT,
+                    "class": "pre_claim_waveform_admissibility",
+                },
+            ],
+            "prior_failed_attempt_document": ATTEMPT2_FAILURE_DOCUMENT,
+            "attempt2_census_document": ATTEMPT2_CENSUS_DOCUMENT,
+            "physical_observation_decision_document": (
+                PHYSICAL_OBSERVATION_DECISION_DOCUMENT
+            ),
+            "prior_scientific_m1_arm_claims": 0,
+            "prior_scientific_m1_results": 0,
             "prior_attempt_scientific_artifacts_created": False,
             "prior_attempt_arm_claims_created": False,
+            "m1_v1_historical_partial_artifacts_preserved": (
+                Path(M1_V1_RUN_ROOT).exists()
+                or Path(M1_V1_STREAM_CACHE_ROOT).exists()
+            ),
+            "m1_v1_run_root": M1_V1_RUN_ROOT,
+            "m1_v1_stream_cache_root": M1_V1_STREAM_CACHE_ROOT,
             "replacement_execution_requires_new_human_authorization": True,
         },
         "arm_claims": claimed,
@@ -3026,6 +3340,7 @@ def execute_m1_stage1(
 
     train_store, _ = load_stream_store(Path(stream_cache_root), "train")
     train_rows = locate_rows(train_store, train_cache.stable_ids)
+    require_available_rows(train_store, train_rows, "primary TRAIN supervised rows")
     train_base = np.asarray(
         train_store.gather(REPRESENTATION_FILE, train_rows), dtype=np.float32
     )
@@ -3039,6 +3354,12 @@ def execute_m1_stage1(
     validation_store, _ = load_stream_store(Path(stream_cache_root), "validation")
     validation_rows = locate_rows(validation_store, validation_cache.stable_ids)
     challenge_rows = locate_rows(validation_store, challenge_ids)
+    require_available_rows(
+        validation_store, validation_rows, "primary VALIDATION metric rows"
+    )
+    require_available_rows(
+        validation_store, challenge_rows, "frozen VALIDATION challenge rows"
+    )
     validation_base = np.asarray(
         validation_store.gather(REPRESENTATION_FILE, validation_rows), dtype=np.float32
     )

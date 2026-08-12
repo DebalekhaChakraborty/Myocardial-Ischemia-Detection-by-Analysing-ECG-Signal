@@ -477,9 +477,9 @@ def test_run_stage1_claims_arms_in_the_frozen_order():
     ]
     assert names, "the suite must iterate the frozen arm order"
     assert M1_ARM_ORDER == (
-        "M1S_short_memory_v1",
-        "M1L_long_memory_v1",
-        "M1D_dual_memory_v1",
+        "M1S_short_memory_v2",
+        "M1L_long_memory_v2",
+        "M1D_dual_memory_v2",
     )
 
 
@@ -785,18 +785,25 @@ def test_superseded_protocol_digest_is_named_as_such():
     # entries are never erased, so a stale digest is recognised as superseded
     # rather than merely rejected as unknown.
     for digest in (
+        # superseded BEFORE use
         "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4",
         "cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61",
+        # M1-v1: superseded PROSPECTIVELY after two authorized invocations that
+        # produced zero arm claims and zero results.
+        "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253",
     ):
         assert digest in SUPERSEDED_M1_PROTOCOL_SHA256
     assert M1_PROTOCOL_SHA256 not in SUPERSEDED_M1_PROTOCOL_SHA256
 
-    document = Path("docs/M1_DUAL_MEMORY_PROTOCOL_V1.md").read_text()
-    for digest in SUPERSEDED_M1_PROTOCOL_SHA256:
-        assert digest in document, "the revision record must retain every entry"
-    assert document.count("SUPERSEDED BEFORE USE") >= len(
-        SUPERSEDED_M1_PROTOCOL_SHA256
+    # v1 keeps its own two before-use entries; v2 records v1 as superseded
+    # prospectively and must never rewrite v1.
+    v1 = Path("docs/M1_DUAL_MEMORY_PROTOCOL_V1.md").read_text()
+    assert v1.count("SUPERSEDED BEFORE USE") >= 2
+    v2 = Path("docs/M1_DUAL_MEMORY_PROTOCOL_V2.md").read_text()
+    assert (
+        "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253" in v2
     )
+    assert "IMMUTABLE HISTORICAL EVIDENCE" in v2
 
 
 # --------------------------------------------------------------------------

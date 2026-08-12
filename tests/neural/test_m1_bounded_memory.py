@@ -252,6 +252,46 @@ VALIDATION_ROWS = _corpus("validation", {"rC": 2, "rD": 3})
 ALL_ROWS = {"train": TRAIN_ROWS, "validation": VALIDATION_ROWS}
 
 
+
+def _availability_stream(rows_by_id, embedding_for, unavailable=()):
+    """The M1-v2 physical seam: yields (reference, waveform_or_None, available).
+
+    Availability is a property of the synthetic waveform, exactly as production
+    decides it from real samples -- the stub never consults an identifier list
+    to make the decision, it builds a genuinely flat waveform instead.
+    """
+    def _stream(_partition, identifiers):
+        for key in identifiers:
+            reference = rows_by_id[str(key)]
+            if str(key) in unavailable:
+                yield reference, None, False
+            else:
+                yield reference, embedding_for(str(key)), True
+    return _stream
+
+
+
+def _stub_physical_batches(rows_by_id, waveform_for, unavailable=frozenset()):
+    """Stand-in for `physical_observation_batches`.
+
+    Availability is decided from the synthetic samples themselves via the
+    production predicate, so the stub never whitelists identifiers.
+    """
+    from cardiosentinel.neural.patient_memory import exact_flat_unavailable
+
+    def _stream(references, source, *, batch_size=256):
+        for item in references:
+            key = str(item.stable_id)
+            wave = waveform_for(key, flat=key in unavailable)
+            values = wave.numpy().reshape(-1)
+            if exact_flat_unavailable(values):
+                yield item, None, False
+            else:
+                yield item, wave, True
+
+    return _stream
+
+
 @pytest.fixture
 def corpus(tmp_path, monkeypatch):
     primary = {
@@ -353,7 +393,23 @@ def corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
     )
+    rows_by_id = {
+        item.stable_id: item for group in ALL_ROWS.values() for item in group
+    }
+
+    def _wave(key, *, flat=False):
+        import torch as _t
+
+        if flat:
+            return _t.full((1, 2500), -5.12, dtype=_t.float32)
+        return _waveform(key)
+
     monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+    monkeypatch.setattr(
+        m1_experiment,
+        "physical_observation_batches",
+        _stub_physical_batches(rows_by_id, _wave),
+    )
 
     return {
         "cache_root": tmp_path / "caches",
@@ -804,7 +860,7 @@ def test_stream_slices_are_contiguous_and_cover_every_row():
 # --------------------------------------------------------------------------
 
 
-def test_preflight_reports_the_attempt_one_governance_block(tmp_path, monkeypatch):
+def test_preflight_reports_both_historical_attempts(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, STUB_DIGEST)
     )
@@ -815,10 +871,22 @@ def test_preflight_reports_the_attempt_one_governance_block(tmp_path, monkeypatc
     )
     report = m1_experiment.m1_preflight(tmp_path / "runs", tmp_path / "caches")
     governance = report["execution_governance"]
-    assert governance["prior_authorized_invocation_count"] == 1
+    # Two authorized invocations have occurred. No preflight may ever imply
+    # that they did not.
+    assert governance["prior_authorized_invocation_count"] == 2
+    assert governance["active_protocol"] == "M1-v2"
     assert governance["prior_failed_preclaim_attempt_documented"] is True
-    assert governance["prior_failed_attempt_document"] == (
+    assert [a["attempt"] for a in governance["prior_failed_attempts"]] == [1, 2]
+    assert governance["prior_failed_attempts"][0]["document"] == (
         "docs/M1_STAGE1_ATTEMPT1_FAILURE.md"
+    )
+    assert governance["prior_failed_attempts"][1]["document"] == (
+        "docs/M1_STAGE1_ATTEMPT2_FAILURE.md"
+    )
+    assert governance["prior_scientific_m1_arm_claims"] == 0
+    assert governance["prior_scientific_m1_results"] == 0
+    assert governance["m1_protocol_v1_sha256"] == (
+        "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253"
     )
     assert governance["prior_attempt_scientific_artifacts_created"] is False
     assert governance["prior_attempt_arm_claims_created"] is False
@@ -992,7 +1060,23 @@ def wide(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
     )
+    rows_by_id = {
+        item.stable_id: item for group in ALL_ROWS.values() for item in group
+    }
+
+    def _wave(key, *, flat=False):
+        import torch as _t
+
+        if flat:
+            return _t.full((1, 2500), -5.12, dtype=_t.float32)
+        return _waveform(key)
+
     monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+    monkeypatch.setattr(
+        m1_experiment,
+        "physical_observation_batches",
+        _stub_physical_batches(rows_by_id, _wave),
+    )
     return {
         "cache_root": tmp_path / "caches",
         "p1_cache_root": tmp_path / "p1",
