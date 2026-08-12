@@ -252,6 +252,46 @@ VALIDATION_ROWS = _corpus("validation", {"rC": 2, "rD": 3})
 ALL_ROWS = {"train": TRAIN_ROWS, "validation": VALIDATION_ROWS}
 
 
+
+def _availability_stream(rows_by_id, embedding_for, unavailable=()):
+    """The M1-v2 physical seam: yields (reference, waveform_or_None, available).
+
+    Availability is a property of the synthetic waveform, exactly as production
+    decides it from real samples -- the stub never consults an identifier list
+    to make the decision, it builds a genuinely flat waveform instead.
+    """
+    def _stream(_partition, identifiers):
+        for key in identifiers:
+            reference = rows_by_id[str(key)]
+            if str(key) in unavailable:
+                yield reference, None, False
+            else:
+                yield reference, embedding_for(str(key)), True
+    return _stream
+
+
+
+def _stub_physical_batches(rows_by_id, waveform_for, unavailable=frozenset()):
+    """Stand-in for `physical_observation_batches`.
+
+    Availability is decided from the synthetic samples themselves via the
+    production predicate, so the stub never whitelists identifiers.
+    """
+    from cardiosentinel.neural.patient_memory import exact_flat_unavailable
+
+    def _stream(references, source, *, batch_size=256):
+        for item in references:
+            key = str(item.stable_id)
+            wave = waveform_for(key, flat=key in unavailable)
+            values = wave.numpy().reshape(-1)
+            if exact_flat_unavailable(values):
+                yield item, None, False
+            else:
+                yield item, wave, True
+
+    return _stream
+
+
 @pytest.fixture
 def corpus(tmp_path, monkeypatch):
     primary = {
@@ -353,7 +393,23 @@ def corpus(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
     )
+    rows_by_id = {
+        item.stable_id: item for group in ALL_ROWS.values() for item in group
+    }
+
+    def _wave(key, *, flat=False):
+        import torch as _t
+
+        if flat:
+            return _t.full((1, 2500), -5.12, dtype=_t.float32)
+        return _waveform(key)
+
     monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+    monkeypatch.setattr(
+        m1_experiment,
+        "physical_observation_batches",
+        _stub_physical_batches(rows_by_id, _wave),
+    )
 
     return {
         "cache_root": tmp_path / "caches",
@@ -804,7 +860,7 @@ def test_stream_slices_are_contiguous_and_cover_every_row():
 # --------------------------------------------------------------------------
 
 
-def test_preflight_reports_the_attempt_one_governance_block(tmp_path, monkeypatch):
+def test_preflight_reports_both_historical_attempts(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "require_p1_runtime", lambda: ({"device": "cpu"}, STUB_DIGEST)
     )
@@ -815,13 +871,39 @@ def test_preflight_reports_the_attempt_one_governance_block(tmp_path, monkeypatc
     )
     report = m1_experiment.m1_preflight(tmp_path / "runs", tmp_path / "caches")
     governance = report["execution_governance"]
-    assert governance["prior_authorized_invocation_count"] == 1
+    # Two authorized invocations have occurred. No preflight may ever imply
+    # that they did not.
+    assert governance["prior_authorized_invocation_count"] == 2
+    assert governance["active_protocol"] == "M1-v2"
     assert governance["prior_failed_preclaim_attempt_documented"] is True
-    assert governance["prior_failed_attempt_document"] == (
+    assert [a["attempt"] for a in governance["prior_failed_attempts"]] == [1, 2]
+    assert governance["prior_failed_attempts"][0]["document"] == (
         "docs/M1_STAGE1_ATTEMPT1_FAILURE.md"
     )
-    assert governance["prior_attempt_scientific_artifacts_created"] is False
+    assert governance["prior_failed_attempts"][1]["document"] == (
+        "docs/M1_STAGE1_ATTEMPT2_FAILURE.md"
+    )
+    assert governance["prior_scientific_m1_arm_claims"] == 0
+    assert governance["prior_scientific_m1_results"] == 0
+    assert governance["m1_protocol_v1_sha256"] == (
+        "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253"
+    )
+    # Attempt 2 created partial execution artifacts; it created no claim-bearing
+    # scientific result. The report must not collapse those into one flag.
+    assert governance["prior_claim_bearing_scientific_result_artifacts_created"] is (
+        False
+    )
+    assert governance["prior_partial_execution_artifacts_created"] is True
+    assert governance["prior_partial_execution_artifacts"] == [
+        "M1-v1 TRAIN stream store",
+        "M1-v1 distance standardizer",
+        "M1-v1 validation staging area",
+    ]
+    assert governance[
+        "prior_partial_execution_artifacts_are_valid_m1_v2_artifacts"
+    ] is False
     assert governance["prior_attempt_arm_claims_created"] is False
+    assert "prior_attempt_scientific_artifacts_created" not in governance
     assert governance["replacement_execution_requires_new_human_authorization"] is True
     assert report["m1_stream_cache_schema"] == M1_STREAM_CACHE_SCHEMA
     # Reporting prior history must not itself authorize anything.
@@ -992,7 +1074,23 @@ def wide(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "load_official_b4b_encoder", lambda *_a: _ENCODER
     )
+    rows_by_id = {
+        item.stable_id: item for group in ALL_ROWS.values() for item in group
+    }
+
+    def _wave(key, *, flat=False):
+        import torch as _t
+
+        if flat:
+            return _t.full((1, 2500), -5.12, dtype=_t.float32)
+        return _waveform(key)
+
     monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+    monkeypatch.setattr(
+        m1_experiment,
+        "physical_observation_batches",
+        _stub_physical_batches(rows_by_id, _wave),
+    )
     return {
         "cache_root": tmp_path / "caches",
         "p1_cache_root": tmp_path / "p1",
@@ -1183,3 +1281,370 @@ def test_a_self_consistent_manifest_alone_does_not_satisfy_the_loader(corpus):
     # ...and still refused.
     with pytest.raises(Exception):
         load_stream_store(corpus["cache_root"], "train")
+
+
+# --------------------------------------------------------------------------
+# M1-v2 review corrections: canonical all-NaN unavailable rows, exact loader
+# sentinels, and independent re-derivation of the unavailable ordered-ID digest.
+#
+# Blocker 1: `_fill_physiology` used to write the frozen 18-d vector into EVERY
+# full-stream row, so an unavailable row ended up as
+# [128 NaN embedding ; 18 finite physiology] instead of 146 NaN.
+# Blocker 2: the loader only asked whether an unavailable row was "not entirely
+# finite", which that mixed row satisfies.
+# Blocker 3: the manifest's unavailable ordered-ID digest was trusted rather
+# than re-derived from stable_id.npy + observation_state.npy.
+# --------------------------------------------------------------------------
+
+# Must be an EXTRA row: primary rows are copied from the frozen P1 cache and
+# never pass through the physical reader at all.
+FLAT_ID = next(
+    row.stable_id for row in VALIDATION_ROWS if row.target_family not in PRIMARY
+)
+
+
+@pytest.fixture
+def outage(tmp_path, monkeypatch, corpus):
+    """The `corpus` fixture with one VALIDATION row physically unavailable."""
+    from cardiosentinel.neural.m1_store import OBSERVATION_STATE_FILE as _STATE
+
+    def _wave(key, *, flat=False):
+        import torch as _t
+
+        if flat or key == FLAT_ID:
+            return _t.full((1, 2500), -5.12, dtype=_t.float32)
+        return _waveform(key)
+
+    rows_by_id = {
+        item.stable_id: item for group in ALL_ROWS.values() for item in group
+    }
+    monkeypatch.setattr(
+        m1_experiment,
+        "physical_observation_batches",
+        _stub_physical_batches(rows_by_id, _wave),
+    )
+    corpus["flat_id"] = FLAT_ID
+    corpus["state_file"] = _STATE
+    return corpus
+
+
+def _build_validation(outage):
+    _manifest, standardizer = _bounded(outage, "train")
+    manifest, _ = _bounded(outage, "validation", standardizer)
+    return manifest
+
+
+# --- Blocker 1 -------------------------------------------------------------
+
+
+def test_unavailable_row_stays_canonical_all_nan_after_physiology(outage):
+    from cardiosentinel.neural.m1_store import (
+        OBSERVATION_STATE_FILE,
+    )
+    from cardiosentinel.neural.m1_store import (
+        REPRESENTATION_FILE as REP,
+    )
+    from cardiosentinel.neural.patient_memory import (
+        OBSERVATION_AVAILABLE as AVAIL,
+    )
+    from cardiosentinel.neural.patient_memory import (
+        OBSERVATION_UNAVAILABLE_EXACT_FLAT as FLAT,
+    )
+
+    manifest = _build_validation(outage)
+    assert manifest["unavailable_exact_flat_row_count"] == 1
+    store, _ = load_stream_store(outage["cache_root"], "validation")
+    states = np.asarray(store.array(OBSERVATION_STATE_FILE))
+    rep = np.asarray(store.array(REP))
+    row = int(np.flatnonzero(states == FLAT)[0])
+
+    # the whole 146-d row, not merely the 128 embedding dims
+    assert np.all(np.isnan(rep[row])), "unavailable row must be all-NaN"
+    assert np.isnan(rep[row, :EMBEDDING_DIM]).all()
+    assert np.isnan(rep[row, EMBEDDING_DIM:]).all(), "physiology must be skipped"
+    # available rows are untouched and fully finite
+    available = np.flatnonzero(states == AVAIL)
+    assert np.all(np.isfinite(rep[available]))
+    store.close()
+
+
+def test_available_rows_receive_identical_physiology_despite_an_outage(outage):
+    from cardiosentinel.neural.m1_store import (
+        OBSERVATION_STATE_FILE,
+        STABLE_ID_FILE,
+    )
+    from cardiosentinel.neural.m1_store import (
+        REPRESENTATION_FILE as REP,
+    )
+    from cardiosentinel.neural.patient_memory import OBSERVATION_AVAILABLE as AVAIL
+
+    _build_validation(outage)
+    store, _ = load_stream_store(outage["cache_root"], "validation")
+    states = np.asarray(store.array(OBSERVATION_STATE_FILE))
+    ids = [str(v) for v in np.asarray(store.array(STABLE_ID_FILE))]
+    rep = np.asarray(store.array(REP))
+
+    physiology = {
+        ids[i]: rep[i, EMBEDDING_DIM:]
+        for i in np.flatnonzero(states == AVAIL)
+    }
+    validity = PHYSIOLOGY_FEATURE_NAMES.index("morphology_valid")
+    raw = np.stack([
+        _values(key, PHYSIOLOGY_DIM).astype(np.float64) for key in physiology
+    ])
+    raw[:, validity] = 1.0
+    expected = outage["transform"].transform(raw)
+    np.testing.assert_array_equal(
+        np.stack(list(physiology.values())), expected.astype(np.float32)
+    )
+    store.close()
+
+
+def test_physiology_accounting_separates_skipped_from_missing(outage):
+    manifest = _build_validation(outage)
+    audit = manifest["primary_overlap_audit"]
+    assert audit["physiology_skipped_unavailable_rows"] == 1
+    # the unavailable row is still proven to exist in the feature corpus
+    assert audit["timeline_rows_present_in_feature_corpus"] == manifest[
+        "full_stream_row_count"
+    ]
+    assert audit["physiology_fused_rows"] == manifest["available_row_count"]
+    assert audit["physiology_refitted"] is False
+
+
+# --- Blocker 2: exact sentinels -------------------------------------------
+
+
+def _corrupt_unavailable_row(outage, mutate) -> Path:
+    from cardiosentinel.neural.m1_store import (
+        OBSERVATION_STATE_FILE,
+    )
+    from cardiosentinel.neural.m1_store import (
+        REPRESENTATION_FILE as REP,
+    )
+    from cardiosentinel.neural.patient_memory import (
+        OBSERVATION_UNAVAILABLE_EXACT_FLAT as FLAT,
+    )
+
+    directory = outage["cache_root"] / "validation"
+    states = np.load(directory / OBSERVATION_STATE_FILE, allow_pickle=False)
+    row = int(np.flatnonzero(states == FLAT)[0])
+    rep = np.load(directory / REP, allow_pickle=False)
+    mutate(rep, row)
+    np.save(directory / REP, rep)
+    return directory
+
+
+@pytest.mark.parametrize(
+    "name,mutate",
+    [
+        (
+            "128 NaN + 18 finite",
+            lambda rep, row: rep.__setitem__(
+                (row, slice(EMBEDDING_DIM, None)), np.float32(0.5)
+            ),
+        ),
+        (
+            "one finite value",
+            lambda rep, row: rep.__setitem__((row, 3), np.float32(1.0)),
+        ),
+        (
+            "positive inf",
+            lambda rep, row: rep.__setitem__((row, 0), np.float32("inf")),
+        ),
+        (
+            "negative inf",
+            lambda rep, row: rep.__setitem__((row, 9), np.float32("-inf")),
+        ),
+        ("zero filled", lambda rep, row: rep.__setitem__(row, np.float32(0.0))),
+    ],
+)
+def test_loader_refuses_a_partially_finite_unavailable_row(outage, name, mutate):
+    _build_validation(outage)
+    _corrupt_unavailable_row(outage, mutate)
+    # the array digest catches it first; reseal so the sentinel rule is what
+    # actually refuses.
+    directory = outage["cache_root"] / "validation"
+    path = directory / "M1_STREAM_CACHE_MANIFEST.json"
+    from cardiosentinel.data.provenance import sha256_file
+    from cardiosentinel.neural.m1_store import REPRESENTATION_FILE as REP
+
+    manifest = json.loads(path.read_text())
+    manifest["artifact_sha256"][REP] = sha256_file(directory / REP)
+    manifest["representation_content_sha256"] = _content_digest(directory / REP)
+    manifest.pop("stream_cache_sha256")
+    manifest["stream_cache_sha256"] = canonical_sha256(manifest)
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(Exception, match="canonical NaN in every dimension"):
+        load_stream_store(outage["cache_root"], "validation")
+
+
+def _content_digest(path: Path) -> str:
+    from cardiosentinel.neural.m1_store import digest_array_file
+
+    return digest_array_file(path)
+
+
+def test_loader_accepts_a_valid_all_nan_unavailable_row(outage):
+    _build_validation(outage)
+    store, manifest = load_stream_store(outage["cache_root"], "validation")
+    assert manifest["unavailable_exact_flat_row_count"] == 1
+    store.close()
+
+
+# --- Blocker 3: independent digest re-derivation ---------------------------
+
+
+def _reseal_full(directory: Path, mutate_manifest=None) -> None:
+    """Recompute every array digest and the manifest digest."""
+    from cardiosentinel.data.provenance import sha256_file
+    from cardiosentinel.neural.m1_store import (
+        OBSERVATION_STATE_FILE,
+        M1StoreSpec,
+    )
+
+    path = directory / "M1_STREAM_CACHE_MANIFEST.json"
+    manifest = json.loads(path.read_text())
+    spec = M1StoreSpec(
+        rows=manifest["full_stream_row_count"],
+        representation_dim=REPRESENTATION_DIM,
+    )
+    manifest["artifact_sha256"] = {
+        name: sha256_file(directory / name) for name in sorted(spec.arrays())
+    }
+    manifest["observation_state_content_sha256"] = _content_digest(
+        directory / OBSERVATION_STATE_FILE
+    )
+    if mutate_manifest is not None:
+        mutate_manifest(manifest)
+    manifest.pop("stream_cache_sha256", None)
+    manifest["stream_cache_sha256"] = canonical_sha256(manifest)
+    path.write_text(json.dumps(manifest))
+
+
+def test_loader_rederives_the_unavailable_ordered_id_digest(outage):
+    """Same unavailable COUNT, different unavailable ROW -> still refused."""
+    from cardiosentinel.neural.m1_store import (
+        OBSERVATION_STATE_FILE,
+    )
+    from cardiosentinel.neural.m1_store import (
+        REPRESENTATION_FILE as REP,
+    )
+    from cardiosentinel.neural.patient_memory import (
+        OBSERVATION_AVAILABLE as AVAIL,
+    )
+    from cardiosentinel.neural.patient_memory import (
+        OBSERVATION_UNAVAILABLE_EXACT_FLAT as FLAT,
+    )
+
+    _build_validation(outage)
+    directory = outage["cache_root"] / "validation"
+    states = np.load(directory / OBSERVATION_STATE_FILE, allow_pickle=False)
+    original = int(np.flatnonzero(states == FLAT)[0])
+    other = int(np.flatnonzero(states == AVAIL)[0])
+
+    # move the outage to a different row, keeping the count identical
+    states[original] = AVAIL
+    states[other] = FLAT
+    np.save(directory / OBSERVATION_STATE_FILE, states)
+    # Swap every per-state column too, so all the sentinel rules stay satisfied
+    # and the ONLY thing left wrong is the unavailable ordered-ID identity.
+    from cardiosentinel.neural.m1_store import (
+        D_LONG_FILE,
+        D_SHORT_FILE,
+        DISAGREEMENT_FILE,
+    )
+
+    for name in (REP, D_SHORT_FILE, D_LONG_FILE, DISAGREEMENT_FILE):
+        values = np.load(directory / name, allow_pickle=False)
+        values[[original, other]] = values[[other, original]]
+        np.save(directory / name, values)
+
+    def _refresh(manifest):
+        manifest["representation_content_sha256"] = _content_digest(directory / REP)
+        manifest["d_short_content_sha256"] = _content_digest(directory / D_SHORT_FILE)
+        manifest["d_long_content_sha256"] = _content_digest(directory / D_LONG_FILE)
+
+    _reseal_full(directory, _refresh)
+    with pytest.raises(Exception, match="unavailable ordered stable-ID digest"):
+        load_stream_store(outage["cache_root"], "validation")
+
+
+def test_loader_refuses_a_wrong_unavailable_digest(outage):
+    _build_validation(outage)
+    directory = outage["cache_root"] / "validation"
+    _reseal_full(
+        directory,
+        lambda m: m.__setitem__("unavailable_ordered_stable_id_sha256", "0" * 64),
+    )
+    with pytest.raises(Exception, match="unavailable ordered stable-ID digest"):
+        load_stream_store(outage["cache_root"], "validation")
+
+
+def test_loader_refuses_a_non_null_digest_with_zero_unavailable_rows(corpus):
+    _bounded(corpus, "train")
+    directory = corpus["cache_root"] / "train"
+    manifest = json.loads(
+        (directory / "M1_STREAM_CACHE_MANIFEST.json").read_text()
+    )
+    assert manifest["unavailable_exact_flat_row_count"] == 0
+    assert manifest["unavailable_ordered_stable_id_sha256"] is None
+    _reseal_full(
+        directory,
+        lambda m: m.__setitem__("unavailable_ordered_stable_id_sha256", "a" * 64),
+    )
+    with pytest.raises(Exception, match="no row is unavailable"):
+        load_stream_store(corpus["cache_root"], "train")
+
+
+def test_loader_refuses_a_null_digest_with_unavailable_rows(outage):
+    _build_validation(outage)
+    directory = outage["cache_root"] / "validation"
+    _reseal_full(
+        directory,
+        lambda m: m.__setitem__("unavailable_ordered_stable_id_sha256", None),
+    )
+    with pytest.raises(Exception, match="records no unavailable ordered-ID digest"):
+        load_stream_store(outage["cache_root"], "validation")
+
+
+def test_unavailable_row_memory_is_frozen_end_to_end(outage):
+    """The outage row produces NaN scores and freezes the counters."""
+    from cardiosentinel.neural.m1_store import (
+        D_LONG_FILE as DL,
+    )
+    from cardiosentinel.neural.m1_store import (
+        D_SHORT_FILE as DS,
+    )
+    from cardiosentinel.neural.m1_store import (
+        DISAGREEMENT_FILE as DD,
+    )
+    from cardiosentinel.neural.m1_store import (
+        OBSERVATION_STATE_FILE,
+    )
+    from cardiosentinel.neural.m1_store import (
+        PAST_OBSERVED_FILE as PO,
+    )
+    from cardiosentinel.neural.m1_store import (
+        PAST_UPDATE_FILE as PU,
+    )
+    from cardiosentinel.neural.m1_store import (
+        RECORDING_AGE_FILE as RA,
+    )
+    from cardiosentinel.neural.patient_memory import (
+        OBSERVATION_UNAVAILABLE_EXACT_FLAT as FLAT,
+    )
+
+    _build_validation(outage)
+    store, _ = load_stream_store(outage["cache_root"], "validation")
+    states = np.asarray(store.array(OBSERVATION_STATE_FILE))
+    row = int(np.flatnonzero(states == FLAT)[0])
+    assert np.isnan(np.asarray(store.array(DS))[row])
+    assert np.isnan(np.asarray(store.array(DL))[row])
+    assert np.isnan(np.asarray(store.array(DD))[row])
+    assert np.isfinite(np.asarray(store.array(RA))[row])
+    observed = np.asarray(store.array(PO))
+    updated = np.asarray(store.array(PU))
+    assert observed[row] == observed[row - 1] + 1  # the prior row's own update
+    assert observed[row] == updated[row]
+    store.close()

@@ -35,7 +35,7 @@ from numpy.lib.format import open_memmap
 # Implementation identity of the on-disk layout. This is an ENGINEERING
 # version, deliberately separate from the frozen M1 scientific protocol SHA:
 # the protocol does not fix a serialization format.
-M1_STREAM_CACHE_SCHEMA: Final = 2
+M1_STREAM_CACHE_SCHEMA: Final = 3
 
 # Row chunk used by every bounded operation. Sized so one chunk of the widest
 # array (float32 [chunk, 146]) stays in the low tens of MB.
@@ -212,6 +212,7 @@ PAST_UPDATE_FILE: Final = "past_update_count.npy"
 DISAGREEMENT_FILE: Final = "prototype_disagreement.npy"
 RECORDING_AGE_FILE: Final = "recording_age_seconds.npy"
 COLD_START_BIN_FILE: Final = "cold_start_bin.npy"
+OBSERVATION_STATE_FILE: Final = "observation_state.npy"
 
 IDENTITY_FILES: Final = (
     STABLE_ID_FILE,
@@ -227,6 +228,7 @@ MEMORY_FILES: Final = (
     DISAGREEMENT_FILE,
     RECORDING_AGE_FILE,
     COLD_START_BIN_FILE,
+    OBSERVATION_STATE_FILE,
 )
 
 
@@ -251,6 +253,8 @@ class M1StoreSpec:
             DISAGREEMENT_FILE: ((self.rows,), "float64"),
             RECORDING_AGE_FILE: ((self.rows,), "float64"),
             COLD_START_BIN_FILE: ((self.rows,), "<U32"),
+            # Schema 3: physical observation availability, persisted per row.
+            OBSERVATION_STATE_FILE: ((self.rows,), "uint8"),
         }
 
 

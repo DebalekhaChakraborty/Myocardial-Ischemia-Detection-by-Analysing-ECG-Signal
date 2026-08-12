@@ -146,6 +146,46 @@ class _StubWaveformDataset:
         return _Stats()
 
 
+
+def _availability_stream(rows_by_id, embedding_for, unavailable=()):
+    """The M1-v2 physical seam: yields (reference, waveform_or_None, available).
+
+    Availability is a property of the synthetic waveform, exactly as production
+    decides it from real samples -- the stub never consults an identifier list
+    to make the decision, it builds a genuinely flat waveform instead.
+    """
+    def _stream(_partition, identifiers):
+        for key in identifiers:
+            reference = rows_by_id[str(key)]
+            if str(key) in unavailable:
+                yield reference, None, False
+            else:
+                yield reference, embedding_for(str(key)), True
+    return _stream
+
+
+
+def _stub_physical_batches(rows_by_id, waveform_for, unavailable=frozenset()):
+    """Stand-in for `physical_observation_batches`.
+
+    Availability is decided from the synthetic samples themselves via the
+    production predicate, so the stub never whitelists identifiers.
+    """
+    from cardiosentinel.neural.patient_memory import exact_flat_unavailable
+
+    def _stream(references, source, *, batch_size=256):
+        for item in references:
+            key = str(item.stable_id)
+            wave = waveform_for(key, flat=key in unavailable)
+            values = wave.numpy().reshape(-1)
+            if exact_flat_unavailable(values):
+                yield item, None, False
+            else:
+                yield item, wave, True
+
+    return _stream
+
+
 @pytest.fixture
 def official(tmp_path, monkeypatch):
     """Stub every upstream gate, then leave the M1 orchestration untouched."""
@@ -296,7 +336,23 @@ def official(tmp_path, monkeypatch):
     monkeypatch.setattr(
         m1_experiment, "build_validation_challenge_index", lambda *_a: _Challenge()
     )
+    rows_by_id = {
+        item.stable_id: item for group in ALL_ROWS.values() for item in group
+    }
+
+    def _wave(key, *, flat=False):
+        import torch as _t
+
+        if flat:
+            return _t.full((1, 2500), -5.12, dtype=_t.float32)
+        return _stub_waveform(key)
+
     monkeypatch.setattr(m1_experiment, "B4WaveformDataset", _StubWaveformDataset)
+    monkeypatch.setattr(
+        m1_experiment,
+        "physical_observation_batches",
+        _stub_physical_batches(rows_by_id, _wave),
+    )
 
     # The suite reads the control lock directly; give it the real layout.
     control_dir = tmp_path / "p1" / "P1B_phys_fusion_v1"

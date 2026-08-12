@@ -434,8 +434,8 @@ def add_p1_parser(subparsers: argparse._SubParsersAction) -> None:
         )
 
 
-DEFAULT_M1_RUN_ROOT = Path("cardiosentinel-runs/phase5-m1-dual-memory-v1")
-DEFAULT_M1_STREAM_CACHE_ROOT = Path("cardiosentinel-features/m1-stream-memory-v1")
+DEFAULT_M1_RUN_ROOT = Path("cardiosentinel-runs/phase5-m1-dual-memory-v2")
+DEFAULT_M1_STREAM_CACHE_ROOT = Path("cardiosentinel-features/m1-stream-memory-v2")
 
 
 def add_m1_parser(subparsers: argparse._SubParsersAction) -> None:

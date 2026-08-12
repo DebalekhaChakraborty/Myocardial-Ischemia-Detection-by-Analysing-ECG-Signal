@@ -60,10 +60,27 @@ from cardiosentinel.neural.protocol import (
     STRIDE_SECONDS,
 )
 
-M1_PROTOCOL_NAME: Final = "M1_DUAL_MEMORY_PROTOCOL_V1"
+M1_PROTOCOL_V1_NAME: Final = "M1_DUAL_MEMORY_PROTOCOL_V1"
+M1_PROTOCOL_V1_PATH: Final = REPOSITORY_ROOT / "docs" / f"{M1_PROTOCOL_V1_NAME}.md"
+# M1-v1 is IMMUTABLE HISTORICAL EVIDENCE. It is superseded prospectively by
+# M1-v2 and is never rewritten; its digest must keep validating.
+M1_PROTOCOL_V1_SHA256: Final = (
+    "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253"
+)
+M1_PHYSICAL_OBSERVATION_DECISION_SHA256: Final = (
+    "ba9be6de0da7037e0d99b7c619aabbb09c44f84a32c04e2241a61d8277ed5ce7"
+)
+M1_ATTEMPT2_CENSUS_SHA256: Final = (
+    "8170068ee3f40875428a28374c8bb1accf4b6fbfd3cc510195f6851f954ce1ee"
+)
+M1_ATTEMPT2_FAILURE_SHA256: Final = (
+    "1bf9539f89d179e8cbf6adb7e578d9f78a9e990fbbf906e5ae3679b93ec1310a"
+)
+
+M1_PROTOCOL_NAME: Final = "M1_DUAL_MEMORY_PROTOCOL_V2"
 M1_PROTOCOL_PATH: Final = REPOSITORY_ROOT / "docs" / f"{M1_PROTOCOL_NAME}.md"
 M1_PROTOCOL_SHA256: Final = (
-    "08f71c5b54ebd0fcc9c1f26f05d7df2c5a1b0ca5253b8821435a65673ad65253"
+    "31a81358870cd23c2258cf4f307ab8c4dc7bf245bc4bf18a4d1f48fe2aada39c"
 )
 # Both superseded before any M1 evidence existed, and retained so a stale digest
 # is recognised as such rather than merely rejected as unknown.
@@ -77,6 +94,9 @@ M1_PROTOCOL_SHA256: Final = (
 SUPERSEDED_M1_PROTOCOL_SHA256: Final = (
     "52eedc628d906ac02619264fc26cd4629e56f05d6c1916448d62a2844c9815f4",
     "cc2e78e720bbb55d3dd51e61a5ea6cd04c77cb77eef41508def3951361ccda61",
+    # M1-v1: superseded PROSPECTIVELY, not before use. Two authorized
+    # invocations ran under it and produced zero arm claims and zero results.
+    M1_PROTOCOL_V1_SHA256,
 )
 P1_RETENTION_DECISION_SHA256: Final = (
     "7b403709fa0fb12eef65423d830c121fc3ada904266a1b47931d438f5e797d68"
@@ -85,11 +105,18 @@ P1_RETENTION_DECISION_SHA256: Final = (
 # The P1 retention decision kept the complete 18-d physiology vector.
 REPRESENTATION_DIM: Final = EMBEDDING_DIM + PHYSIOLOGY_DIM  # 146
 
-M1S_EXPERIMENT_ID: Final = "M1S_short_memory_v1"
-M1L_EXPERIMENT_ID: Final = "M1L_long_memory_v1"
-M1D_EXPERIMENT_ID: Final = "M1D_dual_memory_v1"
+M1S_EXPERIMENT_ID: Final = "M1S_short_memory_v2"
+M1L_EXPERIMENT_ID: Final = "M1L_long_memory_v2"
+M1D_EXPERIMENT_ID: Final = "M1D_dual_memory_v2"
+# v1 arm identities are retained so a historical artifact can never be mistaken
+# for a v2 one, and so a v1 directory is recognised rather than reused.
+M1_V1_EXPERIMENT_IDS: Final = (
+    "M1S_short_memory_v1",
+    "M1L_long_memory_v1",
+    "M1D_dual_memory_v1",
+)
 M1_EXPERIMENT_IDS: Final = (M1S_EXPERIMENT_ID, M1L_EXPERIMENT_ID, M1D_EXPERIMENT_ID)
-M1_RUN_COLLECTION: Final = "phase5-m1-dual-memory-v1"
+M1_RUN_COLLECTION: Final = "phase5-m1-dual-memory-v2"
 GLOBAL_CONTROL_EXPERIMENT_ID: Final = P1B_EXPERIMENT_ID
 
 # Memory features, in the one frozen order used by every arm.
@@ -109,9 +136,58 @@ LONG_HALF_LIFE_UPDATES: Final = 720
 ALPHA_SHORT: Final = 1.0 - 2.0 ** (-1.0 / SHORT_HALF_LIFE_UPDATES)
 ALPHA_LONG: Final = 1.0 - 2.0 ** (-1.0 / LONG_HALF_LIFE_UPDATES)
 
-UPDATE_POLICY: Final = "finite_observation_always_update"
+# --------------------------------------------------------------------------
+# Physical observation availability (M1-v2, the only scientific delta from v1)
+# --------------------------------------------------------------------------
+OBSERVATION_UNINITIALIZED: Final = 0
+OBSERVATION_AVAILABLE: Final = 1
+OBSERVATION_UNAVAILABLE_EXACT_FLAT: Final = 2
+OBSERVATION_STATE_ENUM: Final = {
+    "UNINITIALIZED_INVALID_FOR_COMPLETED_CACHE": OBSERVATION_UNINITIALIZED,
+    "AVAILABLE": OBSERVATION_AVAILABLE,
+    "UNAVAILABLE_EXACT_FLAT": OBSERVATION_UNAVAILABLE_EXACT_FLAT,
+}
+OBSERVATION_STATE_VERSION: Final = 1
+PHYSICAL_OBSERVATION_CONTRACT: Final = (
+    "An individually read 2500-sample single-channel physical mV segment that "
+    "passes interval validity, header calibration, unit support, mV conversion "
+    "and finiteness, but satisfies np.ptp(values) <= np.finfo(np.float64).eps, "
+    "is a PHYSICALLY UNAVAILABLE SENSOR OBSERVATION. It receives no B4-B "
+    "inference, no representation, no deviation score and no memory update, "
+    "while retaining its timeline position and real elapsed time. Every other "
+    "failure class remains fatal."
+)
+
+
+def exact_flat_unavailable(values: np.ndarray) -> bool:
+    """The frozen physical-availability predicate.
+
+    This is EXACTLY the existing B4 hard dynamic-variation criterion, applied
+    to an already fully validated physical mV segment. It is deliberately not a
+    near-flat, variance, amplitude, SQI or morphology threshold, and it never
+    consults `morphology_valid`: a flat lead is decided from the samples alone.
+    """
+    array = np.asarray(values, dtype=np.float64)
+    if array.ndim == 2:
+        if array.shape[1] != 1:
+            raise M1MemoryError(
+                "Physical availability is decided per single channel."
+            )
+        array = array[:, 0]
+    if array.ndim != 1 or array.size == 0:
+        raise M1MemoryError("Physical availability needs a 1-D sample vector.")
+    if not np.all(np.isfinite(array)):
+        # Non-finite is a FATAL class, never reclassified as unavailable.
+        raise M1MemoryError(
+            "A non-finite waveform segment is a fatal integrity failure and "
+            "must never be reclassified as a physically unavailable observation."
+        )
+    return bool(np.ptp(array) <= np.finfo(np.float64).eps)
+
+
+UPDATE_POLICY: Final = "available_finite_observation_always_update"
 UPDATE_POLICY_STATEMENT: Final = (
-    "Every finite fused observation updates both prototypes after its own "
+    "Every AVAILABLE finite fused observation updates both prototypes after its own "
     "features are recorded. This is intentionally NOT contamination-safe: an "
     "abnormal or confounded window may enter memory. M2 is required before any "
     "safe-adaptation or deployment-safe personalization claim."
@@ -163,6 +239,22 @@ def validate_m1_protocol(path: Path = M1_PROTOCOL_PATH) -> str:
         raise M1MemoryError(
             f"M1 protocol digest {digest} differs from the frozen "
             f"{M1_PROTOCOL_SHA256}. The protocol is immutable."
+        )
+    return digest
+
+
+def validate_m1_protocol_v1(path: Path = M1_PROTOCOL_V1_PATH) -> str:
+    """Verify the immutable M1-v1 protocol. It is history and must never move."""
+    from cardiosentinel.data.provenance import sha256_file
+
+    document = Path(path)
+    if not document.is_file():
+        raise M1MemoryError(f"Historical M1-v1 protocol is missing at {document}.")
+    digest = sha256_file(document)
+    if digest != M1_PROTOCOL_V1_SHA256:
+        raise M1MemoryError(
+            f"M1-v1 protocol digest {digest} differs from the frozen historical "
+            f"{M1_PROTOCOL_V1_SHA256}. M1-v1 is immutable evidence."
         )
     return digest
 
@@ -695,6 +787,15 @@ def m1_boundary_statement() -> dict[str, Any]:
         "update_policy_statement": UPDATE_POLICY_STATEMENT,
         "contamination_safe": CONTAMINATION_SAFE,
         "m2_required_before_safe_adaptation_claim": True,
+        "physical_availability_decided_before_encoder": True,
+        "physical_observation_contract": PHYSICAL_OBSERVATION_CONTRACT,
+        "unavailable_row_produces_representation": False,
+        "unavailable_row_produces_score": False,
+        "unavailable_row_updates_memory": False,
+        "unavailable_row_increments_counters": False,
+        "unavailable_row_preserves_elapsed_time": True,
+        "b4_input_contract_weakened": False,
+        "alpha_time_rescaled": False,
         "label_gated_update": False,
         "score_gated_update": False,
         "uncertainty_admission": False,
