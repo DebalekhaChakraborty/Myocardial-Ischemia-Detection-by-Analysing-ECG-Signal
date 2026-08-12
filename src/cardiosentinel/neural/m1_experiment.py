@@ -2041,18 +2041,34 @@ def _fill_physiology(
     transform: PhysiologyTransform,
     chunk_rows: int,
 ) -> dict[str, Any]:
-    """Apply the exact frozen transform in bounded per-file chunks.
+    """Apply the exact frozen transform to AVAILABLE rows only.
 
-    The transform itself is the reviewed frozen artifact and is never refitted;
-    only the plumbing changes. The old path built a whole-corpus
-    `dict[str, ndarray]` of raw morphology, which is one of the allocations
-    that exhausted memory.
+    The transform is the reviewed frozen artifact and is never refitted. What
+    changed in M1-v2 is *which rows it touches*: an UNAVAILABLE row has no
+    physical observation, so fusing physiology into it would leave
+    `[128 NaN embedding ; 18 finite physiology]` instead of the canonical
+    all-NaN row the protocol requires.
+
+    The feature-corpus identity is still proven for every timeline row —
+    unavailable rows must exist in the corpus — but their physiology is
+    deliberately not written, so "skipped because unavailable" is never
+    confused with "missing feature-corpus row".
+
+    `morphology_valid` plays no part in this decision; availability comes from
+    the persisted observation state, which came from the waveform.
     """
     evaluated = require_p1_partition(partition)
     representation = store.array(REPRESENTATION_FILE)
+    states = np.asarray(store.array(OBSERVATION_STATE_FILE))
+    if int(np.count_nonzero(states == OBSERVATION_UNINITIALIZED)):
+        raise M1MemoryError(
+            "Physiology fusion requires every row to be classified; "
+            "UNINITIALIZED observation state is fatal."
+        )
     sorted_ids, order = _sorted_id_index(store)
     columns = list(morphology_columns())
-    filled = np.zeros(representation.shape[0], dtype=bool)
+    seen = np.zeros(representation.shape[0], dtype=bool)
+    fused = np.zeros(representation.shape[0], dtype=bool)
     files = 0
 
     for path in sorted((Path(feature_root) / evaluated).glob("*.npz")):
@@ -2067,23 +2083,62 @@ def _fill_physiology(
                 present = positions >= 0
                 if not np.any(present):
                     continue
+                rows = positions[present]
+                # Corpus identity is proven for EVERY timeline row, available
+                # or not.
+                seen[rows] = True
+                admit = states[rows] == OBSERVATION_AVAILABLE
+                if not np.any(admit):
+                    continue
                 raw = np.asarray(features[begin:end], dtype=np.float64)[:, columns]
-                values = transform.transform(raw[present])
-                representation[positions[present], EMBEDDING_DIM:] = values
-                filled[positions[present]] = True
+                values = transform.transform(raw[present][admit])
+                representation[rows[admit], EMBEDDING_DIM:] = values
+                fused[rows[admit]] = True
     store.flush()
 
-    missing = int(np.sum(~filled))
+    missing = int(np.sum(~seen))
     if missing:
         raise M1MemoryError(
             f"{missing} full-stream rows have no frozen morphology_v1 record."
         )
+    available = states == OBSERVATION_AVAILABLE
+    unfused = int(np.count_nonzero(available & ~fused))
+    if unfused:
+        raise M1MemoryError(
+            f"{unfused} AVAILABLE rows were not physiology-fused."
+        )
+    if int(np.count_nonzero(~available & fused)):
+        raise M1MemoryError(
+            "An UNAVAILABLE row received a physiology vector; the whole 146-d "
+            "representation must remain canonical NaN."
+        )
+
+    # Sentinel proof in bounded chunks: available rows fully finite,
+    # unavailable rows fully NaN.
+    for begin in range(0, representation.shape[0], chunk_rows):
+        end = begin + chunk_rows
+        block = np.asarray(representation[begin:end])
+        block_available = available[begin:end]
+        if np.any(block_available & ~np.all(np.isfinite(block), axis=1)):
+            raise M1MemoryError(
+                "An AVAILABLE row is not fully finite after physiology fusion."
+            )
+        if np.any(~block_available & ~np.all(np.isnan(block), axis=1)):
+            raise M1MemoryError(
+                "An UNAVAILABLE row is not canonical all-NaN after physiology "
+                "fusion."
+            )
     return {
         "physiology_files_read": files,
         "physiology_dim": PHYSIOLOGY_DIM,
         "physiology_refitted": False,
         "physiology_transform_sha256": transform.as_dict()["transform_sha256"],
         "physiology_schema_sha256": MORPHOLOGY_SCHEMA_SHA256,
+        "physiology_fused_rows": int(np.count_nonzero(fused)),
+        "physiology_skipped_unavailable_rows": int(
+            np.count_nonzero(~available)
+        ),
+        "timeline_rows_present_in_feature_corpus": int(np.count_nonzero(seen)),
     }
 
 
@@ -2278,14 +2333,20 @@ def materialize_stream_store(
                 chunk_rows=chunk_rows,
             )
         )
+        # Finiteness is required of AVAILABLE rows only; UNAVAILABLE rows are
+        # canonical all-NaN by protocol. `_fill_physiology` already proved both
+        # sentinels, so this is the residual integrity sweep.
         representation = store.array(REPRESENTATION_FILE)
+        state_column = np.asarray(store.array(OBSERVATION_STATE_FILE))
         for begin in range(0, representation.shape[0], chunk_rows):
-            block = np.asarray(representation[begin : begin + chunk_rows])
-            if not np.all(np.isfinite(block)):
+            end = begin + chunk_rows
+            block = np.asarray(representation[begin:end])
+            admit = state_column[begin:end] == OBSERVATION_AVAILABLE
+            if np.any(admit & ~np.all(np.isfinite(block), axis=1)):
                 raise M1MemoryError(
-                    "A non-finite fused representation was produced despite the "
-                    "frozen P1 transformation. M1 refuses rather than skipping "
-                    "the window."
+                    "A non-finite fused representation was produced for an "
+                    "AVAILABLE row despite the frozen P1 transformation. M1 "
+                    "refuses rather than skipping the window."
                 )
 
         if standardizer is None:
@@ -2631,16 +2692,22 @@ def load_stream_store(
         end = begin + chunk_rows
         block_state = states[begin:end]
         block_rep = np.asarray(rep[begin:end])
-        finite_rep = np.all(np.isfinite(block_rep), axis=1)
         ok = block_state == OBSERVATION_AVAILABLE
         bad = block_state == OBSERVATION_UNAVAILABLE_EXACT_FLAT
-        if np.any(ok & ~finite_rep):
+        # Exact sentinels. "not entirely finite" is too weak: a mixed row of
+        # 128 NaN embedding dims plus 18 finite physiology dims would satisfy
+        # it while violating the protocol.
+        fully_finite = np.all(np.isfinite(block_rep), axis=1)
+        fully_nan = np.all(np.isnan(block_rep), axis=1)
+        if np.any(ok & ~fully_finite):
             raise M1MemoryError(
                 "An AVAILABLE row carries a non-finite representation."
             )
-        if np.any(bad & finite_rep):
+        if np.any(bad & ~fully_nan):
             raise M1MemoryError(
-                "An UNAVAILABLE row must carry the canonical NaN representation."
+                "An UNAVAILABLE row must carry a representation that is "
+                "canonical NaN in every dimension. A partially finite, "
+                "zero-filled or carried-forward row is refused."
             )
         for name, values in (
             ("d_short", np.asarray(short[begin:end])),
@@ -2663,6 +2730,39 @@ def load_stream_store(
         ):
             if np.any(values < 0):
                 raise M1MemoryError(f"{name} must be non-negative.")
+
+    # Independently re-derive the unavailable ordered stable-ID identity from
+    # the PERSISTED arrays. The producer-side audit copy is never trusted.
+    recorded_unavailable = manifest.get("unavailable_ordered_stable_id_sha256")
+    unavailable_count = int(np.count_nonzero(unavailable))
+    if unavailable_count == 0:
+        if recorded_unavailable is not None:
+            raise M1MemoryError(
+                "M1 stream cache records an unavailable ordered-ID digest while "
+                "no row is unavailable."
+            )
+    else:
+        if recorded_unavailable is None:
+            raise M1MemoryError(
+                f"M1 stream cache has {unavailable_count} unavailable rows but "
+                "records no unavailable ordered-ID digest."
+            )
+
+        def _unavailable_identifiers():
+            identifiers = store.array(STABLE_ID_FILE)
+            for begin in range(0, identifiers.shape[0], chunk_rows):
+                end = begin + chunk_rows
+                block = np.asarray(identifiers[begin:end])
+                selected = unavailable[begin:end]
+                yield from (str(value) for value in block[selected])
+
+        rederived = streaming_ordered_stable_id_digest(_unavailable_identifiers())
+        if rederived != recorded_unavailable:
+            raise M1MemoryError(
+                "The unavailable ordered stable-ID digest re-derived from the "
+                "persisted stable_id.npy and observation_state.npy does not "
+                "match the manifest."
+            )
 
     standardizer_path = Path(cache_root) / STANDARDIZER_NAME
     if not standardizer_path.is_file():
@@ -3035,7 +3135,17 @@ def m1_preflight(
             ),
             "prior_scientific_m1_arm_claims": 0,
             "prior_scientific_m1_results": 0,
-            "prior_attempt_scientific_artifacts_created": False,
+            # Attempt 2 DID create partial execution artifacts. What it never
+            # created is a claim-bearing scientific result, so the two facts are
+            # reported separately rather than collapsed into one misleading flag.
+            "prior_claim_bearing_scientific_result_artifacts_created": False,
+            "prior_partial_execution_artifacts_created": True,
+            "prior_partial_execution_artifacts": [
+                "M1-v1 TRAIN stream store",
+                "M1-v1 distance standardizer",
+                "M1-v1 validation staging area",
+            ],
+            "prior_partial_execution_artifacts_are_valid_m1_v2_artifacts": False,
             "prior_attempt_arm_claims_created": False,
             "m1_v1_historical_partial_artifacts_preserved": (
                 Path(M1_V1_RUN_ROOT).exists()
