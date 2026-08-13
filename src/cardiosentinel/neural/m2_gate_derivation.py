@@ -40,9 +40,14 @@ from cardiosentinel.baseline.cache import (
     read_json,
     require_nonversioned_path,
 )
-from cardiosentinel.features.schema import COMBINED_V1
+from cardiosentinel.data.provenance import sha256_file
+from cardiosentinel.features.schema import COMBINED_V1, SIGNAL_V1
 from cardiosentinel.neural import m2_gate as GATE
-from cardiosentinel.neural.m1_experiment import load_stream_store, validate_m1_lock
+from cardiosentinel.neural.m1_experiment import (
+    load_stream_store,
+    validate_m1_lock,
+    validate_m1_stage1_results,
+)
 from cardiosentinel.neural.m1_store import (
     CHANNEL_INDEX_FILE,
     D_LONG_FILE,
@@ -63,6 +68,7 @@ from cardiosentinel.neural.patient_memory import (
 )
 from cardiosentinel.neural.physiology_fusion import P1_BATCH_SIZE
 from cardiosentinel.neural.protocol import SAMPLING_FREQUENCY_HZ, WINDOW_SAMPLES
+from cardiosentinel.neural.provenance import runtime_environment
 
 DEFAULT_STREAM_CACHE_ROOT: Final = (
     REPOSITORY_ROOT / "cardiosentinel-features" / "m1-stream-memory-v2"
@@ -246,9 +252,7 @@ def score_m1l(
 # --------------------------------------------------------------------------
 
 
-def primary_train_background_negative_mask(
-    stable_ids: np.ndarray, p1_cache_root: Path
-) -> np.ndarray:
+def primary_train_background_negative_mask(stable_ids: np.ndarray, cache) -> np.ndarray:
     """The 280,839-row PRIMARY TRAIN background-negative population.
 
     "PRIMARY TRAIN" here is the frozen 374,452-row sampled population used to
@@ -258,7 +262,6 @@ def primary_train_background_negative_mask(
     `load_p1_embedding_cache` is that exact frozen selection, with `label`
     already 0 for background_negative rows.
     """
-    cache = load_p1_embedding_cache(p1_cache_root, "train")
     background = frozenset(
         stable_id
         for stable_id, label in zip(cache.stable_ids, cache.labels, strict=True)
@@ -268,14 +271,151 @@ def primary_train_background_negative_mask(
 
 
 # --------------------------------------------------------------------------
+# Every source/population/artifact identity currently bound by the receipt,
+# other than `environment.dependency_digest` (which this run intentionally
+# re-observes under the canonical runtime and is compared separately).
+# --------------------------------------------------------------------------
+
+
+def verify_identity_bindings(
+    *,
+    receipt: dict[str, Any],
+    manifest: dict[str, Any],
+    cache,
+    current_environment: dict[str, Any],
+    m1_run_root: Path,
+    stream_cache_root: Path,
+) -> dict[str, Any]:
+    mismatches: list[str] = []
+
+    def _check(label: str, computed: Any, expected: Any) -> None:
+        if computed != expected:
+            mismatches.append(f"{label}: computed={computed!r} frozen={expected!r}")
+
+    _check(
+        "base_scientific_tree", manifest.get("git_sha"), receipt["base_scientific_tree"]
+    )
+    _check(
+        "environment.amp_enabled",
+        current_environment["amp_enabled"],
+        receipt["environment"]["amp_enabled"],
+    )
+    _check(
+        "environment.numpy",
+        current_environment["numpy_version"],
+        receipt["environment"]["numpy"],
+    )
+    _check(
+        "environment.python",
+        current_environment["python_version"],
+        receipt["environment"]["python"],
+    )
+    _check(
+        "environment.torch",
+        current_environment["torch_version"],
+        receipt["environment"]["torch"],
+    )
+    _check("environment.device", "cpu", receipt["environment"]["device"])
+
+    identity = receipt["full_train_stream_identity"]
+    _check(
+        "full_train_stream_identity.records",
+        len(manifest["record_ids"]),
+        identity["records"],
+    )
+    _check(
+        "full_train_stream_identity.rows",
+        int(manifest["full_stream_row_count"]),
+        identity["rows"],
+    )
+    _check(
+        "full_train_stream_identity.streams",
+        int(manifest["stream_count"]),
+        identity["streams"],
+    )
+
+    _check(
+        "m1_retention_decision_sha256",
+        sha256_file(REPOSITORY_ROOT / "docs" / "M1_MEMORY_RETENTION_DECISION_V1.md"),
+        receipt["m1_retention_decision_sha256"],
+    )
+    _check(
+        "m1_v2_protocol_sha256",
+        sha256_file(REPOSITORY_ROOT / "docs" / "M1_DUAL_MEMORY_PROTOCOL_V2.md"),
+        receipt["m1_v2_protocol_sha256"],
+    )
+    stage1_payload = validate_m1_stage1_results(
+        m1_run_root, stream_cache_root=stream_cache_root
+    )
+    _check(
+        "m1_stage1_suite_sha256",
+        stage1_payload["m1_stage1_suite_sha256"],
+        receipt["m1_stage1_suite_sha256"],
+    )
+
+    positive = int(np.sum(np.asarray(cache.labels) == 1))
+    subjects = len(set(cache.subject_ids))
+    _check(
+        "primary_train_identity.positive",
+        positive,
+        receipt["primary_train_identity"]["positive"],
+    )
+    _check(
+        "primary_train_identity.rows",
+        len(cache.labels),
+        receipt["primary_train_identity"]["rows"],
+    )
+    _check(
+        "primary_train_identity.subjects",
+        subjects,
+        receipt["primary_train_identity"]["subjects"],
+    )
+    _check(
+        "primary_train_identity.p1_embedding_cache_sha256",
+        cache.manifest["cache_sha256"],
+        receipt["primary_train_identity"]["p1_embedding_cache_sha256"],
+    )
+
+    _check(
+        "signal_v1_schema_sha256", SIGNAL_V1.sha256, receipt["signal_v1_schema_sha256"]
+    )
+    _check(
+        "g4_normal_evidence.m1l_classification_threshold_for_non_equivalence_reference",
+        GATE.M1L_CLASSIFICATION_THRESHOLD,
+        receipt["g4_normal_evidence"][
+            "m1l_classification_threshold_for_non_equivalence_reference"
+        ],
+    )
+
+    return {"mismatches": mismatches, "all_bound": not mismatches}
+
+
+# --------------------------------------------------------------------------
 # G3 -- waveform SQI
 # --------------------------------------------------------------------------
+
+
+def _descriptive_distribution(
+    values: np.ndarray, quantile_labels: dict[float, str]
+) -> dict[str, float]:
+    """min/max plus the given quantiles, labeled exactly as the receipt keys them.
+
+    The frozen receipt is not internally consistent in this labeling: G3's 0.50
+    entry is keyed "median" while G4's is keyed "q50". `quantile_labels` is
+    passed explicitly per call site so this reproduces the receipt's actual
+    keys rather than a normalized guess.
+    """
+    stats = {"min": float(np.min(values)), "max": float(np.max(values))}
+    for q, label in quantile_labels.items():
+        stats[label] = float(np.quantile(values, q, method="linear"))
+    return stats
 
 
 def derive_g3(columns: dict[str, np.ndarray]) -> dict[str, Any]:
     finite_ok = columns["finite_sample_fraction"] == 1.0
     bounds: dict[str, float] = {}
     single_rejection: dict[str, float] = {}
+    descriptive: dict[str, dict[str, float]] = {}
     per_column_fail = np.zeros(finite_ok.shape[0], dtype=bool)
     for name in GATE.G3_SQI_COLUMNS:
         values = columns[name]
@@ -286,11 +426,15 @@ def derive_g3(columns: dict[str, np.ndarray]) -> dict[str, Any]:
         fails = values > bound
         single_rejection[name] = float(np.mean(fails))
         per_column_fail |= fails
+        descriptive[name] = _descriptive_distribution(
+            values, {0.50: "median", 0.95: "q95", 0.99: "q99"}
+        )
     combined_fail = per_column_fail | ~finite_ok
     return {
         "bounds": bounds,
         "single_feature_rejection_fraction": single_rejection,
         "combined_rejection_fraction": float(np.mean(combined_fail)),
+        "descriptive_distribution": descriptive,
         "pass_mask": ~combined_fail,
     }
 
@@ -310,9 +454,22 @@ def derive_g4(
         )
     )
     pass_mask = scores <= threshold
+    descriptive = _descriptive_distribution(
+        population,
+        {
+            0.10: "q10",
+            0.25: "q25",
+            0.50: "q50",
+            0.75: "q75",
+            0.90: "q90",
+            0.95: "q95",
+            0.99: "q99",
+        },
+    )
     return {
         "threshold": threshold,
         "population_rows": int(population.shape[0]),
+        "descriptive_distribution": descriptive,
         "pass_mask": pass_mask,
     }
 
@@ -432,9 +589,8 @@ def run_derivation(
     head = load_frozen_m1l_head(m1_run_root, receipt)
     scores = score_m1l(head, representation, d_long)
 
-    background_negative_mask = primary_train_background_negative_mask(
-        stable_ids, p1_cache_root
-    )
+    cache = load_p1_embedding_cache(p1_cache_root, "train")
+    background_negative_mask = primary_train_background_negative_mask(stable_ids, cache)
     expected_bg_rows = receipt["primary_train_identity"]["background_negative"]
     if int(np.count_nonzero(background_negative_mask)) != expected_bg_rows:
         raise M2GateDerivationError(
@@ -443,6 +599,16 @@ def run_derivation(
             f"receipt's {expected_bg_rows}."
         )
     g4 = derive_g4(scores, background_negative_mask)
+
+    current_environment = runtime_environment("cpu", 0)
+    identity = verify_identity_bindings(
+        receipt=receipt,
+        manifest=manifest,
+        cache=cache,
+        current_environment=current_environment,
+        m1_run_root=m1_run_root,
+        stream_cache_root=stream_cache_root,
+    )
 
     replay = causal_refractory_replay(store, g3["pass_mask"], g4["pass_mask"], g6_pass)
     cold_start = cold_start_update_fraction(store, replay["admitted_mask"])
@@ -465,10 +631,12 @@ def run_derivation(
                 "single_feature_rejection_fraction"
             ],
             "combined_train_rejection_fraction": g3["combined_rejection_fraction"],
+            "descriptive_distribution": g3["descriptive_distribution"],
         },
         "g4_normal_evidence": {
             "normal_evidence_threshold": g4["threshold"],
             "population_rows": g4["population_rows"],
+            "descriptive_distribution": g4["descriptive_distribution"],
         },
         "train_only_sanity": {
             "physical_available_fraction": 1.0,
@@ -493,11 +661,20 @@ def run_derivation(
         },
     }
 
-    comparison = compare_to_frozen(computed, receipt)
+    scientific_comparison = compare_to_frozen(computed, receipt)
+    comparison = {
+        "mismatches": scientific_comparison["mismatches"] + identity["mismatches"],
+        "reproduced": scientific_comparison["reproduced"] and identity["all_bound"],
+    }
     return {
         "receipt_sha256": GATE.M2_GATE_RECEIPT_SHA256,
         "protocol_sha256": GATE.M2_PROTOCOL_SHA256,
+        "canonical_dependency_digest": current_environment["dependencies"][
+            "installed_packages_sha256"
+        ],
+        "receipt_dependency_digest": receipt["environment"]["dependency_digest"],
         "computed": computed,
+        "identity_bindings": identity,
         "frozen_receipt_excerpt": {
             "g3_sqi": receipt["g3_sqi"],
             "g4_normal_evidence": receipt["g4_normal_evidence"],
@@ -512,27 +689,65 @@ def run_derivation(
 def compare_to_frozen(
     computed: dict[str, Any], receipt: dict[str, Any]
 ) -> dict[str, Any]:
+    """Exact-equality comparison; no tolerance is introduced anywhere.
+
+    Every number here comes from a deterministic numpy operation over
+    bit-identical frozen inputs (same checkpoint, same stream cache, same
+    feature corpus, same numpy/torch build), so a genuine reproduction is
+    bit-identical, not merely close. Any float mismatch, however small, is
+    reported and fails reproduction.
+    """
     mismatches: list[str] = []
 
-    for name, bound in computed["g3_sqi"]["frozen_upper_bounds_q99"].items():
-        expected = receipt["g3_sqi"]["frozen_upper_bounds_q99"][name]
-        if not np.isclose(bound, expected, rtol=1e-9, atol=1e-12):
+    def _exact(label: str, computed_value: Any, expected_value: Any) -> None:
+        if computed_value != expected_value:
             mismatches.append(
-                f"g3_upper_bound[{name}]: computed={bound} frozen={expected}"
+                f"{label}: computed={computed_value!r} frozen={expected_value!r}"
             )
 
-    combined = computed["g3_sqi"]["combined_train_rejection_fraction"]
-    expected_combined = receipt["g3_sqi"]["combined_train_rejection_fraction"]
-    if not np.isclose(combined, expected_combined, rtol=1e-6, atol=1e-9):
-        mismatches.append(
-            f"g3_combined_rejection: computed={combined} frozen={expected_combined}"
+    for name, bound in computed["g3_sqi"]["frozen_upper_bounds_q99"].items():
+        _exact(
+            f"g3_upper_bound[{name}]",
+            bound,
+            receipt["g3_sqi"]["frozen_upper_bounds_q99"][name],
         )
+    for name, fraction in computed["g3_sqi"][
+        "single_feature_train_rejection_fraction"
+    ].items():
+        _exact(
+            f"g3_single_feature_rejection[{name}]",
+            fraction,
+            receipt["g3_sqi"]["single_feature_train_rejection_fraction"][name],
+        )
+    _exact(
+        "g3_combined_rejection",
+        computed["g3_sqi"]["combined_train_rejection_fraction"],
+        receipt["g3_sqi"]["combined_train_rejection_fraction"],
+    )
+    for name, stats in computed["g3_sqi"]["descriptive_distribution"].items():
+        expected_stats = receipt["g3_sqi"]["descriptive_distribution"][name]
+        for stat_name, value in stats.items():
+            _exact(
+                f"g3_descriptive[{name}][{stat_name}]", value, expected_stats[stat_name]
+            )
 
-    threshold = computed["g4_normal_evidence"]["normal_evidence_threshold"]
-    expected_threshold = receipt["g4_normal_evidence"]["normal_evidence_threshold"]
-    if not np.isclose(threshold, expected_threshold, rtol=1e-9, atol=1e-15):
-        mismatches.append(
-            f"g4_threshold: computed={threshold} frozen={expected_threshold}"
+    _exact(
+        "g4_threshold",
+        computed["g4_normal_evidence"]["normal_evidence_threshold"],
+        receipt["g4_normal_evidence"]["normal_evidence_threshold"],
+    )
+    _exact(
+        "g4_population_rows",
+        computed["g4_normal_evidence"]["population_rows"],
+        receipt["g4_normal_evidence"]["population"]["rows"],
+    )
+    for stat_name, value in computed["g4_normal_evidence"][
+        "descriptive_distribution"
+    ].items():
+        _exact(
+            f"g4_descriptive[{stat_name}]",
+            value,
+            receipt["g4_normal_evidence"]["descriptive_distribution"][stat_name],
         )
 
     sanity = computed["train_only_sanity"]
@@ -546,21 +761,28 @@ def compare_to_frozen(
         "refractory_blocked_fraction",
     )
     for key in sanity_keys:
-        computed_value = sanity[key]
-        expected_value = frozen_sanity[key]
-        if not np.isclose(computed_value, expected_value, rtol=1e-6, atol=1e-9):
-            mismatches.append(
-                f"{key}: computed={computed_value} frozen={expected_value}"
+        _exact(key, sanity[key], frozen_sanity[key])
+
+    for key in ("min", "q10", "median", "q90", "max", "streams"):
+        _exact(
+            f"per_stream_update_fraction[{key}]",
+            sanity["per_stream_update_fraction"][key],
+            frozen_sanity["per_stream_update_fraction"][key],
+        )
+
+    for bin_name, bin_stats in sanity["cold_start_update_fraction"].items():
+        expected_bin = frozen_sanity["cold_start_update_fraction"][bin_name]
+        for stat_name in ("rows", "update_fraction"):
+            _exact(
+                f"cold_start[{bin_name}][{stat_name}]",
+                bin_stats[stat_name],
+                expected_bin[stat_name],
             )
 
-    for key in ("min", "median", "max"):
-        computed_value = sanity["per_stream_update_fraction"][key]
-        expected_value = frozen_sanity["per_stream_update_fraction"][key]
-        if not np.isclose(computed_value, expected_value, rtol=1e-6, atol=1e-9):
-            mismatches.append(
-                f"per_stream_update_fraction[{key}]: computed={computed_value} "
-                f"frozen={expected_value}"
-            )
+    for key, value in sanity["refusal_fractions"].items():
+        _exact(
+            f"refusal_fractions[{key}]", value, frozen_sanity["refusal_fractions"][key]
+        )
 
     return {"mismatches": mismatches, "reproduced": not mismatches}
 
