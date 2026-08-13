@@ -130,6 +130,16 @@ _ANNOTATION_IDENTIFIERS: Final = (
 FIREWALL_DEFINITION_NAME: Final = "_ANNOTATION_IDENTIFIERS"
 
 
+_POST_REPLAY_MODULES: Final = (
+    "m2_evaluation",
+    "m2_stress_intervals",
+)
+"""Modules that legitimately hold annotations, and so may never be imported
+by the replay side. `m2_stress_intervals` selects source-defined stress
+intervals from `.stb` semantics; if the replay could reach it, annotation
+timing could influence a score, gate decision or memory update."""
+
+
 def _module_identifiers(path: Path) -> set[str]:
     """Identifiers and non-docstring literals a module's CODE references.
 
@@ -224,14 +234,17 @@ def assert_label_firewall() -> dict[str, Any]:
                 f"{leaked} in code."
             )
         imported = _module_imports(path)
-        if any(module.endswith("m2_evaluation") for module in imported):
-            raise M2ExecutionError(
-                f"Label firewall breach: {name} imports the post-replay "
-                "evaluation module, which would let annotations feed backward."
-            )
+        for forbidden in _POST_REPLAY_MODULES:
+            if any(module.endswith(forbidden) for module in imported):
+                raise M2ExecutionError(
+                    f"Label firewall breach: {name} imports the post-replay "
+                    f"module {forbidden!r}, which would let annotations feed "
+                    "backward into the label-blind replay."
+                )
     return {
         "label_firewall": "enforced_structurally",
         "replay_side_modules": sorted(replay_side),
+        "post_replay_modules": sorted(_POST_REPLAY_MODULES),
         "annotation_identifiers_absent": True,
         "replay_imports_evaluation": False,
         "direction": "artifacts -> replay -> evidence -> (then) evaluation",
