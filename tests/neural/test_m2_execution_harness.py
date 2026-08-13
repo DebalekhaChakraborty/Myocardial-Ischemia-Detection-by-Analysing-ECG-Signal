@@ -46,9 +46,28 @@ IN_FROZEN_SCIENTIFIC_RUNTIME = (
 )
 
 
+FROZEN_RUNTIME_ONLY = pytest.mark.skipif(
+    not IN_FROZEN_SCIENTIFIC_RUNTIME,
+    reason=(
+        "asserts the frozen scientific identity; canonical COMPLETE evidence "
+        "requires the frozen runtime by design, and CI legitimately builds its "
+        "own environment"
+    ),
+)
+
+
 def _green_runtime() -> S.RuntimeIntegrityRecord:
-    """A record whose START check has already been taken and matched."""
-    record = S.RuntimeIntegrityRecord()
+    """A record whose START check has already been taken and matched.
+
+    The expectation is pinned to whatever this environment actually is, so the
+    persistence MECHANICS can be exercised anywhere -- including CI, which is
+    not the frozen scientific runtime. Tests that assert the frozen identity
+    itself, or that drive a run all the way to canonical COMPLETE, carry
+    `FROZEN_RUNTIME_ONLY` instead: `validate_complete_runtime_identity`
+    deliberately requires the frozen digest and must not be relaxed.
+    """
+    observed = S.observe_runtime_identity(S.EnforcementPoint.START).observed_digest
+    record = S.RuntimeIntegrityRecord(expected_digest=observed)
     S.require_runtime_identity(S.EnforcementPoint.START, record=record, detail="test")
     return record
 
@@ -976,6 +995,7 @@ def test_claim_time_runtime_mismatch_creates_no_canonical_directory(tmp_path):
 # --- 4-7. completion binding and runtime-block completeness ---------------
 
 
+@FROZEN_RUNTIME_ONLY
 def test_canonical_complete_result_cannot_carry_a_none_completion_digest():
     runtime = _green_runtime()
     runtime.record(
@@ -987,6 +1007,7 @@ def test_canonical_complete_result_cannot_carry_a_none_completion_digest():
         PS.validate_complete_runtime_identity(runtime)
 
 
+@FROZEN_RUNTIME_ONLY
 def test_completion_mismatch_prevents_canonical_complete_promotion(tmp_path):
     runtime = _green_runtime()
     claimed = PS.claim_run_directory(tmp_path, "M2_end_bad", "M2-G", runtime=runtime)
@@ -1013,6 +1034,7 @@ def test_completion_mismatch_prevents_canonical_complete_promotion(tmp_path):
     assert (claimed.staging_dir / PS.ARM_RESULT_NAME).exists()
 
 
+@FROZEN_RUNTIME_ONLY
 def test_all_three_enforcement_points_appear_in_the_finalized_block(tmp_path):
     runtime = _green_runtime()
     claimed = PS.claim_run_directory(tmp_path, "M2_full_block", "M2-G", runtime=runtime)
@@ -1044,6 +1066,7 @@ def test_all_three_enforcement_points_appear_in_the_finalized_block(tmp_path):
     )
 
 
+@FROZEN_RUNTIME_ONLY
 def test_all_observations_matched_is_required_for_canonical_evidence():
     runtime = _green_runtime()
     runtime.record(
@@ -1097,6 +1120,7 @@ def test_valid_full_population_identity_is_accepted():
     assert validated["population_scope"] == V.POPULATION_SCOPE_FULL
 
 
+@FROZEN_RUNTIME_ONLY
 def test_claim_bearing_result_requires_population_identity_when_evaluated(tmp_path):
     runtime = _green_runtime()
     claimed = PS.claim_run_directory(tmp_path, "M2_no_pop", "M2-G", runtime=runtime)
