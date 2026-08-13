@@ -38,7 +38,7 @@ from cardiosentinel.neural.patient_memory import (
 )
 
 FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
-SUITE = "synthetic-suite"
+SUITE = R.CANONICAL_SUITE_ID
 GIT_SHA = "0" * 40
 
 RECORDS = (("s00001", 0), ("s00001", 1), ("s00002", 0))
@@ -564,7 +564,11 @@ def test_a_pre_existing_arm_claim_prevents_validation_access(
         opened.append("validation")
         raise AssertionError("validation must not be opened")
 
-    with pytest.raises(PS.M2PersistenceError, match="already claimed"):
+    # The recovery precondition fires before claim checking, which is earlier
+    # still than the pair preflight -- either way, nothing is opened.
+    with pytest.raises(
+        (R.M2DevelopmentRunError, PS.M2PersistenceError), match="already|consumed"
+    ):
         _execute(tmp_path, canonical_replay_population=forbidden)
     assert opened == []
 
@@ -581,7 +585,9 @@ def test_a_pre_existing_suite_result_prevents_validation_access(
         opened.append("validation")
         raise AssertionError("validation must not be opened")
 
-    with pytest.raises(PS.M2PersistenceError, match="already claimed"):
+    with pytest.raises(
+        (R.M2DevelopmentRunError, PS.M2PersistenceError), match="already|consumed"
+    ):
         _execute(tmp_path, canonical_replay_population=forbidden)
     assert opened == []
 
@@ -592,7 +598,9 @@ def test_a_pre_existing_evidence_workspace_is_refused(
     """§13.N -- a generic workspace never silently reuses another attempt."""
     roots = _roots(tmp_path)
     PS.evidence_workspace(roots["run_root"], SUITE).mkdir(parents=True)
-    with pytest.raises(PS.M2PersistenceError, match="already claimed"):
+    with pytest.raises(
+        (R.M2DevelopmentRunError, PS.M2PersistenceError), match="already|consumed"
+    ):
         _execute(tmp_path)
 
 
@@ -1004,6 +1012,7 @@ def _suite_body(**overrides):
             for index, field in enumerate(PS.POPULATION_IDENTITY_FIELDS)
         },
         development_source_identity=_source_identity(source_root="", feature_root=""),
+        recovery_lineage=R.recovery_lineage(),
         git_sha=GIT_SHA,
     )
     body.update(overrides)
@@ -1098,27 +1107,31 @@ def test_a_noncanonical_suite_id_is_refused_before_anything_happens(tmp_path):
     assert not (tmp_path / "runs").exists()
 
 
-def test_the_default_canonical_suite_cannot_be_rerun_under_a_second_name(
+def test_a_consumed_recovery_cannot_be_rerun_under_a_second_name(
     tmp_path, frozen_runtime, synthetic_frozen_populations
 ):
-    """§7.2 -- an alternate name cannot bypass a consumed canonical attempt."""
+    """An alternate name cannot bypass a consumed canonical attempt."""
     roots = _roots(tmp_path)
-    # A consumed canonical attempt.
     (roots["run_root"] / PS.arm_experiment_id(R.CANONICAL_SUITE_ID, "M2-0")).mkdir(
         parents=True
     )
-    # Production refuses to run at all, because it can only be the canonical id.
-    with pytest.raises(PS.M2PersistenceError, match="already claimed"):
+    with pytest.raises(
+        (R.M2DevelopmentRunError, PS.M2PersistenceError), match="already|consumed"
+    ):
         R._run(
             expected_git_sha=GIT_SHA,
             suite_id=R.require_canonical_suite_id(R.CANONICAL_SUITE_ID),
             roots=roots,
             loaders=_loaders(),
         )
-    # And there is no public route that would let a caller pick another name.
+    # There is no public route that would let a caller pick another name, and
+    # every alternate name is refused outright.
     assert (
         "suite_id" not in inspect.signature(R.execute_canonical_development).parameters
     )
+    for name in ("m2-v1-development-two-arm-recovery2", "attempt3"):
+        with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
+            R.require_canonical_suite_id(name)
 
 
 def test_the_test_seam_cannot_alter_production_semantics(

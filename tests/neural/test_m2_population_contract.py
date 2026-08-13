@@ -783,6 +783,7 @@ def _complete_result(arm="M2-G"):
         "challenge_evaluation_population_identity": challenge,
         "stress_interval_selection_identity": stress,
         "development_source_identity": source,
+        **R.recovery_lineage(),
         "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",

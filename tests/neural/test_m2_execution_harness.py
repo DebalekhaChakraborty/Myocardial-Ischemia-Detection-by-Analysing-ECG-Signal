@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from cardiosentinel.neural import m2_development_run as RUN
 from cardiosentinel.neural import m2_evaluation as V
 from cardiosentinel.neural import m2_execution as X
 from cardiosentinel.neural import m2_gate as G
@@ -280,6 +281,7 @@ def _full_result(arm="M2-G", **overrides):
         "challenge_evaluation_population_identity": challenge,
         "stress_interval_selection_identity": stress,
         "development_source_identity": _source_identity(),
+        **RUN.recovery_lineage(),
         "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
@@ -1391,6 +1393,7 @@ def _build_complete_lock(*, population=None, **overrides):
         runtime=runtime,
         population_identities=(population or _population_identities()),
         development_source_identity=_source_identity(),
+        recovery_lineage=RUN.recovery_lineage(),
         started_at="2026-01-01T00:00:00Z",
         completed_at="2026-01-01T00:10:00Z",
         artifact_sha256={PS.ARM_RESULT_NAME: "b" * 64},

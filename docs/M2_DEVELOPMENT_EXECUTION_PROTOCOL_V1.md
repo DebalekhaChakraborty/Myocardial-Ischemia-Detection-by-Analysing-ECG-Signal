@@ -101,8 +101,22 @@ imported by the canonical route, and no `TEST_ATTEMPT` is ever created.
 
 ## 4. One suite, two independent canonical attempts
 
+> **Attempt #1 is consumed.** The first canonical execution, suite
+> `m2-v1-development-two-arm` at master `3c1ba4c`, claimed both arms and then
+> failed during full label-blind replay, before a single row was scored, on a
+> TRAIN-vs-VALIDATION feature-join defect. It is permanently preserved and never
+> re-run. Exactly one recovery is permitted:
+> `m2-v1-development-two-arm-recovery1`. See
+> `docs/M2_DEVELOPMENT_ATTEMPT1_FAILURE_AND_RECOVERY_DECISION_V1.md`
+> (SHA-256 `e9d55d7a047e9610c6e156afc9e1a98aafbca86a3131c02a8e56624da7ad57d6`),
+> whose digest every recovery artifact binds along with the lineage fields
+> `recovery_from_suite_id`, `recovery_suite_id`, `recovery_reason_class`,
+> `prior_attempt_scoring_started=false`,
+> `prior_attempt_metrics_computed=false` and
+> `prior_attempt_test_accessed=false`.
+
 The production suite identity is **immutable**:
-`CANONICAL_SUITE_ID = "m2-v1-development-two-arm"`. There is no public
+`CANONICAL_SUITE_ID = "m2-v1-development-two-arm-recovery1"`. There is no public
 `suite_id` parameter and no CLI option that selects one, because a
 caller-chosen suite name would let a second "canonical" suite run under a
 different directory after the first was consumed. A non-canonical id is refused
@@ -236,6 +250,38 @@ There is no partition option, no arm option, no threshold option, no retry
 option, no seed option and no alternative data-source option. A private
 `_roots`/`_loaders` dependency-injection seam exists for synthetic tests only;
 it is absent from the CLI and from the public scientific contract.
+
+## 6a. Partition-aware feature assembly
+
+Scientific timeline assembly joins COMBINED_V1 columns through
+`m2_feature_join.join_sqi_and_morphology_for_partition`, which takes the
+partition explicitly and names it in every refusal. The frozen M2 **TRAIN**
+gate derivation keeps its own TRAIN-only helper unchanged, so the frozen
+receipt continues to mean exactly what it meant.
+
+The join requires exact record-set equality between the COMBINED_V1 corpus and
+the M1 stream-cache manifest **for the same partition**, refuses duplicate
+record ids and escaping cache paths, aligns strictly by frozen stable identity,
+and treats a missing, unmatched or extra row as fatal rather than inner-joining
+it away. TEST is refused before the feature manifest is opened.
+
+## 6b. Post-claim failure accounting
+
+Once any arm claim exists, an uncaught canonical-run exception writes
+deterministic non-claim-bearing accounting: one additive
+`M2_ATTEMPT_FAILURE_RECEIPT.json` in `<suite_id>__failure_review/`, plus the
+established `FAILED_OR_INTERRUPTED` status on each existing claim. The receipt
+records the exact stage and exception, whether VALIDATION had been opened, the
+promotion state, the runtime observations so far, and `canonical=false`.
+
+Nothing is deleted, cleaned, renamed, reseeded or retried; staged and evidence
+files are preserved exactly as the failure left them; and a partially failed
+attempt is never made to look COMPLETE. A failure *before* any claim writes
+nothing, because no attempt was consumed.
+
+Historical claim files from a previous attempt are never rewritten to make a
+failed state look cleaner: the forensic classification lives beside the claim,
+in its own additive receipt.
 
 ## 7. Bounded memory
 
