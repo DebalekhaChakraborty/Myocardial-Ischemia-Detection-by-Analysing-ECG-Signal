@@ -43,43 +43,86 @@ EXCLUDED_NO_STRESS_ROWS: Final = "no_rows_inside_stress_interval"
 # --------------------------------------------------------------------------
 
 
-def summarize_admission(evidence: Sequence[M2RowEvidence]) -> dict[str, Any]:
-    """Coverage and refusal accounting over one already-replayed population.
+CONDITION_REPORT_NAMES: Final = {
+    "sqi": "G3",
+    "normal_evidence": "G4",
+    "refractory": "G5",
+    "morphology": "G6",
+}
 
-    Refusal fractions are attributed to every condition that actually failed,
-    so they overlap by construction and are reported as such rather than
-    forced into a misleading single-cause partition.
+CONDITION_DENOMINATORS: Final = {
+    "sqi": "rows_where_g3_was_applicable_and_evaluated",
+    "normal_evidence": "rows_where_a_score_exists_and_g4_was_evaluated",
+    "refractory": "rows_where_g5_was_applicable_and_evaluated",
+    "morphology": "rows_where_g6_was_applicable_and_evaluated",
+}
+
+
+def summarize_admission(evidence: Sequence[M2RowEvidence]) -> dict[str, Any]:
+    """Arm-aware coverage and refusal accounting over one replayed population.
+
+    Every reported fraction carries its integer numerator, its integer
+    denominator and an explicit statement of what that denominator means, so a
+    later scientific result is auditable rather than merely plausible.
+
+    Only conditions that were **applicable and actually evaluated** contribute.
+    A row that carried no score never enters the G4 denominator, because the
+    absence of a normal-evidence quantity is not a normal-evidence failure --
+    the frozen protocol reports G4 "where a score exists".
+
+    Under **M2-0** the G3-G6 conditions are not operative, so their claim-bearing
+    refusal fractions are reported as `None` with `applicable: false` rather
+    than as zero or as hypothetical failures. No counterfactual gate diagnostic
+    is computed here; if one is ever wanted it must live in a separately named
+    structure and must never populate these fields.
     """
     total = len(evidence)
     if total == 0:
         raise M2PolicyError("Admission evidence is empty; nothing to summarize.")
-    scored = [row for row in evidence if row.decision.score is not None]
+    arms = {row.arm for row in evidence}
+    if len(arms) != 1:
+        raise M2PolicyError(f"Admission evidence mixes arms {sorted(arms)}.")
+    arm = require_m2_arm(next(iter(arms)))
+
     admitted = sum(1 for row in evidence if row.update_admitted)
     available = sum(1 for row in evidence if row.decision.g1_available)
+    scored = sum(1 for row in evidence if row.decision.score is not None)
+
+    refusals: dict[str, Any] = {}
+    for key, condition in CONDITION_REPORT_NAMES.items():
+        results = [row.decision.condition_results()[condition] for row in evidence]
+        evaluated = sum(1 for result in results if result is not None)
+        failed = sum(1 for result in results if result is False)
+        refusals[key] = {
+            "condition": condition,
+            "applicable": evaluated > 0,
+            "failed_count": failed,
+            "evaluated_count": evaluated,
+            "not_applicable_count": total - evaluated,
+            "fraction": (failed / evaluated) if evaluated else None,
+            "denominator": CONDITION_DENOMINATORS[key],
+        }
+
     return {
+        "arm": arm,
         "rows": total,
         "available_rows": available,
-        "scored_rows": len(scored),
+        "scored_rows": scored,
         "update_admitted_count": admitted,
         "update_admission_fraction": admitted / total,
+        "update_admission_denominator": "all_timeline_rows",
         "freeze_fraction": 1.0 - (admitted / total),
-        "refusal_fractions": {
-            "sqi": sum(1 for r in evidence if not r.decision.g3_sqi_admissible) / total,
-            "normal_evidence": (
-                sum(1 for r in evidence if not r.decision.g4_normal_evidence) / total
-            ),
-            "morphology": (
-                sum(1 for r in evidence if not r.decision.g6_morphology_computable)
-                / total
-            ),
-            "refractory": (
-                sum(1 for r in evidence if not r.decision.g5_not_in_refractory) / total
-            ),
-        },
-        "refusal_fraction_semantics": (
-            "each fraction counts rows where that condition failed; a row "
-            "failing several conditions is counted in each, so these overlap "
-            "and do not sum to the freeze fraction"
+        "freeze_denominator": "all_timeline_rows",
+        "refusals": refusals,
+        "refusal_semantics": (
+            "each entry counts rows where that condition was applicable, "
+            "evaluated and failed, over the rows where it was applicable and "
+            "evaluated; a row failing several applicable conditions is counted "
+            "in each, so these overlap and do not sum to the freeze fraction. "
+            "A condition that was not applicable -- because an upstream "
+            "physical prerequisite gave it no input, or because it is not "
+            "operative for this arm -- is excluded from both numerator and "
+            "denominator rather than counted as a failure."
         ),
         "time_since_last_admitted_update": {
             "defined_rows": sum(
@@ -152,37 +195,31 @@ def interval_drift_evidence(
     eligible causal support it is recorded as `None` with an explicit reason;
     follow-up is never fabricated and no tuned recovery threshold exists.
     """
-    times = trajectory.times
-    before = np.flatnonzero(times < float(stress_start_time))
-    if before.size == 0:
+    labels = [f"at_least_{int(offset)}s" for offset in RESIDUAL_FOLLOW_UP_SECONDS]
+
+    def _excluded(reason: str, *, mu_ref_available: bool) -> dict[str, Any]:
         return {
-            "mu_ref_available": False,
-            "excluded_reason": EXCLUDED_NO_PRE_STRESS_PROTOTYPE,
+            "mu_ref_available": mu_ref_available,
+            "excluded_reason": reason,
+            "stress_rows": 0,
             "peak_drift_during_stress": None,
             "mean_drift_during_stress": None,
             "drift_at_stress_end": None,
-            "residual_drift": {
-                f"at_least_{int(offset)}s": None
-                for offset in RESIDUAL_FOLLOW_UP_SECONDS
-            },
+            "residual_drift": dict.fromkeys(labels),
+            "residual_drift_excluded_reasons": dict.fromkeys(labels, reason),
         }
+
+    times = trajectory.times
+    before = np.flatnonzero(times < float(stress_start_time))
+    if before.size == 0:
+        return _excluded(EXCLUDED_NO_PRE_STRESS_PROTOTYPE, mu_ref_available=False)
 
     mu_ref = trajectory.prototypes[before[-1]]
     during = np.flatnonzero(
         (times >= float(stress_start_time)) & (times <= float(stress_end_time))
     )
     if during.size == 0:
-        return {
-            "mu_ref_available": True,
-            "excluded_reason": EXCLUDED_NO_STRESS_ROWS,
-            "peak_drift_during_stress": None,
-            "mean_drift_during_stress": None,
-            "drift_at_stress_end": None,
-            "residual_drift": {
-                f"at_least_{int(offset)}s": None
-                for offset in RESIDUAL_FOLLOW_UP_SECONDS
-            },
-        }
+        return _excluded(EXCLUDED_NO_STRESS_ROWS, mu_ref_available=True)
 
     stress_drift = np.asarray(
         [prototype_drift(trajectory.prototypes[i], mu_ref) for i in during]

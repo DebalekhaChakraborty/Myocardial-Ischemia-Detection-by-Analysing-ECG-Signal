@@ -169,7 +169,7 @@ def test_m2_zero_matches_frozen_dual_timescale_memory_exactly():
         arm=P.M2_ARM_NAIVE,
         standardizer=standardizer,
         scorer=constant_scorer(0.9),
-        prototype_observer=lambda _index, mu: trajectory.append(mu),
+        prototype_observer=lambda _index, _time, mu: trajectory.append(mu),
     )
     expected = DualTimescaleMemory(standardizer.prior_vector())
     for step, value in enumerate(values):
@@ -741,11 +741,18 @@ def test_admission_summary_reports_overlapping_refusals_honestly():
     sqi["flatline_fraction"] = 1.0
     evidence = replay([row(0, sqi=sqi), row(1)], scorer=constant_scorer(0.9))
     summary = E.summarize_admission(evidence)
+    assert summary["arm"] == P.M2_ARM_GATED
     assert summary["rows"] == 2
     assert summary["update_admitted_count"] == 0
     assert summary["update_admission_fraction"] == 0.0
+    assert summary["update_admission_denominator"] == "all_timeline_rows"
     assert summary["freeze_fraction"] == 1.0
-    assert "overlap" in summary["refusal_fraction_semantics"]
+    assert "overlap" in summary["refusal_semantics"]
+    # Both rows scored suspiciously, so both are applicable G4 failures; only
+    # the first also fails G3. The two causes overlap on row 0 and are NOT
+    # forced into exclusive attribution.
+    assert summary["refusals"]["normal_evidence"]["failed_count"] == 2
+    assert summary["refusals"]["sqi"]["failed_count"] == 1
 
 
 def test_row_evidence_exposes_every_required_audit_field():
@@ -826,3 +833,258 @@ def test_populated_result_is_refused():
     schema["metrics"]["pooled_auprc"] = 0.5
     with pytest.raises(P.M2PolicyError):
         E.validate_unpopulated(schema)
+
+
+# --------------------------------------------------------------------------
+# Human review correction: M2-0 must remain a TRUE naive control, and gate
+# evidence must distinguish an applicable failure from a non-applicable one.
+# --------------------------------------------------------------------------
+
+
+def test_m2_zero_never_acquires_an_operative_refractory_state():
+    """§9.1 -- the naive control has no memory-update safety refractory."""
+    evidence = replay(
+        [row(0), row(1), row(2)], arm=P.M2_ARM_NAIVE, scorer=constant_scorer(0.9)
+    )
+    for item in evidence:
+        assert item.refractory_until_after is None
+        assert item.refractory_rearmed_after_decision is False
+        assert item.decision.refractory_until_before is None
+        assert item.decision.g5_not_in_refractory is None
+        assert item.update_admitted  # every AVAILABLE finite row still updates
+
+
+def test_high_m2_zero_score_does_not_create_an_actual_refractory_refusal():
+    """§9.2 -- a suspicious score cannot freeze the naive control."""
+    evidence = replay(
+        [row(i) for i in range(5)], arm=P.M2_ARM_NAIVE, scorer=constant_scorer(0.99)
+    )
+    assert all(item.update_admitted for item in evidence)
+    assert all("G5" not in item.decision.refusal_reasons() for item in evidence)
+    assert evidence[-1].past_update_count_after == 5
+
+
+def test_m2_zero_summary_reports_no_actual_normal_evidence_refusal():
+    """§9.3 -- M2-0 updated the row, so it cannot also have refused it."""
+    evidence = replay(
+        [row(i) for i in range(3)], arm=P.M2_ARM_NAIVE, scorer=constant_scorer(0.99)
+    )
+    summary = E.summarize_admission(evidence)
+    assert summary["arm"] == P.M2_ARM_NAIVE
+    assert summary["update_admission_fraction"] == 1.0
+    normal = summary["refusals"]["normal_evidence"]
+    assert normal["applicable"] is False
+    assert normal["failed_count"] == 0
+    assert normal["evaluated_count"] == 0
+    assert normal["fraction"] is None
+
+
+def test_m2_zero_summary_reports_no_counterfactual_refractory_refusal():
+    """§9.4 -- no counterfactual G5 state may reach a claim-bearing field."""
+    evidence = replay(
+        [row(i) for i in range(5)], arm=P.M2_ARM_NAIVE, scorer=constant_scorer(0.99)
+    )
+    summary = E.summarize_admission(evidence)
+    for key in ("sqi", "normal_evidence", "refractory", "morphology"):
+        entry = summary["refusals"][key]
+        assert entry["applicable"] is False, key
+        assert entry["failed_count"] == 0, key
+        assert entry["fraction"] is None, key
+    assert "counterfactual" not in summary
+
+
+def test_unavailable_row_is_not_a_g4_normal_evidence_refusal():
+    """§9.5 -- absence of a score is not a normal-evidence failure."""
+    evidence = replay([row(0, state=OBSERVATION_UNAVAILABLE_EXACT_FLAT)])
+    decision = evidence[0].decision
+    assert decision.g1_available is False
+    assert decision.g4_normal_evidence is None
+    assert decision.refusal_reasons() == ("G1",)
+    assert set(decision.not_applicable_conditions()) == {"G2", "G3", "G4", "G5", "G6"}
+    summary = E.summarize_admission(evidence)
+    assert summary["refusals"]["normal_evidence"]["evaluated_count"] == 0
+    assert summary["refusals"]["normal_evidence"]["failed_count"] == 0
+
+
+def test_unscored_nonfinite_representation_row_is_not_a_g4_refusal():
+    """§9.6 -- G2 fails, no score exists, so G4 is not applicable."""
+    broken = P.M2TimelineRow(
+        record_id="s00001",
+        channel_index=0,
+        start_sample=0,
+        observation_state=OBSERVATION_AVAILABLE,
+        representation=np.full(REPRESENTATION_DIM, np.nan),
+        finite_sample_fraction=1.0,
+        sqi=dict(CLEAN_SQI),
+        morphology_valid=1.0,
+    )
+    evidence = replay([broken])
+    decision = evidence[0].decision
+    assert decision.g1_available is True
+    assert decision.g2_finite_representation is False
+    assert decision.score is None
+    assert decision.g4_normal_evidence is None
+    assert "G4" not in decision.refusal_reasons()
+    assert decision.refusal_reasons() == ("G2",)
+    assert not evidence[0].update_admitted  # fail-closed
+    # G3/G5/G6 still had their own inputs and remain evaluated.
+    assert decision.g3_sqi_admissible is True
+    assert decision.g5_not_in_refractory is True
+    assert decision.g6_morphology_computable is True
+
+
+def test_g4_denominator_is_exactly_the_scored_population():
+    """§9.7 -- unscored rows enter neither numerator nor denominator."""
+    rows = [
+        row(0),  # scored, passes G4
+        row(1, state=OBSERVATION_UNAVAILABLE_EXACT_FLAT),  # unscored
+        row(2),  # scored, fails G4
+    ]
+    scores = iter([THRESHOLD, 0.99])
+    evidence = P.replay_stream(
+        rows,
+        arm=P.M2_ARM_GATED,
+        standardizer=identity_standardizer(),
+        scorer=lambda _r, _d: next(scores),
+    )
+    summary = E.summarize_admission(evidence)
+    normal = summary["refusals"]["normal_evidence"]
+    assert summary["rows"] == 3
+    assert summary["scored_rows"] == 2
+    assert normal["evaluated_count"] == 2  # NOT 3
+    assert normal["failed_count"] == 1
+    assert normal["fraction"] == 0.5
+    assert normal["not_applicable_count"] == 1
+    assert normal["denominator"] == "rows_where_a_score_exists_and_g4_was_evaluated"
+
+
+def test_scored_row_above_threshold_is_an_actual_g4_refusal_for_m2_gated():
+    """§9.8 -- a real normal-evidence failure is still counted."""
+    evidence = replay([row(0)], scorer=constant_scorer(np.nextafter(THRESHOLD, np.inf)))
+    assert evidence[0].decision.g4_normal_evidence is False
+    assert evidence[0].decision.refusal_reasons() == ("G4",)
+    summary = E.summarize_admission(evidence)
+    assert summary["refusals"]["normal_evidence"]["failed_count"] == 1
+    assert summary["refusals"]["normal_evidence"]["evaluated_count"] == 1
+    assert summary["refusals"]["normal_evidence"]["fraction"] == 1.0
+
+
+def test_refusal_counts_and_fractions_match_explicit_integer_counts():
+    """§9.9 -- every fraction is numerator/denominator over integers."""
+    bad_sqi = dict(CLEAN_SQI)
+    bad_sqi["flatline_fraction"] = 1.0
+    rows = [
+        row(0),  # clean, admitted
+        row(1, sqi=bad_sqi),  # G3 failure
+        row(2, morphology_valid=0.0),  # G6 failure
+        row(3),  # clean
+    ]
+    evidence = replay(rows, scorer=constant_scorer(THRESHOLD))
+    summary = E.summarize_admission(evidence)
+    assert summary["rows"] == 4
+    assert summary["refusals"]["sqi"]["failed_count"] == 1
+    assert summary["refusals"]["sqi"]["evaluated_count"] == 4
+    assert summary["refusals"]["sqi"]["fraction"] == 1 / 4
+    assert summary["refusals"]["morphology"]["failed_count"] == 1
+    assert summary["refusals"]["morphology"]["fraction"] == 1 / 4
+    assert summary["refusals"]["normal_evidence"]["failed_count"] == 0
+    assert summary["update_admitted_count"] == 2
+    assert summary["update_admission_fraction"] == 2 / 4
+
+
+def test_overlapping_actual_refusals_are_not_forced_into_exclusive_attribution():
+    """§9.10 -- one row may genuinely fail several applicable conditions."""
+    bad_sqi = dict(CLEAN_SQI)
+    bad_sqi["flatline_fraction"] = 1.0
+    evidence = replay(
+        [row(0, sqi=bad_sqi, morphology_valid=0.0)], scorer=constant_scorer(0.99)
+    )
+    reasons = evidence[0].decision.refusal_reasons()
+    assert set(reasons) == {"G3", "G4", "G6"}
+    summary = E.summarize_admission(evidence)
+    assert summary["refusals"]["sqi"]["failed_count"] == 1
+    assert summary["refusals"]["normal_evidence"]["failed_count"] == 1
+    assert summary["refusals"]["morphology"]["failed_count"] == 1
+    # Overlapping causes do not sum to the freeze fraction, and the summary
+    # says so rather than implying a partition.
+    assert summary["freeze_fraction"] == 1.0
+
+
+def test_m2_zero_parity_remains_exact_after_the_correction():
+    """§9.11 -- removing the refractory changed no M2-0 trajectory."""
+    values = [0.5, 1.5, -2.0, 3.25, 0.125]
+    rows = [row(i, value=v) for i, v in enumerate(values)]
+    evidence = replay(rows, arm=P.M2_ARM_NAIVE, scorer=constant_scorer(0.99))
+
+    standardizer = identity_standardizer()
+    reference = DualTimescaleMemory(standardizer.prior_vector())
+    expected = [
+        reference.observe(standardizer.standardize(representation(v))[0]).d_long
+        for v in values
+    ]
+    assert [item.d_long for item in evidence] == expected
+    assert all(item.update_admitted for item in evidence)
+    assert evidence[-1].past_update_count_after == len(values)
+
+
+def test_scorer_receives_raw_representation_and_pre_update_d_long():
+    """§6 -- exact [raw 146-d z_t, pre-update d_long] scorer-input parity."""
+    seen: list[tuple[np.ndarray, float]] = []
+
+    def recording_scorer(vector, d_long):
+        seen.append((np.array(vector, copy=True), d_long))
+        return THRESHOLD
+
+    values = [2.0, 4.0]
+    rows = [row(i, value=v) for i, v in enumerate(values)]
+    standardizer = identity_standardizer()
+    evidence = P.replay_stream(
+        rows,
+        arm=P.M2_ARM_NAIVE,
+        standardizer=standardizer,
+        scorer=recording_scorer,
+    )
+
+    # The RAW frozen representation reaches the scorer, not a standardized or
+    # post-update derivative of it.
+    for (vector, _d_long), value in zip(seen, values, strict=True):
+        assert np.array_equal(vector, representation(value))
+
+    # The PRE-update d_long reaches the scorer: recomputing against a
+    # reference memory that has not yet seen the current row reproduces it,
+    # and it equals what the evidence recorded.
+    reference = DualTimescaleMemory(standardizer.prior_vector())
+    for step, value in enumerate(values):
+        standardized = standardizer.standardize(representation(value))[0]
+        expected_pre_update = reference.deviations(standardized).d_long
+        assert seen[step][1] == expected_pre_update
+        assert evidence[step].d_long == expected_pre_update
+        reference.update(standardized)  # only now does the prototype move
+
+    # No post-update value entered the scorer: the second row's d_long is
+    # measured against a prototype that already moved for the first row only.
+    assert seen[1][1] != seen[0][1]
+
+
+def test_correction_introduces_no_label_or_identity_leakage():
+    """§9.14 -- the firewall still holds after the semantics correction."""
+    identifiers = code_identifiers(Path(P.__file__).read_text())
+    for banned in ("target_family", "binary_label", "ischemic_positive", "labels"):
+        assert banned not in identifiers, banned
+    evidence_identifiers = code_identifiers(Path(E.__file__).read_text())
+    for banned in ("target_family", "binary_label", "ischemic_positive"):
+        assert banned not in evidence_identifiers, banned
+    parameters = set(inspect.signature(P.evaluate_gate).parameters)
+    assert "arm" in parameters  # the only new parameter
+    assert not (parameters & {"label", "target_family", "subject_id"})
+
+
+def test_correction_introduces_no_rollback_or_execution_route():
+    """§9.15 -- still no rollback path and still no way to execute science."""
+    for module in (P, E):
+        source = Path(module.__file__).read_text()
+        identifiers = {name.lower() for name in code_identifiers(source)}
+        for banned in ("snapshot", "restore", "oracle", "m2_gr"):
+            assert banned not in identifiers, (module.__name__, banned)
+        assert "torch" not in identifiers
+        assert "load_stream_store" not in identifiers
