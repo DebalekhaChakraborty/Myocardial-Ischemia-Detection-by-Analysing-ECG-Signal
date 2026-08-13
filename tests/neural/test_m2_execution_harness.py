@@ -150,10 +150,8 @@ def test_classification_and_update_thresholds_cannot_be_interchanged():
     assert SC.NORMAL_EVIDENCE_THRESHOLD < SC.M1L_CLASSIFICATION_THRESHOLD
     assert SC.NORMAL_EVIDENCE_THRESHOLD == G.NORMAL_EVIDENCE_THRESHOLD
     # The evaluation layer refuses any threshold that is not the frozen one.
-    with pytest.raises(V.M2EvaluationError, match="no new threshold"):
-        V.window_evidence(
-            [], labels=[], subject_ids=[], threshold=SC.NORMAL_EVIDENCE_THRESHOLD
-        )
+    with pytest.raises(V.M2EvaluationError):
+        V.require_frozen_m1l_classification_threshold(SC.NORMAL_EVIDENCE_THRESHOLD)
 
 
 # --------------------------------------------------------------------------
@@ -190,15 +188,24 @@ def test_timeline_row_carries_no_identity_or_annotation_field():
 
 
 def test_post_replay_join_misalignment_fails_loudly():
-    with pytest.raises(V.M2EvaluationError, match="misaligned"):
-        V.window_evidence([], labels=[1, 0], subject_ids=["a", "b"])
+    """Identity mismatch is refused; a positional join is not even possible."""
+    evidence = [_evidence(start_sample=0)]
+    with pytest.raises(V.M2EvaluationError, match="no evidence row"):
+        V.build_evaluation_bundle("M2-G", evidence, [_annotation(start_sample=7777)])
 
 
-def test_false_alarm_join_misalignment_fails_loudly():
-    with pytest.raises(V.M2EvaluationError, match="not row-aligned"):
-        V.false_alarm_evidence(
-            [], labels=[1], target_families=["background_negative"], subject_ids=[]
-        )
+def test_evaluation_functions_require_an_identity_joined_bundle():
+    """The old positional (labels=..., subject_ids=...) API is gone."""
+    import inspect
+
+    for function in (
+        V.window_evidence,
+        V.false_alarm_evidence,
+        V.cold_start_stratified_evidence,
+    ):
+        parameters = set(inspect.signature(function).parameters)
+        assert not (parameters & {"labels", "subject_ids", "target_families"}), function
+        assert "bundle" in parameters
 
 
 @pytest.mark.skipif(not LOCAL_DATA, reason=LOCAL_SKIP)
@@ -443,10 +450,10 @@ def test_prototype_drift_annotations_cannot_affect_replay():
     )
     before = trajectory.prototypes.copy()
     result = V.contamination_evidence(
-        trajectory,
+        {("s00001", 0): trajectory},
         stress_intervals=[
-            {"family": "ischemic", "start_time": 5.0, "end_time": 25.0},
-            {"family": "conduction_change", "start_time": 5.0, "end_time": 25.0},
+            V.M2StressInterval("s00001", 0, "ischemic", 5.0, 25.0),
+            V.M2StressInterval("s00001", 0, "conduction_change", 5.0, 25.0),
         ],
     )
     # The trajectory is consumed, never mutated.
@@ -518,3 +525,362 @@ def test_bounded_train_smoke_is_non_claim_bearing():
     assert report["test_accessed"] is False
     assert set(report["arms"]) == {"M2-0", "M2-G"}
     assert report["runtime_identity_checks"]["all_observations_matched"] is True
+
+
+# --------------------------------------------------------------------------
+# Human execution-harness review corrections:
+#   A) the frozen classification threshold is enforced on EVERY thresholded path
+#   B) the post-replay annotation join is keyed by immutable row identity
+# --------------------------------------------------------------------------
+
+from cardiosentinel.neural.m2_policy import (  # noqa: E402
+    M2GateDecision,
+    M2RowEvidence,
+)
+
+ALT_THRESHOLD = 0.5
+
+
+def _decision(score: float | None) -> M2GateDecision:
+    return M2GateDecision(
+        arm="M2-G",
+        g1_available=True,
+        g2_finite_representation=True,
+        g3_finite_sample_precondition=True,
+        g3_feature_results={},
+        g3_sqi_admissible=True,
+        g4_normal_evidence=True,
+        g5_not_in_refractory=True,
+        g6_morphology_computable=True,
+        admitted=True,
+        score=score,
+        refractory_until_before=float("-inf"),
+    )
+
+
+def _evidence(record_id="s00001", channel_index=0, start_sample=0, score=0.1):
+    return M2RowEvidence(
+        record_id=record_id,
+        channel_index=channel_index,
+        start_sample=start_sample,
+        available_time=(start_sample + 2500) / 250.0,
+        observation_state=1,
+        arm="M2-G",
+        decision=_decision(score),
+        d_long=0.5,
+        morphology_valid=1.0,
+        update_admitted=True,
+        refractory_rearmed_after_decision=False,
+        refractory_until_after=float("-inf"),
+        past_observed_count_before=0,
+        past_update_count_before=0,
+        past_update_count_after=1,
+        time_since_last_admitted_update=None,
+    )
+
+
+def _annotation(
+    record_id="s00001",
+    channel_index=0,
+    start_sample=0,
+    label=0,
+    family="background_negative",
+    subject="subj-1",
+    bin_name="over_60_minutes",
+):
+    return V.M2AnnotationRow(
+        record_id=record_id,
+        channel_index=channel_index,
+        start_sample=start_sample,
+        label=label,
+        target_family=family,
+        subject_id=subject,
+        cold_start_bin=bin_name,
+    )
+
+
+def _paired_bundle(count=4):
+    """A minimal well-formed bundle with both classes and two subjects."""
+    evidence, annotations = [], []
+    for index in range(count):
+        start = index * 1250
+        evidence.append(_evidence(start_sample=start, score=0.1 + 0.2 * index))
+        annotations.append(
+            _annotation(
+                start_sample=start,
+                label=index % 2,
+                family="ischemic_positive" if index % 2 else "background_negative",
+                subject=f"subj-{index % 2}",
+            )
+        )
+    return V.build_evaluation_bundle("M2-G", evidence, annotations)
+
+
+# --- 1-2. threshold enforcement on every thresholded path -----------------
+
+
+def test_every_thresholded_metric_rejects_a_non_frozen_threshold():
+    bundle = _paired_bundle()
+    for function in (
+        V.window_evidence,
+        V.false_alarm_evidence,
+        V.cold_start_stratified_evidence,
+    ):
+        with pytest.raises(V.M2EvaluationError, match="frozen retained M1L"):
+            function(bundle, threshold=ALT_THRESHOLD)
+
+
+def test_normal_evidence_threshold_is_rejected_as_a_classification_threshold():
+    bundle = _paired_bundle()
+    for function in (
+        V.window_evidence,
+        V.false_alarm_evidence,
+        V.cold_start_stratified_evidence,
+    ):
+        with pytest.raises(V.M2EvaluationError):
+            function(bundle, threshold=SC.NORMAL_EVIDENCE_THRESHOLD)
+
+
+def test_the_frozen_classification_threshold_is_accepted():
+    bundle = _paired_bundle()
+    assert (
+        V.require_frozen_m1l_classification_threshold(SC.M1L_CLASSIFICATION_THRESHOLD)
+        == SC.M1L_CLASSIFICATION_THRESHOLD
+    )
+    payload = V.cold_start_stratified_evidence(bundle)
+    assert payload["threshold"] == SC.M1L_CLASSIFICATION_THRESHOLD
+    assert payload["threshold_selected_here"] is False
+
+
+# --- 3-7. identity-keyed join -------------------------------------------
+
+
+def test_equal_length_but_wrong_identities_are_rejected():
+    evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
+    wrong = [_annotation(start_sample=9999), _annotation(start_sample=8888)]
+    assert len(evidence) == len(wrong)
+    with pytest.raises(V.M2EvaluationError, match="no evidence row"):
+        V.build_evaluation_bundle("M2-G", evidence, wrong)
+
+
+def test_permuted_annotation_ordering_is_realigned_by_identity_not_position():
+    evidence = [
+        _evidence(start_sample=0, score=0.10),
+        _evidence(start_sample=1250, score=0.90),
+    ]
+    ordered = [
+        _annotation(start_sample=0, label=0, subject="a"),
+        _annotation(start_sample=1250, label=1, subject="b"),
+    ]
+    bundle_ordered = V.build_evaluation_bundle("M2-G", evidence, ordered)
+    bundle_permuted = V.build_evaluation_bundle(
+        "M2-G", evidence, list(reversed(ordered))
+    )
+    # Identity, not order, decides the pairing.
+    assert bundle_ordered.keys == bundle_permuted.keys
+    assert np.array_equal(bundle_ordered.labels, bundle_permuted.labels)
+    assert np.array_equal(bundle_ordered.scores, bundle_permuted.scores)
+    # And the score/label pairing is the correct one.
+    assert bundle_ordered.scores[0] == 0.10
+    assert bundle_ordered.labels[0] == 0
+    assert bundle_ordered.scores[1] == 0.90
+    assert bundle_ordered.labels[1] == 1
+
+
+def test_duplicate_annotation_identities_are_rejected():
+    evidence = [_evidence(start_sample=0)]
+    with pytest.raises(V.M2EvaluationError, match="Duplicate annotation"):
+        V.build_evaluation_bundle(
+            "M2-G", evidence, [_annotation(start_sample=0), _annotation(start_sample=0)]
+        )
+
+
+def test_duplicate_evidence_identities_are_rejected():
+    duplicated = [_evidence(start_sample=0), _evidence(start_sample=0)]
+    with pytest.raises(V.M2EvaluationError, match="Duplicate evidence"):
+        V.build_evaluation_bundle("M2-G", duplicated, [_annotation(start_sample=0)])
+
+
+def test_missing_annotation_identities_are_rejected():
+    evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
+    with pytest.raises(V.M2EvaluationError, match="carry no annotation"):
+        V.build_evaluation_bundle("M2-G", evidence, [_annotation(start_sample=0)])
+
+
+def test_extra_annotation_identities_are_rejected():
+    evidence = [_evidence(start_sample=0)]
+    extra = [_annotation(start_sample=0), _annotation(start_sample=1250)]
+    with pytest.raises(V.M2EvaluationError, match="no evidence row"):
+        V.build_evaluation_bundle("M2-G", evidence, extra)
+
+
+def test_subset_population_requires_an_explicit_opt_in():
+    evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
+    annotations = [_annotation(start_sample=0)]
+    bundle = V.build_evaluation_bundle(
+        "M2-G", evidence, annotations, require_full_population=False
+    )
+    assert len(bundle.keys) == 1
+
+
+def test_evaluation_key_corresponds_to_the_frozen_stable_id():
+    row = _evidence(record_id="s20011", channel_index=1, start_sample=2500)
+    key = V.evaluation_key(row)
+    assert key == ("s20011", 1, 2500)
+    assert V.stable_id_for_key(key) == "ltstdb:s20011:1:2500:5000"
+
+
+# --- 8-9. subject and family remain evaluation-only ----------------------
+
+
+def test_subject_and_family_remain_evaluation_only():
+    replay_fields = set(P.M2TimelineRow.__dataclass_fields__)
+    assert "subject_id" not in replay_fields
+    assert "target_family" not in replay_fields
+    evaluation_fields = set(V.M2AnnotationRow.__dataclass_fields__)
+    assert {"subject_id", "target_family"} <= evaluation_fields
+    # Neither reaches the gate.
+    import inspect
+
+    assert not (
+        set(inspect.signature(P.evaluate_gate).parameters)
+        & {"subject_id", "target_family"}
+    )
+
+
+# --- 10-11. stress intervals bound to their stream -----------------------
+
+
+def _trajectory(times, values):
+    from cardiosentinel.neural.m2_evidence import PrototypeTrajectory
+    from cardiosentinel.neural.patient_memory import REPRESENTATION_DIM
+
+    prototypes = np.zeros((len(times), REPRESENTATION_DIM))
+    for index, value in enumerate(values):
+        prototypes[index] = value
+    return PrototypeTrajectory(
+        times=np.asarray(times, dtype=np.float64), prototypes=prototypes
+    )
+
+
+def test_stress_interval_is_bound_to_the_correct_stream_trajectory():
+    trajectories = {
+        ("s00001", 0): _trajectory([0.0, 10.0, 20.0], [0.0, 0.0, 1.0]),
+        ("s00001", 1): _trajectory([0.0, 10.0, 20.0], [0.0, 0.0, 5.0]),
+    }
+    result = V.contamination_evidence(
+        trajectories,
+        stress_intervals=[
+            V.M2StressInterval("s00001", 0, "ischemic", 5.0, 25.0),
+            V.M2StressInterval("s00001", 1, "ischemic", 5.0, 25.0),
+        ],
+    )
+    assert result["intervals_bound_to_stream_identity"] is True
+    channel_0 = [i for i in result["intervals"] if i["channel_index"] == 0][0]
+    channel_1 = [i for i in result["intervals"] if i["channel_index"] == 1][0]
+    # Each interval saw only its own stream's drift.
+    assert channel_0["peak_drift_during_stress"] == 1.0
+    assert channel_1["peak_drift_during_stress"] == 5.0
+
+
+def test_stress_interval_cannot_cross_apply_to_another_stream():
+    trajectories = {("s00001", 0): _trajectory([0.0, 10.0], [0.0, 1.0])}
+    with pytest.raises(V.M2EvaluationError, match="never be applied to another"):
+        V.contamination_evidence(
+            trajectories,
+            stress_intervals=[V.M2StressInterval("s00002", 0, "ischemic", 5.0, 25.0)],
+        )
+
+
+# --- 12. scored/unscored parity with frozen M1 ---------------------------
+
+
+def test_unscored_row_is_refused_exactly_as_frozen_m1_refuses_it():
+    """Parity with `m1_experiment.require_available_rows` governance semantics.
+
+    Frozen M1 refuses a score-bearing population containing a physically
+    unavailable row rather than dropping it. M2 reproduces that verbatim
+    instead of silently excluding, so the denominator is never altered
+    automatically.
+    """
+    import inspect
+
+    from cardiosentinel.neural.m1_experiment import require_available_rows
+
+    frozen_doc = inspect.getdoc(require_available_rows) or ""
+    assert "never silently altered" in frozen_doc
+
+    evidence = [_evidence(start_sample=0, score=None)]
+    with pytest.raises(V.M2EvaluationError) as caught:
+        V.build_evaluation_bundle("M2-G", evidence, [_annotation(start_sample=0)])
+    message = str(caught.value)
+    assert "STOP FOR HUMAN REVIEW" in message
+    assert "never dropped from a metric" in message
+    assert "no denominator is altered automatically" in message
+
+
+# --- 13-14. smoke bookkeeping and evaluated-population provenance ---------
+
+
+def test_bounded_smoke_keeps_stable_ids_aligned_with_its_bounded_rows():
+    """Interleaved streams mean the retained rows are not a prefix."""
+    source = Path(X.__file__).read_text()
+    assert "bundle.stable_ids[: len(bounded)]" not in source
+    assert "zip(bundle.rows, bundle.stable_ids, strict=True)" in source
+
+
+@pytest.mark.skipif(
+    not (LOCAL_DATA and IN_FROZEN_SCIENTIFIC_RUNTIME),
+    reason="needs the frozen runtime and gitignored corpus",
+)
+def test_bounded_smoke_stable_ids_match_its_rows_exactly():
+    from cardiosentinel.neural.m2_execution import assemble_timeline_rows
+
+    bundle = assemble_timeline_rows("train", record_ids=("s20011",))
+    bounded, bounded_ids, per_stream = [], [], {}
+    for row, stable_id in zip(bundle.rows, bundle.stable_ids, strict=True):
+        taken = per_stream.get(row.stream_key, 0)
+        if taken >= 8:
+            continue
+        per_stream[row.stream_key] = taken + 1
+        bounded.append(row)
+        bounded_ids.append(stable_id)
+    # Every retained ID is the one its own row derives.
+    for row, stable_id in zip(bounded, bounded_ids, strict=True):
+        assert (
+            V.stable_id_for_key((row.record_id, row.channel_index, row.start_sample))
+            == stable_id
+        )
+    # And a naive prefix slice would have been wrong for interleaved streams.
+    assert bounded_ids != list(bundle.stable_ids[: len(bounded)])
+
+
+def test_result_provenance_binds_the_evaluated_population_identity():
+    assert "evaluated_population_identity" in PS.REQUIRED_PROVENANCE_FIELDS
+    bundle = _paired_bundle()
+    identity = bundle.population_identity()
+    assert identity["evaluated_rows"] == 4
+    assert len(identity["evaluated_ordered_stable_id_sha256"]) == 64
+    assert identity["positional_join_used"] is False
+    # A different evaluated population yields a different identity.
+    other = V.build_evaluation_bundle(
+        "M2-G", [_evidence(start_sample=0)], [_annotation(start_sample=0)]
+    )
+    assert (
+        other.population_identity()["evaluated_ordered_stable_id_sha256"]
+        != identity["evaluated_ordered_stable_id_sha256"]
+    )
+
+
+# --- 20. still no scientific result --------------------------------------
+
+
+def test_no_scientific_m2_result_is_generated_by_this_module():
+    bundle = _paired_bundle()
+    payload = V.arm_evaluation("M2-G", list(bundle.evidence))
+    assert payload["window_evidence"] is None
+    assert payload["false_alarm_evidence"] is None
+    assert payload["contamination_evidence"] is None
+    assert payload["label_joined_sections_populated"] is False
+    assert payload["validation_accessed"] is False
+    assert payload["test_accessed"] is False

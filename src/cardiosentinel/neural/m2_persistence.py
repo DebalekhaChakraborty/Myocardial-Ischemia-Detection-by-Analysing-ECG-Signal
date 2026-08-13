@@ -102,6 +102,7 @@ REQUIRED_PROVENANCE_FIELDS: Final = (
     "sealed_test_state",
     "m1l_classification_threshold",
     "normal_evidence_threshold",
+    "evaluated_population_identity",
     "started_at",
     "completed_at",
     "artifact_sha256",
@@ -117,8 +118,16 @@ def build_run_provenance(
     started_at: str,
     completed_at: str,
     artifact_sha256: dict[str, str],
+    evaluated_population_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Bind every identity a canonical M2 run must carry."""
+    """Bind every identity a canonical M2 run must carry.
+
+    `evaluated_population_identity` is the exact evaluated row set, bound
+    through the existing frozen ordered-stable-ID digest -- not merely a row
+    count, and deliberately not a second dataset identity mechanism. It comes
+    from `M2EvaluationBundle.population_identity()`. It is `None` only for a
+    run that produced no label-joined evaluation.
+    """
     from cardiosentinel.features.schema import COMBINED_V1, MORPHOLOGY_V1, SIGNAL_V1
     from cardiosentinel.neural.m2_scorer import (
         M1L_CLASSIFICATION_THRESHOLD,
@@ -166,6 +175,7 @@ def build_run_provenance(
         "sealed_test_state": "unopened",
         "m1l_classification_threshold": M1L_CLASSIFICATION_THRESHOLD,
         "normal_evidence_threshold": NORMAL_EVIDENCE_THRESHOLD,
+        "evaluated_population_identity": evaluated_population_identity,
         "classification_threshold_used_for_admission": False,
         "classifier_retrained": False,
         "threshold_selected_during_run": False,

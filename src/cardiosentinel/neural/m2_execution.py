@@ -481,18 +481,24 @@ def train_integration_smoke(
         feature_root=feature_root,
         record_ids=record_ids,
     )
+    # Bound the work per stream, keeping each retained row's stable ID with the
+    # row itself. Slicing the first N stable IDs would be WRONG: streams are
+    # interleaved in the timeline, so the retained row indices are not a
+    # prefix, and the identities would silently misalign with the rows.
     bounded: list[M2TimelineRow] = []
+    bounded_ids: list[str] = []
     per_stream: dict[tuple[str, int], int] = {}
-    for row in bundle.rows:
+    for row, stable_id in zip(bundle.rows, bundle.stable_ids, strict=True):
         taken = per_stream.get(row.stream_key, 0)
         if taken >= max_rows_per_stream:
             continue
         per_stream[row.stream_key] = taken + 1
         bounded.append(row)
+        bounded_ids.append(stable_id)
     bounded_bundle = M2InputBundle(
         partition=bundle.partition,
         rows=tuple(bounded),
-        stable_ids=bundle.stable_ids[: len(bounded)],
+        stable_ids=tuple(bounded_ids),
         standardizer=bundle.standardizer,
         stream_cache_manifest=bundle.stream_cache_manifest,
     )
