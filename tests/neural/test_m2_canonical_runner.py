@@ -382,7 +382,7 @@ def _execute(tmp_path, **overrides):
     return R.execute_canonical_development(
         expected_git_sha=GIT_SHA,
         execute=True,
-        suite_id=SUITE,
+        _suite_id=SUITE,
         _roots=_roots(tmp_path),
         _loaders=_loaders(**overrides),
     )
@@ -479,13 +479,50 @@ def test_the_two_arms_replay_the_identical_frozen_population(
     assert identities[0] == identities[1]
 
 
-def test_no_test_path_is_resolved_anywhere_on_the_route(
-    tmp_path, frozen_runtime, synthetic_frozen_populations
+def test_no_test_path_or_partition_is_ever_requested(
+    tmp_path, frozen_runtime, synthetic_frozen_populations, monkeypatch
 ):
+    """A real spy: every partition and path the route asks for is recorded.
+
+    The previous version of this test carried an unconditional `or True`, so it
+    could not fail. This one refuses the run outright if any component asks for
+    the test partition, a test path or a sealed-test helper.
+    """
+    requested_partitions: list[str] = []
+    opened_paths: list[str] = []
+
+    real_guard = X.require_canonical_development_partition
+
+    def spy_partition(partition):
+        requested_partitions.append(str(partition))
+        return real_guard(partition)
+
+    monkeypatch.setattr(X, "require_canonical_development_partition", spy_partition)
+    monkeypatch.setattr(R, "require_canonical_development_partition", spy_partition)
+
+    real_open = Path.open
+
+    def spy_open(self, *args, **kwargs):
+        opened_paths.append(str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", spy_open)
+
     result = _execute(tmp_path)
+    monkeypatch.undo()
+
     assert result["partition"] == "validation"
-    for path in Path(tmp_path).rglob("*"):
-        assert "test" not in path.name.lower() or path.is_dir() is False or True
+    # Only the canonical partition is ever requested for real, plus the
+    # firewall's own self-check that "test" is still refused.
+    assert set(requested_partitions) <= {"validation", "test", "TEST", " test "}
+    assert "validation" in requested_partitions
+    for offender in ("test", "TEST"):
+        # ...and every such request RAISED rather than resolving a path.
+        with pytest.raises(X.M2ExecutionError):
+            real_guard(offender)
+    assert not any("/test/" in path or path.endswith("/test") for path in opened_paths)
+    assert not any("sealed" in path.lower() for path in opened_paths)
+
     runs = _roots(tmp_path)["run_root"]
     for arm in R.CANONICAL_ARM_ORDER:
         promoted = json.loads(
@@ -887,9 +924,12 @@ def test_evidence_store_files_are_revalidated_after_finalization(
 def test_build_suite_result_is_on_the_canonical_route():
     """§13.P -- the promise in PLANNED_EXECUTION_ORDER is actually kept."""
     source = inspect.getsource(R._run)
-    assert "build_suite_result(" in source
+    assert "build_suite_body(" in source
     assert "finalize_and_promote_suite_result(" in source
     assert "two_arm_suite_without_selection" in R.PLANNED_EXECUTION_ORDER
+    # The body is built unsigned; only finalization signs it, after the
+    # suite's own PRE_PROMOTION observation exists.
+    assert "build_suite_result(" not in source
 
 
 def test_the_suite_contains_exactly_the_two_arms_and_selects_nothing(
@@ -935,27 +975,39 @@ def test_the_suite_has_its_own_pre_promotion_observation(
     assert observed.count(f"promote:{PS.ARM_RESULT_NAME}") == 2
 
 
-def test_an_incomplete_arm_yields_no_canonical_suite(
-    tmp_path, frozen_runtime, synthetic_frozen_populations
-):
+def test_an_incomplete_arm_yields_no_canonical_suite(tmp_path, frozen_runtime):
     runs = _roots(tmp_path)["run_root"]
-    incomplete = runs / PS.arm_experiment_id(SUITE, "M2-0")
-    incomplete.mkdir(parents=True)
+    (runs / PS.arm_experiment_id(SUITE, "M2-0")).mkdir(parents=True)
     with pytest.raises(PS.M2PersistenceError, match="not COMPLETE"):
         PS.finalize_and_promote_suite_result(
             runs,
             SUITE,
-            suite=PS.build_suite_result(
-                suite_id=SUITE,
-                arm_results={"M2-0": {}, "M2-G": {}},
-                population_identities={
-                    field: {"x": 1} for field in PS.POPULATION_IDENTITY_FIELDS
-                },
-                development_source_identity={"annotation_set": "stb"},
-            ),
+            suite_body=_suite_body(),
             runtime=_suite_runtime(),
-            arm_run_dirs={"M2-0": incomplete, "M2-G": incomplete},
         )
+
+
+def _suite_body(**overrides):
+    body = PS.build_suite_body(
+        suite_id=SUITE,
+        arm_results={
+            arm: {
+                "experiment_id": PS.arm_experiment_id(SUITE, arm),
+                "run_dir": "x",
+                "arm_result_sha256": "a" * 64,
+            }
+            for arm in PS.M2_ARMS
+        },
+        arm_lock_sha256=dict.fromkeys(PS.M2_ARMS, "b" * 64),
+        population_identities={
+            field: {"x": index}
+            for index, field in enumerate(PS.POPULATION_IDENTITY_FIELDS)
+        },
+        development_source_identity=_source_identity(source_root="", feature_root=""),
+        git_sha=GIT_SHA,
+    )
+    body.update(overrides)
+    return body
 
 
 def _suite_runtime():
@@ -1009,11 +1061,385 @@ def test_no_real_development_data_is_opened_by_this_module():
 
 def test_the_injection_seam_is_private_and_absent_from_the_cli():
     parameters = set(inspect.signature(R.execute_canonical_development).parameters)
-    assert {"_roots", "_loaders"} <= parameters
-    assert all(name.startswith("_") for name in ("_roots", "_loaders"))
+    assert {"_roots", "_loaders", "_suite_id"} <= parameters
+    assert all(name.startswith("_") for name in ("_roots", "_loaders", "_suite_id"))
+    # And no PUBLIC suite selector exists.
+    assert "suite_id" not in parameters
     options = {
         flag for action in R.build_parser()._actions for flag in action.option_strings
     }
     assert options == {"-h", "--help", R.EXECUTION_FLAG, R.EXPECTED_GIT_SHA_FLAG}
     for banned in ("partition", "arm", "threshold", "retry", "seed", "source", "root"):
         assert not any(banned in flag for flag in options), banned
+
+
+# --------------------------------------------------------------------------
+# §1/§7.1-3 -- the production suite id is immutable
+# --------------------------------------------------------------------------
+
+
+def test_no_public_suite_id_override_exists():
+    """§7.1 -- production execution cannot choose another canonical suite."""
+    parameters = inspect.signature(R.execute_canonical_development).parameters
+    assert "suite_id" not in parameters
+    assert "_suite_id" in parameters
+    with pytest.raises(TypeError):
+        R.execute_canonical_development(
+            expected_git_sha=GIT_SHA, execute=True, suite_id="alternate"
+        )
+
+
+def test_a_noncanonical_suite_id_is_refused_before_anything_happens(tmp_path):
+    """§1 -- refused before claim checking, filesystem creation and VALIDATION."""
+    with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
+        R.require_canonical_suite_id("alternate")
+    assert R.require_canonical_suite_id(R.CANONICAL_SUITE_ID) == R.CANONICAL_SUITE_ID
+    # Nothing was created by the refusal.
+    assert not (tmp_path / "runs").exists()
+
+
+def test_the_default_canonical_suite_cannot_be_rerun_under_a_second_name(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.2 -- an alternate name cannot bypass a consumed canonical attempt."""
+    roots = _roots(tmp_path)
+    # A consumed canonical attempt.
+    (roots["run_root"] / PS.arm_experiment_id(R.CANONICAL_SUITE_ID, "M2-0")).mkdir(
+        parents=True
+    )
+    # Production refuses to run at all, because it can only be the canonical id.
+    with pytest.raises(PS.M2PersistenceError, match="already claimed"):
+        R._run(
+            expected_git_sha=GIT_SHA,
+            suite_id=R.require_canonical_suite_id(R.CANONICAL_SUITE_ID),
+            roots=roots,
+            loaders=_loaders(),
+        )
+    # And there is no public route that would let a caller pick another name.
+    assert (
+        "suite_id" not in inspect.signature(R.execute_canonical_development).parameters
+    )
+
+
+def test_the_test_seam_cannot_alter_production_semantics(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.3 -- `_suite_id` only names a synthetic suite; production is pinned."""
+    result = _execute(tmp_path)
+    assert result["suite_id"] == SUITE
+    # The promoted suite is validated WITHOUT the production id expectation
+    # only because this is a synthetic run; production passes it.
+    finalize = inspect.getsource(R._run)
+    assert "expected_suite_id=CANONICAL_SUITE_ID if production else None" in finalize
+    execute = inspect.getsource(R.execute_canonical_development)
+    assert "production=_suite_id is None" in execute
+
+
+# --------------------------------------------------------------------------
+# §2/§7.4-7 -- the suite persists its own runtime promotion evidence
+# --------------------------------------------------------------------------
+
+
+def _promoted_suite(tmp_path):
+    runs = _roots(tmp_path)["run_root"]
+    return json.loads(
+        (PS.suite_directory(runs, SUITE) / PS.SUITE_RESULT_NAME).read_text()
+    )
+
+
+def test_the_suite_persists_its_start_and_pre_promotion_observations(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.4/§7.5."""
+    _execute(tmp_path)
+    suite = _promoted_suite(tmp_path)
+    checks = suite["runtime_identity_checks"]
+    observed = {
+        (item["enforcement_point"], item["detail"]) for item in checks["checks"]
+    }
+    assert ("start", "m2_suite") in observed
+    assert ("pre_promotion", f"promote:{PS.SUITE_RESULT_NAME}") in observed
+    assert checks["expected_digest"] == FROZEN_DIGEST
+    assert checks["all_observations_matched"] is True
+
+
+def test_the_suite_digest_covers_its_runtime_block(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.6 -- the signature is taken AFTER the promotion observation exists."""
+    _execute(tmp_path)
+    suite = _promoted_suite(tmp_path)
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    body = {k: v for k, v in suite.items() if k != "m2_suite_sha256"}
+    assert suite["m2_suite_sha256"] == canonical_sha256(body)
+    # Stripping the runtime block changes the digest, so it is genuinely covered.
+    without = {k: v for k, v in body.items() if k != "runtime_identity_checks"}
+    assert canonical_sha256(without) != suite["m2_suite_sha256"]
+    # And an unsigned body is refused by finalization.
+    with pytest.raises(PS.M2PersistenceError, match="must be unsigned"):
+        PS.finalize_and_promote_suite_result(
+            _roots(tmp_path)["run_root"],
+            SUITE,
+            suite_body=suite,
+            runtime=_suite_runtime(),
+        )
+
+
+def test_a_suite_runtime_mismatch_prevents_promotion(tmp_path, monkeypatch):
+    """§7.7 -- a non-frozen observation refuses the suite."""
+    runs = tmp_path / "runs"
+    runs.mkdir()
+
+    def mismatched(point, *, expected_digest=FROZEN_DIGEST, detail=None):
+        check = _frozen_check(point, detail or "test")
+        return S.RuntimeCheck(
+            enforcement_point=check.enforcement_point,
+            observed_digest="9" * 64,
+            expected_digest=FROZEN_DIGEST,
+            matches=False,
+            package_count=1,
+            observed_at=check.observed_at,
+            detail=check.detail,
+        )
+
+    monkeypatch.setattr(PS, "observe_runtime_identity", mismatched)
+    monkeypatch.setattr(PS, "_verify_suite_against_arm_artifacts", lambda *a, **k: None)
+    with pytest.raises(S.RuntimeIntegrityError, match="NOT promoted"):
+        PS.finalize_and_promote_suite_result(
+            runs, SUITE, suite_body=_suite_body(), runtime=_suite_runtime()
+        )
+    assert not (PS.suite_directory(runs, SUITE)).exists()
+
+
+def test_a_suite_without_a_runtime_block_is_rejected():
+    suite = _suite_body()
+    suite["runtime_identity_checks"] = None
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    suite["m2_suite_sha256"] = canonical_sha256(
+        {k: v for k, v in suite.items() if k != "m2_suite_sha256"}
+    )
+    with pytest.raises(PS.M2PersistenceError, match="own runtime_identity_checks"):
+        PS.validate_suite_result(suite)
+
+
+def test_a_suite_reusing_an_arm_promotion_observation_is_rejected():
+    """The suite's PRE_PROMOTION must name M2_SUITE_RESULT.json."""
+    record = _suite_runtime()
+    record.record(
+        _frozen_check(
+            S.EnforcementPoint.PRE_PROMOTION.value, f"promote:{PS.ARM_RESULT_NAME}"
+        )
+    )
+    suite = _suite_body()
+    suite["runtime_identity_checks"] = record.as_dict()
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    suite["m2_suite_sha256"] = canonical_sha256(
+        {k: v for k, v in suite.items() if k != "m2_suite_sha256"}
+    )
+    with pytest.raises(PS.M2PersistenceError, match="never reused"):
+        PS.validate_suite_result(suite)
+
+
+# --------------------------------------------------------------------------
+# §3/§7.8-16 -- the suite is verified against the ACTUAL arm artifacts
+# --------------------------------------------------------------------------
+
+
+def _signed(body):
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    record = _suite_runtime()
+    record.record(
+        _frozen_check(
+            S.EnforcementPoint.PRE_PROMOTION.value, f"promote:{PS.SUITE_RESULT_NAME}"
+        )
+    )
+    body = dict(body)
+    body["runtime_identity_checks"] = record.as_dict()
+    body["m2_suite_sha256"] = canonical_sha256(body)
+    return body
+
+
+@pytest.mark.parametrize("bad", [None, "short", "z" * 63, 12345])
+def test_a_missing_or_malformed_arm_result_sha_is_rejected(bad):
+    """§7.8/§7.9."""
+    body = _suite_body()
+    body["arm_results"]["M2-0"]["arm_result_sha256"] = bad
+    with pytest.raises(PS.M2PersistenceError, match="arm_result_sha256"):
+        PS.validate_suite_result(_signed(body))
+
+
+@pytest.mark.parametrize("bad", [None, "short", "z" * 63])
+def test_a_missing_or_malformed_lock_sha_is_rejected(bad):
+    """§7.11."""
+    body = _suite_body()
+    body["arm_experiment_lock_sha256"]["M2-G"] = bad
+    with pytest.raises(PS.M2PersistenceError, match="arm_experiment_lock_sha256"):
+        PS.validate_suite_result(_signed(body))
+
+
+def test_wrong_arm_experiment_ids_are_rejected():
+    """§7.14."""
+    body = _suite_body()
+    body["arm_experiment_ids"]["M2-0"] = "something-else"
+    with pytest.raises(PS.M2PersistenceError, match="deterministic"):
+        PS.validate_suite_result(_signed(body))
+
+
+def test_a_malformed_suite_git_sha_is_rejected():
+    body = _suite_body()
+    body["git_sha"] = "not-a-sha"
+    with pytest.raises(PS.M2PersistenceError, match="git_sha is malformed"):
+        PS.validate_suite_result(_signed(body))
+
+
+def test_a_mutated_arm_result_byte_fails_suite_validation(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.10 -- the suite is the aggregation of the ACTUAL frozen arms."""
+    _execute(tmp_path)
+    runs = _roots(tmp_path)["run_root"]
+    suite = _promoted_suite(tmp_path)
+    PS.validate_suite_result(suite, run_root=runs)
+
+    result_path = runs / PS.arm_experiment_id(SUITE, "M2-0") / PS.ARM_RESULT_NAME
+    result_path.write_text(result_path.read_text() + " ")
+    with pytest.raises(PS.M2PersistenceError, match="but the suite declares"):
+        PS.validate_suite_result(suite, run_root=runs)
+
+
+def test_an_altered_arm_lock_fails_suite_validation(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.12/§7.13."""
+    _execute(tmp_path)
+    runs = _roots(tmp_path)["run_root"]
+    suite = _promoted_suite(tmp_path)
+
+    lock_path = runs / PS.arm_experiment_id(SUITE, "M2-G") / PS.EXPERIMENT_LOCK_NAME
+    lock = json.loads(lock_path.read_text())
+    lock["experiment_lock_sha256"] = "0" * 64
+    lock_path.write_text(json.dumps(lock))
+    with pytest.raises(PS.M2PersistenceError, match="differs from the suite"):
+        PS.validate_suite_result(suite, run_root=runs)
+
+
+def test_the_suite_git_sha_must_equal_both_arm_locks(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.15."""
+    _execute(tmp_path)
+    runs = _roots(tmp_path)["run_root"]
+    suite = _promoted_suite(tmp_path)
+    for arm in R.CANONICAL_ARM_ORDER:
+        lock = json.loads(
+            (
+                runs / PS.arm_experiment_id(SUITE, arm) / PS.EXPERIMENT_LOCK_NAME
+            ).read_text()
+        )
+        assert lock["git_sha"] == suite["git_sha"]
+
+
+def test_the_suite_population_identities_must_equal_both_arm_locks(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.16."""
+    _execute(tmp_path)
+    runs = _roots(tmp_path)["run_root"]
+    suite = _promoted_suite(tmp_path)
+    for arm in R.CANONICAL_ARM_ORDER:
+        lock = json.loads(
+            (
+                runs / PS.arm_experiment_id(SUITE, arm) / PS.EXPERIMENT_LOCK_NAME
+            ).read_text()
+        )
+        for field in PS.POPULATION_IDENTITY_FIELDS:
+            assert lock[field] == suite[field], field
+
+
+# --------------------------------------------------------------------------
+# §4/§7.17-18 -- development-source identity coherence
+# --------------------------------------------------------------------------
+
+
+def test_source_identity_agrees_across_result_stress_lock_and_suite(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    """§7.17."""
+    _execute(tmp_path)
+    runs = _roots(tmp_path)["run_root"]
+    suite = _promoted_suite(tmp_path)
+    for arm in R.CANONICAL_ARM_ORDER:
+        run_dir = runs / PS.arm_experiment_id(SUITE, arm)
+        result = json.loads((run_dir / PS.ARM_RESULT_NAME).read_text())
+        lock = json.loads((run_dir / PS.EXPERIMENT_LOCK_NAME).read_text())
+        identity = result["development_source_identity"]
+        assert (
+            result["stress_interval_selection_identity"]["development_source_identity"]
+            == identity
+        )
+        assert lock["development_source_identity"] == identity
+        assert suite["development_source_identity"] == identity
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        {"identity_class": "something_else"},
+        {"annotation_set": "sta"},
+        {"test_partition_hashed": True},
+        {"verified_before_stress_selection": False},
+        {"feature_receipt": {"verification_result": "failed"}},
+        {"source_receipt": {"verification_result": "failed"}},
+        {"feature_receipt": None},
+    ],
+)
+def test_a_malformed_source_integrity_identity_is_rejected(mutation):
+    """§7.18."""
+    identity = {**_source_identity(source_root="", feature_root=""), **mutation}
+    with pytest.raises(PS.M2PersistenceError):
+        PS.validate_development_source_identity(identity)
+
+
+def test_a_result_whose_stress_source_disagrees_is_rejected(
+    tmp_path, frozen_runtime, synthetic_frozen_populations
+):
+    _execute(tmp_path)
+    runs = _roots(tmp_path)["run_root"]
+    run_dir = runs / PS.arm_experiment_id(SUITE, "M2-0")
+    result = json.loads((run_dir / PS.ARM_RESULT_NAME).read_text())
+    result["stress_interval_selection_identity"] = {
+        **result["stress_interval_selection_identity"],
+        "development_source_identity": {
+            **result["development_source_identity"],
+            "annotation_set": "stb",
+            "verified_before_stress_selection": True,
+            "feature_receipt": {"verification_result": "passed", "extra": 1},
+        },
+    }
+    with pytest.raises(PS.M2PersistenceError, match="differs from|same verified"):
+        PS.validate_claim_bearing_arm_result_payload(result)
+
+
+def test_no_assertion_in_this_module_is_vacuous():
+    """No assertion may contain an unconditionally-true disjunct.
+
+    Checked on the AST rather than by scanning text, because a literal scan
+    would match this test's own description and pass for the wrong reason.
+    """
+    tree = ast.parse(Path(__file__).read_text())
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assert):
+            continue
+        test = node.test
+        if isinstance(test, ast.Constant) and bool(test.value):
+            offenders.append(node.lineno)
+        if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
+            for value in test.values:
+                if isinstance(value, ast.Constant) and bool(value.value):
+                    offenders.append(node.lineno)
+    assert offenders == [], offenders

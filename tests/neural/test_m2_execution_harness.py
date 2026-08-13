@@ -238,9 +238,23 @@ def _challenge_identity():
     }
 
 
+def _source_identity():
+    """A development source-integrity receipt, as the real verifier produces."""
+    return {
+        "identity_class": PS.DEVELOPMENT_SOURCE_IDENTITY_CLASS,
+        "feature_receipt": {"verification_result": "passed"},
+        "source_receipt": {"verification_result": "passed"},
+        "annotation_set": "stb",
+        "test_partition_hashed": False,
+        "verified_before_stress_selection": True,
+    }
+
+
 def _stress_identity():
     """A real source-defined stress selection identity."""
-    return SI.build_stress_selection().identity()
+    identity = dict(SI.build_stress_selection().identity())
+    identity["development_source_identity"] = _source_identity()
+    return identity
 
 
 def _full_result(arm="M2-G", **overrides):
@@ -265,6 +279,7 @@ def _full_result(arm="M2-G", **overrides):
         "primary_evaluation_population_identity": primary,
         "challenge_evaluation_population_identity": challenge,
         "stress_interval_selection_identity": stress,
+        "development_source_identity": _source_identity(),
         "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
@@ -1375,6 +1390,7 @@ def _build_complete_lock(*, population=None, **overrides):
         execution_identity=_execution_identity(),
         runtime=runtime,
         population_identities=(population or _population_identities()),
+        development_source_identity=_source_identity(),
         started_at="2026-01-01T00:00:00Z",
         completed_at="2026-01-01T00:10:00Z",
         artifact_sha256={PS.ARM_RESULT_NAME: "b" * 64},

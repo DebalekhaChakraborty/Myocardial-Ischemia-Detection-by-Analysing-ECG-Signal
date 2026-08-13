@@ -704,6 +704,18 @@ def test_an_unscored_row_is_refused_by_the_compact_score_table(tmp_path):
 # --------------------------------------------------------------------------
 
 
+def _source_identity():
+    """A development source-integrity receipt, as the real verifier produces."""
+    return {
+        "identity_class": PS.DEVELOPMENT_SOURCE_IDENTITY_CLASS,
+        "feature_receipt": {"verification_result": "passed"},
+        "source_receipt": {"verification_result": "passed"},
+        "annotation_set": "stb",
+        "test_partition_hashed": False,
+        "verified_before_stress_selection": True,
+    }
+
+
 def _complete_result(arm="M2-G"):
     """A complete canonical arm result carrying four distinct populations."""
     replay = X.M2ReplayPopulation(
@@ -747,7 +759,9 @@ def _complete_result(arm="M2-G"):
         "positional_join_used": False,
         "matches_frozen_authority_exactly": True,
     }
-    stress = SI.build_stress_selection().identity()
+    source = _source_identity()
+    stress = dict(SI.build_stress_selection().identity())
+    stress["development_source_identity"] = source
     return {
         "artifact_class": PS.ARM_RESULT_CLASS,
         "arm": arm,
@@ -768,6 +782,7 @@ def _complete_result(arm="M2-G"):
         "primary_evaluation_population_identity": primary,
         "challenge_evaluation_population_identity": challenge,
         "stress_interval_selection_identity": stress,
+        "development_source_identity": source,
         "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",

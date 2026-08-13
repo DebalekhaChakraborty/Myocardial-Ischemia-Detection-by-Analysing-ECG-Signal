@@ -519,22 +519,42 @@ def replay_both_arms(
 # --------------------------------------------------------------------------
 
 
+def require_canonical_suite_id(suite_id: str) -> str:
+    """Production canonical execution is ALWAYS the one canonical suite.
+
+    A caller-chosen suite name would let a second "canonical" suite be executed
+    under a different directory after the first was consumed, which is exactly
+    the automatic-rerun the claim model forbids. The check runs before claim
+    checking, before any filesystem creation and before any VALIDATION access.
+    """
+    if str(suite_id) != CANONICAL_SUITE_ID:
+        raise M2DevelopmentRunError(
+            f"The canonical M2 development suite is {CANONICAL_SUITE_ID!r}; "
+            f"{suite_id!r} is refused. A second suite name would let a consumed "
+            "canonical attempt be re-run under another directory. Nothing was "
+            "claimed, created or opened."
+        )
+    return CANONICAL_SUITE_ID
+
+
 def execute_canonical_development(
     *,
     expected_git_sha: str | None,
     execute: bool = False,
-    suite_id: str = CANONICAL_SUITE_ID,
     _roots: dict[str, Path] | None = None,
     _loaders: dict[str, Any] | None = None,
+    _suite_id: str | None = None,
 ) -> dict[str, Any]:
     """The canonical two-arm development run.
 
     Without `execute=True` this performs the identity preflight and returns the
     plan; it opens no partition and consumes no attempt.
 
-    `_roots` and `_loaders` are private TEST-ONLY dependency injection seams.
-    They are absent from the CLI and from the public scientific contract: a real
-    run always uses `canonical_roots()` and the real loaders.
+    There is deliberately **no public `suite_id` parameter**: production always
+    runs the one `CANONICAL_SUITE_ID`. `_roots`, `_loaders` and `_suite_id` are
+    private TEST-ONLY seams, absent from the CLI and from the public scientific
+    contract; `_suite_id` still cannot bypass a consumed canonical attempt,
+    because the pair preflight refuses any suite whose paths already exist.
     """
     if not execute:
         plan = preflight(expected_git_sha=expected_git_sha)
@@ -543,9 +563,14 @@ def execute_canonical_development(
         return plan
     return _run(
         expected_git_sha=expected_git_sha,
-        suite_id=suite_id,
+        suite_id=(
+            require_canonical_suite_id(CANONICAL_SUITE_ID)
+            if _suite_id is None
+            else str(_suite_id)
+        ),
         roots=dict(_roots or canonical_roots()),
         loaders=dict(_loaders or {}),
+        production=_suite_id is None,
     )
 
 
@@ -555,8 +580,10 @@ def _run(
     suite_id: str,
     roots: dict[str, Path],
     loaders: dict[str, Any],
+    production: bool = True,
 ) -> dict[str, Any]:
     """The frozen execution order, end to end."""
+    from cardiosentinel.data.provenance import sha256_file
     from cardiosentinel.neural.m2_evaluation import (
         build_challenge_bundle,
         build_primary_bundle,
@@ -575,9 +602,10 @@ def _run(
         streaming_input_identity,
     )
     from cardiosentinel.neural.m2_persistence import (
+        ARM_RESULT_NAME,
         EXPERIMENT_LOCK_NAME,
         arm_experiment_id,
-        build_suite_result,
+        build_suite_body,
         claim_evidence_workspace,
         claim_run_directory,
         finalize_and_promote_arm_result,
@@ -720,6 +748,9 @@ def _run(
                 challenge_bundle.population_identity()
             ),
             "stress_interval_selection_identity": stress_identity,
+            # Top-level provenance for the whole arm, and identical to the copy
+            # the stress selection carries -- the persistence layer requires
+            # they agree exactly.
             "development_source_identity": source_identity,
             "population_containment_proof": containment,
             "pre_claim_readiness": readiness,
@@ -770,17 +801,20 @@ def _run(
         del primary_bundle, challenge_bundle, table
 
     # -- 6. ONE aggregating suite. No new metric, no preference. -------------
-    suite = build_suite_result(
+    # The suite's own runtime record is created and STARTed first, so its
+    # PRE_PROMOTION observation can be embedded before the payload is signed.
+    suite_runtime = RuntimeIntegrityRecord()
+    require_runtime_identity(
+        EnforcementPoint.START, record=suite_runtime, detail="m2_suite"
+    )
+    suite_body = build_suite_body(
         suite_id=suite_id,
         arm_results={
             arm: {
                 "experiment_id": arm_experiment_id(suite_id, arm),
                 "run_dir": str(claims[arm].run_dir),
-                "arm_result_sha256": results[arm]["artifact_sha256"][
-                    "M2_ARM_RESULT.json"
-                ]
-                if "artifact_sha256" in results[arm]
-                else None,
+                # Hashed from the PROMOTED bytes, never restated from memory.
+                "arm_result_sha256": sha256_file(claims[arm].run_dir / ARM_RESULT_NAME),
             }
             for arm in CANONICAL_ARM_ORDER
         },
@@ -789,16 +823,12 @@ def _run(
         development_source_identity=source_identity,
         git_sha=readiness["git_sha"],
     )
-    suite_runtime = RuntimeIntegrityRecord()
-    require_runtime_identity(
-        EnforcementPoint.START, record=suite_runtime, detail="m2_suite"
-    )
-    finalize_and_promote_suite_result(
+    suite = finalize_and_promote_suite_result(
         roots["run_root"],
         suite_id,
-        suite=suite,
+        suite_body=suite_body,
         runtime=suite_runtime,
-        arm_run_dirs={arm: claims[arm].run_dir for arm in CANONICAL_ARM_ORDER},
+        expected_suite_id=CANONICAL_SUITE_ID if production else None,
     )
     return {
         "preflight_class": readiness["preflight_class"],

@@ -182,6 +182,7 @@ REQUIRED_PROVENANCE_FIELDS: Final = (
     "morphology_v1_schema_sha256",
     "combined_v1_schema_sha256",
     *POPULATION_IDENTITY_FIELDS,
+    "development_source_identity",
     "m1l_classification_threshold",
     "normal_evidence_threshold",
     "runtime_dependency_digest_start",
@@ -253,6 +254,7 @@ REQUIRED_RESULT_FIELDS: Final = (
     "rollback",
     "partition_accessed",
     *POPULATION_IDENTITY_FIELDS,
+    "development_source_identity",
     "validation_accessed",
     "test_accessed",
     "sealed_test_state",
@@ -376,6 +378,17 @@ def validate_claim_bearing_arm_result_payload(
         "stress_interval_selection_identity",
         stress,
     )
+
+    # The raw `.stb` provenance must be ONE identity, not several that happen
+    # to look alike: the arm result and the stress selection it authorised must
+    # name the same verified source.
+    source = validate_development_source_identity(result["development_source_identity"])
+    if stress.get("development_source_identity") != source:
+        raise M2PersistenceError(
+            "The stress selection's development_source_identity differs from "
+            "the arm result's. The intervals and the verified source must "
+            "describe the same files."
+        )
     return result
 
 
@@ -407,6 +420,7 @@ def build_canonical_run_lock(
     execution_identity: dict[str, Any],
     runtime: RuntimeIntegrityRecord,
     population_identities: dict[str, Any],
+    development_source_identity: dict[str, Any] | None,
     started_at: str,
     completed_at: str,
     artifact_sha256: dict[str, str],
@@ -452,6 +466,10 @@ def build_canonical_run_lock(
             field: population_identities.get(field)
             for field in POPULATION_IDENTITY_FIELDS
         },
+        # Top-level rather than only nested inside the stress selection: the
+        # raw .stb the stress intervals came from is provenance for the whole
+        # arm, not a detail of one evidence section.
+        "development_source_identity": development_source_identity,
         "m1l_classification_threshold": M1L_CLASSIFICATION_THRESHOLD,
         "normal_evidence_threshold": NORMAL_EVIDENCE_THRESHOLD,
         "classification_threshold_used_for_admission": False,
@@ -498,7 +516,11 @@ def validate_canonical_run_lock(
     # `memory_selected` is null by design; the four population identities are
     # governed by `requires_evaluation` below, so a run that produced no
     # label-joined evaluation is not forced to invent one.
-    _nullable = {"memory_selected", *POPULATION_IDENTITY_FIELDS}
+    _nullable = {
+        "memory_selected",
+        "development_source_identity",
+        *POPULATION_IDENTITY_FIELDS,
+    }
     empty = [
         field
         for field in REQUIRED_PROVENANCE_FIELDS
@@ -579,6 +601,7 @@ def validate_canonical_run_lock(
             lock["challenge_evaluation_population_identity"]
         )
         validate_stress_selection_identity(lock["stress_interval_selection_identity"])
+        validate_development_source_identity(lock["development_source_identity"])
 
     artifacts = dict(lock["artifact_sha256"])
     if not artifacts:
@@ -749,6 +772,52 @@ def validate_challenge_population_identity(
     return payload
 
 
+DEVELOPMENT_SOURCE_IDENTITY_CLASS: Final = "m2_v1_development_source_integrity"
+
+
+def validate_development_source_identity(
+    identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The proof that the raw `.stb` was the official frozen development source.
+
+    The stress selection reads raw LTSTDB annotations, so the files it read must
+    be bound to the official pinned manifest and the frozen feature-corpus
+    identity. This validates the receipt the existing repository verifiers
+    produced; it invents no second source-identity algorithm.
+    """
+    payload = _require_identity_payload(identity, "development_source_identity")
+    if payload.get("identity_class") != DEVELOPMENT_SOURCE_IDENTITY_CLASS:
+        raise M2PersistenceError(
+            f"development_source_identity must declare identity_class "
+            f"{DEVELOPMENT_SOURCE_IDENTITY_CLASS!r}; received "
+            f"{payload.get('identity_class')!r}."
+        )
+    if payload.get("annotation_set") != "stb":
+        raise M2PersistenceError(
+            "The stress selection reads the primary `.stb` annotation set; "
+            f"received {payload.get('annotation_set')!r}."
+        )
+    if payload.get("test_partition_hashed") is not False:
+        raise M2PersistenceError(
+            "Development source verification must never hash a TEST file."
+        )
+    if payload.get("verified_before_stress_selection") is not True:
+        raise M2PersistenceError(
+            "The development source must be verified BEFORE any raw annotation "
+            "is read for stress selection."
+        )
+    for name in ("feature_receipt", "source_receipt"):
+        receipt = payload.get(name)
+        if not isinstance(receipt, dict):
+            raise M2PersistenceError(f"{name} is missing from the source identity.")
+        if receipt.get("verification_result") != "passed":
+            raise M2PersistenceError(
+                f"{name}.verification_result is "
+                f"{receipt.get('verification_result')!r}, not 'passed'."
+            )
+    return payload
+
+
 def validate_stress_selection_identity(
     identity: dict[str, Any] | None,
 ) -> dict[str, Any]:
@@ -852,33 +921,39 @@ def validate_complete_runtime_identity(
     return runtime.as_dict()
 
 
-def build_suite_result(
+SUITE_CLASS: Final = "m2_v1_two_arm_suite"
+
+
+def build_suite_body(
     *,
     suite_id: str,
     arm_results: dict[str, dict[str, Any]],
-    arm_lock_sha256: dict[str, str] | None = None,
-    population_identities: dict[str, Any] | None = None,
-    development_source_identity: dict[str, Any] | None = None,
-    git_sha: str | None = None,
+    arm_lock_sha256: dict[str, str],
+    population_identities: dict[str, Any],
+    development_source_identity: dict[str, Any] | None,
+    git_sha: str | None,
 ) -> dict[str, Any]:
-    """A two-arm suite that expresses no retention decision.
+    """The suite aggregation WITHOUT its self-digest.
 
-    An AGGREGATION of two already-frozen arm results. It computes no new
-    scientific metric, compares nothing and applies no preference.
+    Deliberately unsigned: the suite's own PRE_PROMOTION observation does not
+    exist yet, and a digest computed before that observation could never cover
+    it. `finalize_and_promote_suite_result` embeds the complete runtime block
+    and only then signs the payload, so the promoted artifact proves its own
+    promotion gate rather than asserting it.
     """
     if set(arm_results) != set(M2_ARMS):
         raise M2PersistenceError(
             f"An M2 suite binds exactly {M2_ARMS}; received {sorted(arm_results)}."
         )
-    payload: dict[str, Any] = {
+    body: dict[str, Any] = {
         "suite_id": suite_id,
-        "suite_class": "m2_v1_two_arm_suite",
+        "suite_class": SUITE_CLASS,
         "arms": list(M2_ARMS),
         "arm_results": arm_results,
         "arm_experiment_ids": {
             arm: arm_experiment_id(suite_id, arm) for arm in M2_ARMS
         },
-        "arm_experiment_lock_sha256": dict(arm_lock_sha256 or {}),
+        "arm_experiment_lock_sha256": dict(arm_lock_sha256),
         "git_sha": git_sha,
         "development_source_identity": development_source_identity,
         "memory_selection_performed": False,
@@ -892,19 +967,126 @@ def build_suite_result(
         "rollback_evaluated": False,
     }
     for field in POPULATION_IDENTITY_FIELDS:
-        payload[field] = (population_identities or {}).get(field)
+        body[field] = population_identities.get(field)
+    return body
+
+
+def build_suite_result(
+    *,
+    suite_id: str,
+    arm_results: dict[str, dict[str, Any]],
+    arm_lock_sha256: dict[str, str] | None = None,
+    population_identities: dict[str, Any] | None = None,
+    development_source_identity: dict[str, Any] | None = None,
+    git_sha: str | None = None,
+    runtime_identity_checks: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """A two-arm suite that expresses no retention decision.
+
+    An AGGREGATION of two already-frozen arm results. It computes no new
+    scientific metric, compares nothing and applies no preference. The digest
+    is taken over the body INCLUDING the runtime block, so the suite's own
+    promotion evidence is covered by its signature.
+    """
+    payload = build_suite_body(
+        suite_id=suite_id,
+        arm_results=arm_results,
+        arm_lock_sha256=dict(arm_lock_sha256 or {}),
+        population_identities=dict(population_identities or {}),
+        development_source_identity=development_source_identity,
+        git_sha=git_sha,
+    )
+    payload["runtime_identity_checks"] = runtime_identity_checks
     payload["m2_suite_sha256"] = canonical_sha256(payload)
     return payload
 
 
-def validate_suite_result(suite: dict[str, Any]) -> dict[str, Any]:
-    """Re-verify a suite's self-digest and its no-selection invariants."""
+def _validate_suite_runtime_block(suite: dict[str, Any]) -> None:
+    """The suite must carry its own GREEN START and PRE_PROMOTION evidence."""
+    checks = suite.get("runtime_identity_checks")
+    if not isinstance(checks, dict):
+        raise M2PersistenceError(
+            "A canonical M2 suite must bind its own runtime_identity_checks; "
+            "without them the promoted artifact cannot prove its promotion gate."
+        )
+    if checks.get("expected_digest") != FROZEN_DEPENDENCY_DIGEST:
+        raise M2PersistenceError(
+            "The suite runtime block does not expect the frozen scientific identity."
+        )
+    if checks.get("all_observations_matched") is not True:
+        raise M2PersistenceError(
+            "Canonical suite evidence requires every runtime observation to match."
+        )
+    observed = {
+        (item.get("enforcement_point"), item.get("detail"))
+        for item in checks.get("checks", ())
+    }
+    points = {point for point, _detail in observed}
+    if EnforcementPoint.START.value not in points:
+        raise M2PersistenceError(
+            "The suite runtime block records no START observation."
+        )
+    if (EnforcementPoint.PRE_PROMOTION.value, f"promote:{SUITE_RESULT_NAME}") not in (
+        observed
+    ):
+        raise M2PersistenceError(
+            f"The suite runtime block records no PRE_PROMOTION observation for "
+            f"{SUITE_RESULT_NAME}; an arm's observation is never reused as the "
+            "suite's."
+        )
+    for item in checks.get("checks", ()):
+        if item.get("observed_digest") != FROZEN_DEPENDENCY_DIGEST:
+            raise M2PersistenceError(
+                "A suite runtime observation did not observe the frozen identity."
+            )
+
+
+def validate_suite_result(
+    suite: dict[str, Any],
+    *,
+    run_root: Path | None = None,
+    expected_suite_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate the actual canonical suite contract.
+
+    When `run_root` is supplied the declarations are checked against the ACTUAL
+    arm artifacts on disk: a suite is the immutable aggregation of two frozen
+    arms, so declaring a digest the files do not have is exactly the failure
+    this must catch.
+    """
     recorded = suite.get("m2_suite_sha256")
     body = {k: v for k, v in suite.items() if k != "m2_suite_sha256"}
     if recorded is None or recorded != canonical_sha256(body):
         raise M2PersistenceError("M2 suite result failed digest validation.")
+    if suite.get("suite_class") != SUITE_CLASS:
+        raise M2PersistenceError(
+            f"suite_class must be {SUITE_CLASS!r}; received "
+            f"{suite.get('suite_class')!r}."
+        )
+    suite_id = suite.get("suite_id")
+    if not suite_id:
+        raise M2PersistenceError("A canonical M2 suite must name its suite id.")
+    if expected_suite_id is not None and suite_id != expected_suite_id:
+        raise M2PersistenceError(
+            f"suite_id is {suite_id!r}; the canonical production suite is "
+            f"{expected_suite_id!r}."
+        )
     if list(suite.get("arms", ())) != list(M2_ARMS):
-        raise M2PersistenceError(f"An M2 suite binds exactly {M2_ARMS}.")
+        raise M2PersistenceError(f"An M2 suite binds exactly {M2_ARMS}, in order.")
+
+    expected_ids = {arm: arm_experiment_id(suite_id, arm) for arm in M2_ARMS}
+    if suite.get("arm_experiment_ids") != expected_ids:
+        raise M2PersistenceError(
+            f"The suite's arm experiment ids must be the deterministic "
+            f"{expected_ids}; received {suite.get('arm_experiment_ids')!r}."
+        )
+    if not isinstance(suite.get("git_sha"), str) or not _GIT_SHA_PATTERN.match(
+        suite["git_sha"]
+    ):
+        raise M2PersistenceError(
+            f"suite git_sha is malformed: {suite.get('git_sha')!r}."
+        )
+
     for flag in (
         "memory_selection_performed",
         "automatic_arm_preference_applied",
@@ -922,15 +1104,102 @@ def validate_suite_result(suite: dict[str, Any]) -> dict[str, Any]:
         )
     if suite.get("sealed_test_state") != "unopened":
         raise M2PersistenceError("The B4 sealed test must remain unopened.")
+
     for field in POPULATION_IDENTITY_FIELDS:
         if not suite.get(field):
             raise M2PersistenceError(f"A canonical M2 suite must bind {field}.")
-    if not suite.get("development_source_identity"):
-        raise M2PersistenceError(
-            "A canonical M2 suite must bind the development source-integrity "
-            "identity that the raw .stb stress selection was proven against."
+    source_identity = validate_development_source_identity(
+        suite.get("development_source_identity")
+    )
+    _validate_suite_runtime_block(suite)
+
+    results = suite.get("arm_results") or {}
+    locks = suite.get("arm_experiment_lock_sha256") or {}
+    if set(results) != set(M2_ARMS) or set(locks) != set(M2_ARMS):
+        raise M2PersistenceError(f"An M2 suite binds exactly {M2_ARMS}.")
+    for arm in M2_ARMS:
+        entry = results[arm] or {}
+        if entry.get("experiment_id") != expected_ids[arm]:
+            raise M2PersistenceError(
+                f"Suite arm {arm} declares experiment_id "
+                f"{entry.get('experiment_id')!r}, not {expected_ids[arm]!r}."
+            )
+        _require_sha256(
+            f"suite arm_result_sha256[{arm}]", entry.get("arm_result_sha256")
+        )
+        _require_sha256(f"suite arm_experiment_lock_sha256[{arm}]", locks.get(arm))
+
+    if run_root is not None:
+        _verify_suite_against_arm_artifacts(
+            suite, run_root=Path(run_root), source_identity=source_identity
         )
     return suite
+
+
+def _verify_suite_against_arm_artifacts(
+    suite: dict[str, Any], *, run_root: Path, source_identity: dict[str, Any]
+) -> None:
+    """Prove every suite declaration against the actual promoted arm files."""
+    suite_id = suite["suite_id"]
+    for arm in M2_ARMS:
+        run_dir = Path(run_root) / arm_experiment_id(suite_id, arm)
+        result_path = run_dir / ARM_RESULT_NAME
+        lock_path = run_dir / EXPERIMENT_LOCK_NAME
+        for path in (result_path, lock_path):
+            if not path.is_file():
+                raise M2PersistenceError(
+                    f"Arm {arm} is not COMPLETE ({path.name} is absent); there is "
+                    "no canonical suite."
+                )
+        declared_result = suite["arm_results"][arm]["arm_result_sha256"]
+        actual_result = sha256_file(result_path)
+        if actual_result != declared_result:
+            raise M2PersistenceError(
+                f"Arm {arm} result digests to {actual_result}, but the suite "
+                f"declares {declared_result}. The suite aggregates the frozen "
+                "arms; it never restates them."
+            )
+
+        lock = read_json_result(lock_path)
+        declared_lock = suite["arm_experiment_lock_sha256"][arm]
+        if lock.get("experiment_lock_sha256") != declared_lock:
+            raise M2PersistenceError(
+                f"Arm {arm} lock digest {lock.get('experiment_lock_sha256')!r} "
+                f"differs from the suite's {declared_lock!r}."
+            )
+        validate_canonical_run_lock(lock, run_dir=run_dir)
+        if lock.get("artifact_sha256", {}).get(ARM_RESULT_NAME) != actual_result:
+            raise M2PersistenceError(
+                f"Arm {arm} lock does not bind the promoted result's digest."
+            )
+        if lock.get("arm") != arm:
+            raise M2PersistenceError(f"Arm {arm} lock records arm {lock.get('arm')!r}.")
+        if lock.get("experiment_id") != arm_experiment_id(suite_id, arm):
+            raise M2PersistenceError(
+                f"Arm {arm} lock records experiment_id {lock.get('experiment_id')!r}."
+            )
+        if lock.get("git_sha") != suite["git_sha"]:
+            raise M2PersistenceError(
+                f"Arm {arm} lock binds git_sha {lock.get('git_sha')!r}, but the "
+                f"suite binds {suite['git_sha']!r}. Both arms and the suite are "
+                "one execution."
+            )
+        for field in POPULATION_IDENTITY_FIELDS:
+            if lock.get(field) != suite.get(field):
+                raise M2PersistenceError(
+                    f"Arm {arm} lock's {field} differs from the suite's."
+                )
+        if lock.get("development_source_identity") != source_identity:
+            raise M2PersistenceError(
+                f"Arm {arm} lock's development_source_identity differs from the "
+                "suite's."
+            )
+        if lock.get("test_accessed") is not False:
+            raise M2PersistenceError(f"Arm {arm} lock records test_accessed true.")
+        if lock.get("sealed_test_state") != "unopened":
+            raise M2PersistenceError(f"Arm {arm} lock reports the sealed test opened.")
+        if lock.get("memory_selected") is not None:
+            raise M2PersistenceError(f"Arm {arm} lock selects an arm.")
 
 
 # --------------------------------------------------------------------------
@@ -1032,28 +1301,46 @@ def finalize_and_promote_suite_result(
     run_root: Path,
     suite_id: str,
     *,
-    suite: dict[str, Any],
+    suite_body: dict[str, Any],
     runtime: RuntimeIntegrityRecord,
-    arm_run_dirs: dict[str, Path],
+    expected_suite_id: str | None = None,
 ) -> dict[str, Any]:
-    """Validate and atomically promote the one canonical suite result.
+    """Sign and atomically promote the one canonical suite result.
 
-    `M2_SUITE_RESULT.json` is claim-bearing in its own right, so it takes its
-    OWN PRE_PROMOTION observation -- never a reused arm observation. If either
-    arm is not COMPLETE there is no canonical suite, and if suite promotion
-    fails the two arm artifacts are retained for human review and nothing is
-    re-run automatically.
+    The sequence exists so the promoted artifact can PROVE its own promotion
+    gate rather than assert it:
+
+    1. the caller creates the suite record and records START;
+    2. every declaration is verified against the ACTUAL arm artifacts;
+    3. `M2_SUITE_RESULT.json` takes its OWN PRE_PROMOTION observation -- never
+       a reused arm observation;
+    4. every suite observation must be GREEN;
+    5. the complete runtime block is embedded in the payload;
+    6. `m2_suite_sha256` is computed only AFTER that block exists, so the
+       signature covers the promotion evidence;
+    7. the artifact is promoted atomically and re-validated from its bytes.
+
+    No observation is ever fabricated after hashing. If either arm is not
+    COMPLETE there is no canonical suite; if promotion fails, both arm
+    artifacts are retained for human review and nothing is re-run
+    automatically.
     """
     require_frozen_runtime_record(runtime)
-    validate_suite_result(suite)
+    if "m2_suite_sha256" in suite_body:
+        raise M2PersistenceError(
+            "The suite body must be unsigned here: a digest taken before the "
+            "suite's PRE_PROMOTION observation could never cover it."
+        )
 
-    for arm, run_dir in sorted(arm_run_dirs.items()):
-        for name in (ARM_RESULT_NAME, EXPERIMENT_LOCK_NAME):
-            if not (Path(run_dir) / name).is_file():
-                raise M2PersistenceError(
-                    f"Arm {arm} is not COMPLETE ({name} is absent); there is no "
-                    "canonical suite."
-                )
+    # Verify the aggregation against the real files BEFORE taking the
+    # promotion observation, so a mismatched arm never reaches the gate.
+    _verify_suite_against_arm_artifacts(
+        suite_body,
+        run_root=Path(run_root),
+        source_identity=validate_development_source_identity(
+            suite_body.get("development_source_identity")
+        ),
+    )
 
     check = observe_runtime_identity(
         EnforcementPoint.PRE_PROMOTION,
@@ -1068,6 +1355,20 @@ def finalize_and_promote_suite_result(
             "review, never deleted or blessed, and nothing is retried "
             "automatically."
         )
+    if not runtime.all_matched:
+        mismatch = runtime.first_mismatch()
+        raise RuntimeIntegrityError(
+            "Canonical suite evidence requires every runtime observation to "
+            f"match; {mismatch.enforcement_point!r} observed "
+            f"{mismatch.observed_digest}. The suite was NOT promoted."
+        )
+
+    suite = dict(suite_body)
+    suite["runtime_identity_checks"] = runtime.as_dict()
+    suite["m2_suite_sha256"] = canonical_sha256(suite)
+    validate_suite_result(
+        suite, run_root=Path(run_root), expected_suite_id=expected_suite_id
+    )
 
     directory = suite_directory(run_root, suite_id)
     directory.parent.mkdir(parents=True, exist_ok=True)
@@ -1079,7 +1380,11 @@ def finalize_and_promote_suite_result(
         ) from error
     path = directory / SUITE_RESULT_NAME
     write_json_atomic(path, suite)
-    validate_suite_result(read_json_result(path))
+    validate_suite_result(
+        read_json_result(path),
+        run_root=Path(run_root),
+        expected_suite_id=expected_suite_id,
+    )
     return suite
 
 
@@ -1259,6 +1564,7 @@ def finalize_and_promote_arm_result(
     # The RESULT owns its population identities; finalization extracts them
     # rather than accepting free-standing arguments that could disagree.
     populations = {field: result.get(field) for field in POPULATION_IDENTITY_FIELDS}
+    source_identity = result.get("development_source_identity")
 
     staging = claimed.staging_dir
     staging.mkdir(parents=True, exist_ok=True)
@@ -1340,6 +1646,7 @@ def finalize_and_promote_arm_result(
         execution_identity=execution_identity,
         runtime=runtime,
         population_identities=populations,
+        development_source_identity=source_identity,
         started_at=claimed.started_at,
         completed_at=_now(),
         artifact_sha256={ARM_RESULT_NAME: artifact_digest},
@@ -1350,6 +1657,10 @@ def finalize_and_promote_arm_result(
                 raise M2PersistenceError(
                     f"The lock's {field} differs from the result's."
                 )
+        if lock["development_source_identity"] != source_identity:
+            raise M2PersistenceError(
+                "The lock's development_source_identity differs from the result's."
+            )
     validate_canonical_run_lock(lock, requires_evaluation=requires_evaluation)
     write_json_atomic(claimed.run_dir / EXPERIMENT_LOCK_NAME, lock)
     validate_canonical_run_lock(

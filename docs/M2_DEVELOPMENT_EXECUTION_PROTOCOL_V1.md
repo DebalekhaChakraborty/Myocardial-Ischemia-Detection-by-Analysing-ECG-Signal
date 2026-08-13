@@ -101,8 +101,17 @@ imported by the canonical route, and no `TEST_ATTEMPT` is ever created.
 
 ## 4. One suite, two independent canonical attempts
 
-A shared `suite_id` names the run, and each arm gets its **own** immutable claim
-directory:
+The production suite identity is **immutable**:
+`CANONICAL_SUITE_ID = "m2-v1-development-two-arm"`. There is no public
+`suite_id` parameter and no CLI option that selects one, because a
+caller-chosen suite name would let a second "canonical" suite run under a
+different directory after the first was consumed. A non-canonical id is refused
+before claim checking, before any filesystem creation and before any VALIDATION
+access. A private `_suite_id` seam exists for synthetic tests only, and it still
+cannot bypass a consumed attempt: the pair preflight refuses any suite whose
+paths already exist.
+
+Each arm gets its **own** immutable claim directory:
 
 ```
 <run_root>/<suite_id>__M2-0     the M2-0 canonical attempt
@@ -165,12 +174,36 @@ runtime helper.
    separate PRE_PROMOTION observations for `M2_ARM_RESULT.json` and
    `M2_EXPERIMENT_LOCK.json`, atomic promotion.
 7. **SUITE.** One aggregating two-arm suite that expresses no retention
-   decision. `M2_SUITE_RESULT.json` is claim-bearing in its own right, so it
-   takes its **own** PRE_PROMOTION observation — never a reused arm
-   observation. If either arm is not COMPLETE there is no canonical suite; if
-   suite promotion fails, both arm artifacts are retained for human review and
-   nothing is re-run automatically. The suite computes no new scientific metric
-   and applies no preference: it aggregates two already-frozen arm results.
+   decision. It computes no new scientific metric and applies no preference: it
+   aggregates two already-frozen arm results. The sequence exists so the
+   promoted artifact can *prove* its own promotion gate rather than assert it:
+
+   1. create the suite `RuntimeIntegrityRecord` and record START;
+   2. build the aggregation body **unsigned**;
+   3. verify every declaration against the ACTUAL arm artifacts (below);
+   4. take a PRE_PROMOTION observation specifically for
+      `M2_SUITE_RESULT.json` — never a reused arm observation;
+   5. require every suite observation GREEN;
+   6. embed the complete suite runtime block into the payload;
+   7. compute `m2_suite_sha256` only **after** that block exists, so the
+      signature covers the promotion evidence;
+   8. promote atomically and re-validate from the persisted bytes.
+
+   No observation is ever fabricated after hashing. If either arm is not
+   COMPLETE there is no canonical suite; if suite promotion fails, both arm
+   artifacts are retained for human review and nothing is re-run automatically.
+
+   The suite is the immutable aggregation of two frozen arms, so its validator
+   proves the declarations against the files rather than trusting them: for
+   each arm the deterministic experiment id, the presence of the result and
+   lock, `sha256(M2_ARM_RESULT.json)` equal to the declared
+   `arm_result_sha256`, the lock's own `experiment_lock_sha256` equal to the
+   declared value, a full `validate_canonical_run_lock` against the real
+   directory, the lock's `artifact_sha256[M2_ARM_RESULT.json]` equal to the
+   promoted result's digest, the lock's arm and experiment id, the same
+   execution Git SHA as the suite, the same four population identities, the
+   same development-source identity, `test_accessed=false`,
+   `sealed_test_state="unopened"` and no arm selection.
 
 ## 6. Execution consent, the Git gate, and the deterministic roots
 
@@ -234,7 +267,26 @@ Prototype persistence is label-blind: the whole trajectory is written first, and
 stress annotations select points from it only afterwards. Annotations never
 decide which prototypes are kept.
 
-## 8. The result and lock contract
+## 8. Development-source identity coherence
+
+The receipt proving the raw `.hea`/`.dat`/`.stb` were the official frozen
+source is one identity, carried identically by every claim-bearing artifact:
+
+```
+arm result   development_source_identity
+  == stress_interval_selection_identity.development_source_identity
+  == arm lock development_source_identity      (explicit top-level provenance)
+  == suite     development_source_identity
+```
+
+It is validated as `identity_class = "m2_v1_development_source_integrity"`,
+`annotation_set = "stb"`, `test_partition_hashed = false`,
+`verified_before_stress_selection = true`, and both the feature and source
+receipts reporting `verification_result = "passed"`. The frozen split,
+feature-corpus and official-manifest identities remain bound inside those
+receipts; no second source-identity algorithm is invented.
+
+## 9. The result and lock contract
 
 A canonical arm result binds four separate identities — the single
 `evaluated_population_identity` that once stood for all of them is gone, because
@@ -252,14 +304,14 @@ that declaration must equal the arm result's own identity for that population. A
 section that borrows another's denominator, or declares none, is fatal. The
 experiment lock binds all four and must agree with the result exactly.
 
-## 9. Execution history is read, never asserted
+## 10. Execution history is read, never asserted
 
 No source constant records whether a canonical run has happened: source code
 cannot rewrite itself, so such a boolean could only ever become a lie.
 `canonical_execution_history()` reports run history from the canonical claim
 directories, the run-status files, the experiment locks and the suite result.
 
-## 10. What this protocol does not do
+## 11. What this protocol does not do
 
 It defines no metric, computes no value, selects no threshold and expresses no
 retention or rollback decision. It does not modify the frozen M2 gate protocol,
