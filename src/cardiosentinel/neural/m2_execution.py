@@ -243,6 +243,36 @@ def assert_label_firewall() -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
+SELECTION_SCOPE_FULL: Final = "full_partition"
+SELECTION_SCOPE_BOUNDED: Final = "bounded_subset"
+
+
+@dataclass(frozen=True, slots=True)
+class M2CanonicalPopulation:
+    """The AUTHORITY for what the full canonical evaluation population is.
+
+    Produced only by `M2InputBundle.canonical_input_population_identity()`,
+    which proves the bundle is the complete frozen partition before returning
+    one. Evaluation accepts this token instead of a caller-supplied digest, so
+    the reference can never be authored by the very rows being evaluated.
+    """
+
+    partition: str
+    row_count: int
+    ordered_stable_id_sha256: str
+    stream_cache_sha256: str
+    source: str = "verified_full_input_bundle"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "partition": self.partition,
+            "row_count": self.row_count,
+            "ordered_stable_id_sha256": self.ordered_stable_id_sha256,
+            "stream_cache_sha256": self.stream_cache_sha256,
+            "source": self.source,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class M2InputBundle:
     """Row-aligned, identity-checked, label-blind canonical inputs."""
@@ -252,16 +282,37 @@ class M2InputBundle:
     stable_ids: tuple[str, ...]
     standardizer: M1DistanceStandardizer
     stream_cache_manifest: dict[str, Any]
+    selection_scope: str = SELECTION_SCOPE_FULL
+
+    @property
+    def is_full_partition(self) -> bool:
+        return self.selection_scope == SELECTION_SCOPE_FULL
+
+    def selected_ordered_stable_id_sha256(self) -> str:
+        """The digest of THIS bundle's own selected rows.
+
+        Deliberately distinct from the manifest's identity: when `record_ids`
+        filtered the bundle, reporting the manifest digest would describe rows
+        the bundle does not contain.
+        """
+        from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+        return ordered_stable_id_digest(self.stable_ids)
 
     def identity(self) -> dict[str, Any]:
         return {
             "partition": self.partition,
             "rows": len(self.rows),
+            "selection_scope": self.selection_scope,
+            "selected_row_count": len(self.stable_ids),
+            "selected_ordered_stable_id_sha256": (
+                self.selected_ordered_stable_id_sha256()
+            ),
             "stream_cache_sha256": self.stream_cache_manifest["stream_cache_sha256"],
             "ordered_chronology_sha256": self.stream_cache_manifest[
                 "ordered_chronology_sha256"
             ],
-            "ordered_stable_id_sha256": self.stream_cache_manifest[
+            "manifest_ordered_stable_id_sha256": self.stream_cache_manifest[
                 "ordered_stable_id_sha256"
             ],
             "split_sha256": self.stream_cache_manifest["split_sha256"],
@@ -275,6 +326,42 @@ class M2InputBundle:
             "labels_present": False,
             "subject_identifiers_present": False,
         }
+
+    def canonical_input_population_identity(self) -> M2CanonicalPopulation:
+        """Prove this bundle IS the full frozen partition, then vouch for it.
+
+        Refuses a bounded/selected bundle, refuses a row count that disagrees
+        with the frozen manifest's `full_stream_row_count`, and refuses a
+        selected-row digest that differs from the manifest's frozen
+        `ordered_stable_id_sha256`. Only a bundle that survives all three may
+        define the canonical evaluation population.
+        """
+        if not self.is_full_partition:
+            raise M2ExecutionError(
+                f"A canonical population requires the full partition; this "
+                f"bundle is {self.selection_scope!r}. A bounded or "
+                "record-filtered bundle can never define canonical scope."
+            )
+        expected_rows = int(self.stream_cache_manifest["full_stream_row_count"])
+        if len(self.stable_ids) != expected_rows:
+            raise M2ExecutionError(
+                f"Full-partition bundle holds {len(self.stable_ids)} rows, but "
+                f"the frozen manifest records {expected_rows}."
+            )
+        observed = self.selected_ordered_stable_id_sha256()
+        frozen = self.stream_cache_manifest["ordered_stable_id_sha256"]
+        if observed != frozen:
+            raise M2ExecutionError(
+                "The bundle's ordered stable-ID digest does not match the "
+                f"frozen manifest identity: observed {observed}, frozen "
+                f"{frozen}."
+            )
+        return M2CanonicalPopulation(
+            partition=self.partition,
+            row_count=expected_rows,
+            ordered_stable_id_sha256=frozen,
+            stream_cache_sha256=self.stream_cache_manifest["stream_cache_sha256"],
+        )
 
 
 def load_distance_standardizer(cache_root: Path) -> M1DistanceStandardizer:
@@ -367,6 +454,9 @@ def assemble_timeline_rows(
         stable_ids=tuple(str(value) for value in stable_ids[selected]),
         standardizer=standardizer,
         stream_cache_manifest=dict(manifest),
+        selection_scope=(
+            SELECTION_SCOPE_FULL if record_ids is None else SELECTION_SCOPE_BOUNDED
+        ),
     )
 
 
@@ -501,6 +591,7 @@ def train_integration_smoke(
         stable_ids=tuple(bounded_ids),
         standardizer=bundle.standardizer,
         stream_cache_manifest=bundle.stream_cache_manifest,
+        selection_scope=SELECTION_SCOPE_BOUNDED,
     )
 
     scorer = load_frozen_m1l_scorer(Path(m1_run_root))

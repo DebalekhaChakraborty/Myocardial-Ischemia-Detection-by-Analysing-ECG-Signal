@@ -58,36 +58,6 @@ POPULATION_SCOPE_FULL: Final = "full_population"
 POPULATION_SCOPE_SUPPORTING_SUBSET: Final = "supporting_subset"
 
 
-def canonical_population_digest(keys: Iterable[EvaluationKey]) -> str:
-    """The frozen ordered-stable-ID digest of an evaluation population.
-
-    Reuses the repository's existing ordered-stable-ID identity rather than
-    introducing another algorithm, so an evaluated population is expressed in
-    exactly the same terms as every other frozen row identity.
-    """
-    from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
-
-    return ordered_stable_id_digest([stable_id_for_key(key) for key in sorted(keys)])
-
-
-def canonical_replay_population_digest(evidence: Iterable[M2RowEvidence]) -> str:
-    """The expected full-population identity, derived from the canonical replay.
-
-    This is the reference a headline claim must match. It is computed from the
-    replay's own evidence, independently of whatever annotation table a caller
-    later supplies, which is what makes a self-consistent subset unable to
-    masquerade as the full development population.
-    """
-    return canonical_population_digest(evaluation_key(row) for row in evidence)
-
-
-HEADLINE_EVIDENCE_FUNCTIONS: Final = (
-    "window_evidence",
-    "false_alarm_evidence",
-    "cold_start_stratified_evidence",
-)
-
-
 class M2EvaluationError(RuntimeError):
     """Raised when post-replay evaluation cannot proceed with integrity."""
 
@@ -120,9 +90,18 @@ def require_frozen_m1l_classification_threshold(threshold: float) -> float:
     return value
 
 
-# --------------------------------------------------------------------------
-# Identity-keyed post-replay annotation join
-# --------------------------------------------------------------------------
+def _observed_population_digest(keys: Iterable[EvaluationKey]) -> str:
+    """The frozen ordered-stable-ID digest of an evaluation population.
+
+    Internal on purpose. It DESCRIBES a population; it can never AUTHORISE one.
+    The canonical reference comes from
+    `M2InputBundle.canonical_input_population_identity()`, which proves against
+    the frozen stream-cache manifest -- so the rows being evaluated can never
+    author the standard they are judged against.
+    """
+    from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+    return ordered_stable_id_digest([stable_id_for_key(key) for key in sorted(keys)])
 
 
 def evaluation_key(row: M2RowEvidence) -> EvaluationKey:
@@ -180,7 +159,8 @@ class M2EvaluationBundle:
     annotations: tuple[M2AnnotationRow, ...]
     population_scope: str = POPULATION_SCOPE_SUPPORTING_SUBSET
     population_verified_against_canonical_replay: bool = False
-    expected_population_digest: str | None = None
+    canonical_population_source: str | None = None
+    canonical_population_digest: str | None = None
 
     @property
     def is_full_population(self) -> bool:
@@ -232,7 +212,8 @@ class M2EvaluationBundle:
             "population_verified_against_canonical_replay": (
                 self.population_verified_against_canonical_replay
             ),
-            "expected_population_digest": self.expected_population_digest,
+            "canonical_population_source": self.canonical_population_source,
+            "canonical_population_digest": self.canonical_population_digest,
         }
 
 
@@ -241,7 +222,7 @@ def build_evaluation_bundle(
     evidence: Sequence[M2RowEvidence],
     annotations: Iterable[M2AnnotationRow],
     *,
-    expected_population_digest: str | None = None,
+    canonical_population: Any | None = None,
     require_full_population: bool = True,
 ) -> M2EvaluationBundle:
     """Join evidence to annotations by identity, refusing every ambiguity.
@@ -308,24 +289,40 @@ def build_evaluation_bundle(
     # that subset, and still be internally consistent. Full scope therefore
     # requires the population to match the canonical replay population digest,
     # which is computed independently of this annotation table.
+    # Full scope is granted ONLY by the canonical input authority. A caller
+    # cannot hand in a digest computed from these very rows: the reference is a
+    # token that `M2InputBundle.canonical_input_population_identity()` issues
+    # after proving the bundle is the complete frozen partition.
     scope = POPULATION_SCOPE_SUPPORTING_SUBSET
     verified = False
-    observed_digest = canonical_population_digest(keys)
+    source = None
+    reference_digest = None
+    observed_digest = _observed_population_digest(keys)
+
     if require_full_population:
-        if expected_population_digest is None:
+        if canonical_population is None:
             raise M2EvaluationError(
-                "A full-population evaluation bundle requires "
-                "expected_population_digest, the canonical replay population "
-                "identity. Without it, full scope cannot be verified and would "
-                "rest on the caller's assertion alone; pass "
+                "A full-population evaluation bundle requires the canonical "
+                "population authority from the verified full M2 input bundle "
+                "(M2InputBundle.canonical_input_population_identity()). Full "
+                "scope may never rest on a caller-supplied digest; pass "
                 "require_full_population=False for supporting evidence."
             )
-        if observed_digest != expected_population_digest:
+        source = getattr(canonical_population, "source", None)
+        if source != "verified_full_input_bundle":
             raise M2EvaluationError(
-                "The evaluated population does not match the canonical replay "
-                f"population: observed {observed_digest}, expected "
-                f"{expected_population_digest}. A self-consistent subset is not "
-                "a full-population claim."
+                "The canonical population reference must come from a verified "
+                f"full input bundle; received source {source!r}."
+            )
+        reference_digest = getattr(
+            canonical_population, "ordered_stable_id_sha256", None
+        )
+        if observed_digest != reference_digest:
+            raise M2EvaluationError(
+                "The evaluated population does not match the canonical input "
+                f"population: observed {observed_digest}, canonical "
+                f"{reference_digest}. A self-consistent subset is not a "
+                "full-population claim."
             )
         scope = POPULATION_SCOPE_FULL
         verified = True
@@ -337,7 +334,8 @@ def build_evaluation_bundle(
         annotations=tuple(annotation_index[key] for key in keys),
         population_scope=scope,
         population_verified_against_canonical_replay=verified,
-        expected_population_digest=expected_population_digest,
+        canonical_population_source=source,
+        canonical_population_digest=reference_digest,
     )
 
 

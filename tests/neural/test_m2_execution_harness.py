@@ -133,6 +133,52 @@ def _green_runtime() -> S.RuntimeIntegrityRecord:
     return _frozen_runtime_record()
 
 
+def _canonical_population_token(evidence):
+    """A canonical authority token for synthetic evidence.
+
+    Real runs obtain this from `M2InputBundle.canonical_input_population_
+    identity()`, which proves the bundle against the frozen manifest. Tests
+    construct an equivalent token for synthetic rows; the point under test is
+    that evaluation accepts ONLY a token, never a caller-computed digest.
+    """
+    from cardiosentinel.neural.m2_evaluation import _observed_population_digest
+
+    keys = [V.evaluation_key(row) for row in evidence]
+    return X.M2CanonicalPopulation(
+        partition="train",
+        row_count=len(keys),
+        ordered_stable_id_sha256=_observed_population_digest(keys),
+        stream_cache_sha256="c" * 64,
+    )
+
+
+def _full_result(population, arm="M2-G"):
+    """A complete canonical arm result payload."""
+    section = {"population_identity": population}
+    return {
+        "artifact_class": PS.ARM_RESULT_CLASS,
+        "arm": arm,
+        "scientific_computation_completed": True,
+        "label_blind_replay_completed": True,
+        "m1l_classification_threshold": SC.M1L_CLASSIFICATION_THRESHOLD,
+        "threshold_selected_here": False,
+        "classifier_retrained": False,
+        "memory_selection_performed": False,
+        "memory_selected": None,
+        "rollback": False,
+        "partition_accessed": "train",
+        "evaluated_population_identity": population,
+        "validation_accessed": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "policy_evidence": {"update_admission_fraction": 0.2},
+        "window_evidence": dict(section),
+        "false_alarm_evidence": dict(section),
+        "cold_start_evidence": dict(section),
+        "contamination_evidence": {"intervals": []},
+    }
+
+
 # --------------------------------------------------------------------------
 # 1-4. Frozen identities accepted; altered identities rejected
 # --------------------------------------------------------------------------
@@ -706,9 +752,11 @@ def _paired_bundle(count=4):
                 subject=f"subj-{index % 2}",
             )
         )
-    expected = V.canonical_replay_population_digest(evidence)
     return V.build_evaluation_bundle(
-        "M2-G", evidence, annotations, expected_population_digest=expected
+        "M2-G",
+        evidence,
+        annotations,
+        canonical_population=_canonical_population_token(evidence),
     )
 
 
@@ -768,15 +816,12 @@ def test_permuted_annotation_ordering_is_realigned_by_identity_not_position():
         _annotation(start_sample=0, label=0, subject="a"),
         _annotation(start_sample=1250, label=1, subject="b"),
     ]
-    expected = V.canonical_replay_population_digest(evidence)
+    token = _canonical_population_token(evidence)
     bundle_ordered = V.build_evaluation_bundle(
-        "M2-G", evidence, ordered, expected_population_digest=expected
+        "M2-G", evidence, ordered, canonical_population=token
     )
     bundle_permuted = V.build_evaluation_bundle(
-        "M2-G",
-        evidence,
-        list(reversed(ordered)),
-        expected_population_digest=expected,
+        "M2-G", evidence, list(reversed(ordered)), canonical_population=token
     )
     # Identity, not order, decides the pairing.
     assert bundle_ordered.keys == bundle_permuted.keys
@@ -970,7 +1015,7 @@ def test_result_provenance_binds_the_evaluated_population_identity():
         "M2-G",
         single,
         [_annotation(start_sample=0)],
-        expected_population_digest=V.canonical_replay_population_digest(single),
+        canonical_population=_canonical_population_token(single),
     )
     assert (
         other.population_identity()["evaluated_ordered_stable_id_sha256"]
@@ -1229,10 +1274,9 @@ def test_completion_mismatch_prevents_canonical_complete_promotion(
     with pytest.raises(S.RuntimeIntegrityError, match="COMPLETION"):
         PS.finalize_and_promote_arm_result(
             claimed,
-            result=_claim_bearing_result(population=population),
+            result=_full_result(population),
             execution_identity=_execution_identity(),
             runtime=runtime,
-            evaluated_population_identity=population,
             requires_evaluation=True,
         )
 
@@ -1259,10 +1303,9 @@ def test_all_three_enforcement_points_appear_in_the_finalized_block(
     population = _paired_bundle().population_identity()
     status = PS.finalize_and_promote_arm_result(
         claimed,
-        result=_claim_bearing_result(population=population),
+        result=_full_result(population),
         execution_identity=_execution_identity(),
         runtime=runtime,
-        evaluated_population_identity=population,
         requires_evaluation=True,
     )
     assert status["status"] == PS.STATUS_COMPLETE
@@ -1349,15 +1392,21 @@ def test_claim_bearing_result_requires_population_identity_when_evaluated(
 ):
     runtime = frozen_runtime
     claimed = PS.claim_run_directory(tmp_path, "M2_no_pop", "M2-G", runtime=runtime)
+    # An otherwise-complete result whose population identity is absent.
+    result = {
+        **_full_result(_paired_bundle().population_identity()),
+        "evaluated_population_identity": None,
+    }
     with pytest.raises(PS.M2PersistenceError, match="evaluated_population_identity"):
         PS.finalize_and_promote_arm_result(
             claimed,
-            result=_claim_bearing_result(population=None),
+            result=result,
             execution_identity=_execution_identity(),
             runtime=runtime,
             requires_evaluation=True,
         )
     assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
+    assert not (claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).exists()
 
 
 # --- 11-14. headline metrics require full-population bundles --------------
@@ -1564,17 +1613,14 @@ def test_changing_one_result_byte_invalidates_the_lock_binding(tmp_path):
 def test_self_consistent_subset_cannot_claim_full_population():
     """§8.15 -- the exact bypass: subset first, annotate the subset, claim full."""
     full_evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
-    canonical = V.canonical_replay_population_digest(full_evidence)
+    canonical = _canonical_population_token(full_evidence)
 
     subset_evidence = full_evidence[:2]
     subset_annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
     # Evidence and annotations cover each other perfectly...
     with pytest.raises(V.M2EvaluationError, match="does not match the canonical"):
         V.build_evaluation_bundle(
-            "M2-G",
-            subset_evidence,
-            subset_annotations,
-            expected_population_digest=canonical,
+            "M2-G", subset_evidence, subset_annotations, canonical_population=canonical
         )
 
 
@@ -1582,30 +1628,61 @@ def test_full_population_requires_the_canonical_digest_to_be_supplied():
     """Full scope cannot rest on the caller's assertion alone."""
     evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
     annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
-    with pytest.raises(
-        V.M2EvaluationError, match="requires expected_population_digest"
-    ):
+    with pytest.raises(V.M2EvaluationError, match="canonical population authority"):
         V.build_evaluation_bundle("M2-G", evidence, annotations)
 
 
-def test_subset_digest_is_rejected_as_the_headline_population():
-    """§8.16 -- a subset's own digest is not the canonical population."""
+def test_subset_cannot_self_author_its_expected_digest(monkeypatch):
+    """§3/§4 -- the exact bypass must RAISE, not merely compare unfavourably.
+
+    The previous version of this test built the bundle successfully and only
+    compared digests afterwards, which proved nothing about refusal. The
+    public API no longer accepts a caller-computed digest at all, so the
+    bypass cannot even be expressed: full scope requires the canonical
+    authority token.
+    """
+    import inspect
+
+    from cardiosentinel.neural.m2_evaluation import _observed_population_digest
+
     full_evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
     subset_evidence = full_evidence[:2]
     subset_annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
-    subset_digest = V.canonical_replay_population_digest(subset_evidence)
 
-    # Passing the subset's own digest builds a bundle that is internally
-    # consistent, but its identity is demonstrably not the full population's.
-    bundle = V.build_evaluation_bundle(
-        "M2-G",
-        subset_evidence,
-        subset_annotations,
-        expected_population_digest=subset_digest,
-    )
-    assert bundle.population_identity()[
-        "evaluated_ordered_stable_id_sha256"
-    ] != V.canonical_replay_population_digest(full_evidence)
+    # 1. There is no public digest-authoring helper any more.
+    assert not hasattr(V, "canonical_replay_population_digest")
+    # 2. The parameter that once accepted a raw digest is gone.
+    parameters = set(inspect.signature(V.build_evaluation_bundle).parameters)
+    assert "expected_population_digest" not in parameters
+    assert "canonical_population" in parameters
+
+    # 3. Handing in a self-authored, non-authoritative reference is refused.
+    forged = type(
+        "ForgedPopulation",
+        (),
+        {
+            "source": "caller_supplied",
+            "ordered_stable_id_sha256": _observed_population_digest(
+                [V.evaluation_key(row) for row in subset_evidence]
+            ),
+        },
+    )()
+    with pytest.raises(V.M2EvaluationError, match="verified full input bundle"):
+        V.build_evaluation_bundle(
+            "M2-G",
+            subset_evidence,
+            subset_annotations,
+            canonical_population=forged,
+        )
+
+    # 4. And a genuine token for the FULL population refuses the subset.
+    with pytest.raises(V.M2EvaluationError, match="does not match the canonical"):
+        V.build_evaluation_bundle(
+            "M2-G",
+            subset_evidence,
+            subset_annotations,
+            canonical_population=_canonical_population_token(full_evidence),
+        )
 
 
 def test_exact_full_replay_population_digest_is_accepted():
@@ -1616,7 +1693,7 @@ def test_exact_full_replay_population_digest_is_accepted():
         "M2-G",
         evidence,
         annotations,
-        expected_population_digest=V.canonical_replay_population_digest(evidence),
+        canonical_population=_canonical_population_token(evidence),
     )
     assert bundle.population_scope == V.POPULATION_SCOPE_FULL
     assert bundle.population_verified_against_canonical_replay is True
@@ -1644,3 +1721,289 @@ def test_supporting_subset_remains_usable_for_supporting_evidence():
     # And its identity is refused as a headline claim-bearing population.
     with pytest.raises(PS.M2PersistenceError):
         PS.validate_evaluated_population_identity(subset.population_identity())
+
+
+# --------------------------------------------------------------------------
+# Human final result-contract review:
+#   canonical population authority, result payload contract, and a separate
+#   PRE_PROMOTION observation for the experiment lock.
+# --------------------------------------------------------------------------
+
+
+def _input_bundle(rows, stable_ids, *, scope, manifest_extra=None):
+    manifest = {
+        "partition": "train",
+        "full_stream_row_count": len(stable_ids),
+        "ordered_stable_id_sha256": "0" * 64,
+        "stream_cache_sha256": "c" * 64,
+        "ordered_chronology_sha256": "d" * 64,
+        "split_sha256": SYNTHETIC_SHA,
+        "feature_corpus_sha256": SYNTHETIC_SHA,
+        "representation_dim": 146,
+        "distance_standardizer_sha256": SYNTHETIC_SHA,
+        **(manifest_extra or {}),
+    }
+    return X.M2InputBundle(
+        partition="train",
+        rows=tuple(rows),
+        stable_ids=tuple(stable_ids),
+        standardizer=None,
+        stream_cache_manifest=manifest,
+        selection_scope=scope,
+    )
+
+
+# --- §11.1-3 bounded vs full input semantics -----------------------------
+
+
+def test_record_filtered_input_bundle_is_explicitly_non_full():
+    """§11.1 -- a bounded bundle cannot define canonical scope."""
+    ids = ["ltstdb:s1:0:0:2500"]
+    bundle = _input_bundle([], ids, scope=X.SELECTION_SCOPE_BOUNDED)
+    assert bundle.is_full_partition is False
+    assert bundle.identity()["selection_scope"] == X.SELECTION_SCOPE_BOUNDED
+    with pytest.raises(X.M2ExecutionError, match="requires the full partition"):
+        bundle.canonical_input_population_identity()
+
+
+def test_full_bundle_row_count_must_equal_the_manifest():
+    """§11.2 -- a row-count disagreement with the frozen manifest is fatal."""
+    ids = ["ltstdb:s1:0:0:2500", "ltstdb:s1:0:1250:3750"]
+    bundle = _input_bundle(
+        [],
+        ids,
+        scope=X.SELECTION_SCOPE_FULL,
+        manifest_extra={"full_stream_row_count": 99},
+    )
+    with pytest.raises(X.M2ExecutionError, match="frozen manifest records"):
+        bundle.canonical_input_population_identity()
+
+
+def test_full_bundle_digest_must_equal_the_frozen_manifest_identity():
+    """§11.3 -- the bundle's own digest must match the frozen manifest."""
+    ids = ["ltstdb:s1:0:0:2500", "ltstdb:s1:0:1250:3750"]
+    bundle = _input_bundle([], ids, scope=X.SELECTION_SCOPE_FULL)
+    with pytest.raises(X.M2ExecutionError, match="does not match the frozen manifest"):
+        bundle.canonical_input_population_identity()
+
+    # With the true digest recorded, the authority is issued.
+    from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+    good = _input_bundle(
+        [],
+        ids,
+        scope=X.SELECTION_SCOPE_FULL,
+        manifest_extra={"ordered_stable_id_sha256": ordered_stable_id_digest(ids)},
+    )
+    token = good.canonical_input_population_identity()
+    assert token.source == "verified_full_input_bundle"
+    assert token.row_count == 2
+
+
+def test_bounded_bundle_reports_its_own_digest_not_the_manifest():
+    """A filtered bundle must not report the manifest identity as its own."""
+    ids = ["ltstdb:s1:0:0:2500"]
+    bundle = _input_bundle([], ids, scope=X.SELECTION_SCOPE_BOUNDED)
+    identity = bundle.identity()
+    assert identity["selected_row_count"] == 1
+    assert (
+        identity["selected_ordered_stable_id_sha256"]
+        != identity["manifest_ordered_stable_id_sha256"]
+    )
+
+
+# --- §11.7-9 the result payload contract ---------------------------------
+
+
+def test_minimal_result_fails_through_the_real_finalization_path(
+    tmp_path, frozen_runtime
+):
+    """§7/§11.7 -- {"arm": "M2-G"} must not become canonical."""
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_minimal", "M2-G", runtime=frozen_runtime
+    )
+    with pytest.raises(PS.M2PersistenceError, match="missing required fields"):
+        PS.finalize_and_promote_arm_result(
+            claimed,
+            result={"arm": "M2-G"},
+            execution_identity=_execution_identity(),
+            runtime=frozen_runtime,
+            requires_evaluation=True,
+        )
+    assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
+    assert not (claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).exists()
+    status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
+    assert status["status"] == PS.STATUS_STARTED
+    assert status["claim_bearing_result_promoted"] is False
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        "policy_evidence",
+        "window_evidence",
+        "false_alarm_evidence",
+        "cold_start_evidence",
+        "contamination_evidence",
+        "scientific_computation_completed",
+        "evaluated_population_identity",
+    ],
+)
+def test_result_missing_any_mandatory_section_fails(tmp_path, frozen_runtime, section):
+    """§11.8-9 -- each mandatory section is individually required."""
+    claimed = PS.claim_run_directory(
+        tmp_path, f"M2_missing_{section}", "M2-G", runtime=frozen_runtime
+    )
+    result = _full_result(_paired_bundle().population_identity())
+    del result[section]
+    with pytest.raises(PS.M2PersistenceError):
+        PS.finalize_and_promote_arm_result(
+            claimed,
+            result=result,
+            execution_identity=_execution_identity(),
+            runtime=frozen_runtime,
+            requires_evaluation=True,
+        )
+    assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
+    assert not (claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).exists()
+
+
+def test_empty_mandatory_section_is_rejected():
+    """An omitted section may not be smuggled in as an empty object."""
+    result = _full_result(_paired_bundle().population_identity())
+    result["window_evidence"] = {}
+    with pytest.raises(PS.M2PersistenceError, match="protocol-valid exclusion"):
+        PS.validate_claim_bearing_arm_result_payload(result)
+
+
+# --- §11.10-11 result / lock / section population coherence ---------------
+
+
+def test_section_population_identity_must_agree_with_the_result(tmp_path):
+    """§11.11 -- metrics and the declared population must describe same rows."""
+    population = _paired_bundle().population_identity()
+    result = _full_result(population)
+    other = dict(population)
+    other["evaluated_rows"] = population["evaluated_rows"] + 1
+    result["window_evidence"] = {"population_identity": other}
+    with pytest.raises(PS.M2PersistenceError, match="differs from"):
+        PS.validate_claim_bearing_arm_result_payload(result)
+
+
+def test_result_and_lock_population_identities_are_identical(tmp_path, frozen_runtime):
+    """§11.10 -- the lock copies the result's identity; they cannot disagree."""
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_coherent", "M2-G", runtime=frozen_runtime
+    )
+    population = _paired_bundle().population_identity()
+    PS.finalize_and_promote_arm_result(
+        claimed,
+        result=_full_result(population),
+        execution_identity=_execution_identity(),
+        runtime=frozen_runtime,
+        requires_evaluation=True,
+    )
+    promoted = json.loads((claimed.run_dir / PS.ARM_RESULT_NAME).read_text())
+    lock = json.loads((claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).read_text())
+    assert (
+        promoted["evaluated_population_identity"]
+        == lock["evaluated_population_identity"]
+        == population
+    )
+
+
+# --- §11.12-16 separate promotion observations ----------------------------
+
+
+def test_result_and_lock_each_have_their_own_pre_promotion_check(
+    tmp_path, frozen_runtime
+):
+    """§11.12-14 -- two claim-bearing artifacts, two observations."""
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_two_checks", "M2-G", runtime=frozen_runtime
+    )
+    PS.finalize_and_promote_arm_result(
+        claimed,
+        result=_full_result(_paired_bundle().population_identity()),
+        execution_identity=_execution_identity(),
+        runtime=frozen_runtime,
+        requires_evaluation=True,
+    )
+    details = [check.detail for check in frozen_runtime.checks]
+    assert PS.CLAIM_DIRECTORY_PROMOTION_DETAIL in details
+    assert f"promote:{PS.ARM_RESULT_NAME}" in details
+    assert f"promote:{PS.EXPERIMENT_LOCK_NAME}" in details
+    points = [check.enforcement_point for check in frozen_runtime.checks]
+    assert points.count("pre_promotion") == 3
+    assert "start" in points and "completion" in points
+
+
+def test_lock_binds_its_own_promotion_observation(tmp_path, frozen_runtime):
+    """§11.15-16 -- the lock records the lock-promotion check it was gated by.
+
+    The observation is taken BEFORE the lock is built, so it genuinely appears
+    in `runtime_identity_checks` and the self-digest covers it. It is never
+    fabricated after the fact.
+    """
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_lock_binds", "M2-G", runtime=frozen_runtime
+    )
+    PS.finalize_and_promote_arm_result(
+        claimed,
+        result=_full_result(_paired_bundle().population_identity()),
+        execution_identity=_execution_identity(),
+        runtime=frozen_runtime,
+        requires_evaluation=True,
+    )
+    lock = json.loads((claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).read_text())
+    recorded = [c["detail"] for c in lock["runtime_identity_checks"]["checks"]]
+    assert f"promote:{PS.EXPERIMENT_LOCK_NAME}" in recorded
+
+    # The self-digest covers that block: recomputing over the body matches.
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    body = {k: v for k, v in lock.items() if k != "experiment_lock_sha256"}
+    assert lock["experiment_lock_sha256"] == canonical_sha256(body)
+    PS.validate_canonical_run_lock(lock, run_dir=claimed.run_dir)
+
+
+def test_lock_promotion_mismatch_leaves_the_run_non_canonical(
+    tmp_path, frozen_runtime, monkeypatch
+):
+    """§10 -- a lock-promotion failure never yields COMPLETE/canonical."""
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_lock_fail", "M2-G", runtime=frozen_runtime
+    )
+
+    def observe(point, *, expected_digest=FROZEN_DIGEST, detail=None):
+        value = S.EnforcementPoint(point).value
+        if detail == f"promote:{PS.EXPERIMENT_LOCK_NAME}":
+            return S.RuntimeCheck(
+                enforcement_point=value,
+                observed_digest="7" * 64,
+                expected_digest=FROZEN_DIGEST,
+                matches=False,
+                package_count=71,
+                observed_at="2026-01-01T00:00:00Z",
+                detail=detail,
+            )
+        return _synthetic_frozen_check(value, detail or "test")
+
+    monkeypatch.setattr(PS, "observe_runtime_identity", observe)
+    with pytest.raises(S.RuntimeIntegrityError, match="experiment-lock promotion"):
+        PS.finalize_and_promote_arm_result(
+            claimed,
+            result=_full_result(_paired_bundle().population_identity()),
+            execution_identity=_execution_identity(),
+            runtime=frozen_runtime,
+            requires_evaluation=True,
+        )
+    # No lock, run not COMPLETE, already-promoted evidence preserved.
+    assert not (claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).exists()
+    status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
+    assert status["status"] == PS.STATUS_FAILED
+    assert status["canonical"] is False
+    failure = json.loads((claimed.run_dir / PS.RUNTIME_FAILURE_NAME).read_text())
+    assert failure["canonical_promotion_invalidated"] is True
+    assert failure["automatic_retry_performed"] is False
+    assert (claimed.run_dir / PS.ARM_RESULT_NAME).exists()  # preserved, not deleted
