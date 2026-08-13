@@ -22,6 +22,20 @@ No VALIDATION or TEST partition is referenced anywhere in this module. No
 frozen document is written. This module only prints a comparison against the
 frozen receipt and `m2_gate.py`; freezing a corrected receipt is a separate,
 explicitly authorized step.
+
+Every receipt-bound quantity is reproduced using the SAME arithmetic path
+the original, uncommitted derivation session used (recovered read-only from
+its Claude Code session transcript): `g3_sqi.combined_train_rejection_fraction`
+via `1.0 - mean(pass_mask)`, `train_only_sanity.refusal_fractions.*` via a
+direct `mean(fail_mask)`, and the G4 descriptive distribution via a dedicated
+batch-4096 forward pass over only the PRIMARY TRAIN background-negative
+population -- not as a subset of the full-timeline pass. These are not
+simplifications of each other: they are float-nonidentical (subtraction
+rounding, and batch-composition-dependent GEMM reduction order) even though
+every one of them reflects the exact same underlying row-level evidence.
+Reproducing the historical path bit-exactly, rather than a cleaner-looking
+equivalent, is what lets this module use strict equality with zero
+tolerance anywhere.
 """
 
 from __future__ import annotations
@@ -57,6 +71,7 @@ from cardiosentinel.neural.m1_store import (
     REPRESENTATION_FILE,
     STABLE_ID_FILE,
     START_SAMPLE_FILE,
+    locate_rows,
 )
 from cardiosentinel.neural.p1_experiment import load_p1_embedding_cache
 from cardiosentinel.neural.patient_memory import (
@@ -87,6 +102,17 @@ COMBINED_NEEDED_COLUMNS: Final = GATE.G3_SQI_COLUMNS + (
     "finite_sample_fraction",
     "morphology_valid",
 )
+
+# The historical g4.json derivation scored the 280,839-row PRIMARY TRAIN
+# background-negative population in one dedicated batched pass at this batch
+# size, gathered in P1-embedding-cache row order. This is not a tunable
+# knob: probing batch sizes {1, 4096, 8192, 280839} against the frozen
+# receipt showed the descriptive minimum reproduces bit-exactly at 1, 4096
+# and 8192, and only diverges (at the ULP-to-few-ULP level, via GEMM
+# reduction-order sensitivity near sigmoid's tail) when the whole 280,839-row
+# population is scored as a single batch. 4096 is reproduced here because it
+# is what the original derivation actually used.
+G4_HISTORICAL_BATCH_SIZE: Final = 4096
 
 
 class M2GateDerivationError(RuntimeError):
@@ -430,12 +456,21 @@ def derive_g3(columns: dict[str, np.ndarray]) -> dict[str, Any]:
             values, {0.50: "median", 0.95: "q95", 0.99: "q99"}
         )
     combined_fail = per_column_fail | ~finite_ok
+    pass_mask = ~combined_fail
+    # The historical derivation computed this field as `1.0 - mean(pass_mask)`
+    # (sqi.json) while `train_only_sanity.refusal_fractions.sqi` was computed,
+    # in a separate script (sanity.json), as `mean(fail_mask)` on an
+    # independently-rebuilt but set-identical mask. The two are mathematically
+    # equal but not float-identical (subtraction rounding), and the frozen
+    # receipt already carries both values as originally produced -- so both
+    # formulas are reproduced here explicitly rather than collapsed to one.
     return {
         "bounds": bounds,
         "single_feature_rejection_fraction": single_rejection,
-        "combined_rejection_fraction": float(np.mean(combined_fail)),
+        "combined_rejection_fraction": float(1.0 - np.mean(pass_mask)),
+        "direct_fail_mean": float(np.mean(combined_fail)),
         "descriptive_distribution": descriptive,
-        "pass_mask": ~combined_fail,
+        "pass_mask": pass_mask,
     }
 
 
@@ -444,18 +479,57 @@ def derive_g3(columns: dict[str, np.ndarray]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 
 
-def derive_g4(
-    scores: np.ndarray, background_negative_mask: np.ndarray
-) -> dict[str, Any]:
-    population = scores[background_negative_mask]
+def score_background_negative_population(
+    head: torch.nn.Module, store, cache
+) -> np.ndarray:
+    """Reproduce the historical g4.json scoring path exactly.
+
+    A dedicated forward pass over just the 280,839-row PRIMARY TRAIN
+    background-negative population, gathered via `locate_rows` in
+    P1-embedding-cache row order and batched at `G4_HISTORICAL_BATCH_SIZE`.
+    Scoring this same population as a subset of a full-timeline pass (as an
+    earlier version of this module did) changes GEMM reduction order and
+    shifts the descriptive minimum by a few ULP; this path is required for
+    the receipt's G4 descriptive statistics to reproduce bit-exactly.
+    """
+    negative_ids = [
+        stable_id
+        for stable_id, label in zip(cache.stable_ids, cache.labels, strict=True)
+        if int(label) == 0
+    ]
+    positions = locate_rows(store, negative_ids)
+    base = np.asarray(store.gather(REPRESENTATION_FILE, positions), dtype=np.float32)
+    d_long = np.asarray(store.gather(D_LONG_FILE, positions), dtype=np.float32).reshape(
+        -1, 1
+    )
+    features = np.concatenate([base, d_long], axis=1).astype(np.float32)
+    if not np.all(np.isfinite(features)):
+        raise M2GateDerivationError(
+            "G4 background-negative feature matrix contains a non-finite value."
+        )
+    outputs: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, features.shape[0], G4_HISTORICAL_BATCH_SIZE):
+            chunk = torch.from_numpy(features[start : start + G4_HISTORICAL_BATCH_SIZE])
+            outputs.append(torch.sigmoid(head(chunk)).to(torch.float64).numpy())
+    scores = np.concatenate(outputs) if outputs else np.empty(0, dtype=np.float64)
+    if not np.all(np.isfinite(scores)):
+        raise M2GateDerivationError(
+            "The frozen M1L head produced a non-finite G4 background-negative score."
+        )
+    return scores
+
+
+def derive_g4(population_scores: np.ndarray) -> dict[str, Any]:
     threshold = float(
         np.quantile(
-            population, GATE.G4_DERIVATION_QUANTILE, method=GATE.G4_QUANTILE_METHOD
+            population_scores,
+            GATE.G4_DERIVATION_QUANTILE,
+            method=GATE.G4_QUANTILE_METHOD,
         )
     )
-    pass_mask = scores <= threshold
     descriptive = _descriptive_distribution(
-        population,
+        population_scores,
         {
             0.10: "q10",
             0.25: "q25",
@@ -468,9 +542,8 @@ def derive_g4(
     )
     return {
         "threshold": threshold,
-        "population_rows": int(population.shape[0]),
+        "population_rows": int(population_scores.shape[0]),
         "descriptive_distribution": descriptive,
-        "pass_mask": pass_mask,
     }
 
 
@@ -523,6 +596,12 @@ def causal_refractory_replay(
         ),
         "final_update_fraction": float(np.mean(admitted)),
         "refractory_blocked_fraction": float(np.mean(~g5_pass)),
+        # Matches the historical sanity.json formula exactly: a direct mean of
+        # the (pre-refractory-admissible AND currently blocked) mask, not a
+        # subtraction of two independently-rounded fractions.
+        "refractory_refusal_fraction": float(
+            np.mean(combined_pre_refractory & ~g5_pass)
+        ),
         "stream_count": stream_count,
         "per_stream_update_fraction": {
             "min": float(np.min(per_stream_fraction)),
@@ -598,7 +677,18 @@ def run_derivation(
             f"{int(np.count_nonzero(background_negative_mask))} differs from the "
             f"receipt's {expected_bg_rows}."
         )
-    g4 = derive_g4(scores, background_negative_mask)
+    g4_population_scores = score_background_negative_population(head, store, cache)
+    if g4_population_scores.shape[0] != expected_bg_rows:
+        raise M2GateDerivationError(
+            f"G4 background-negative scoring population "
+            f"{g4_population_scores.shape[0]} differs from the receipt's "
+            f"{expected_bg_rows}."
+        )
+    g4 = derive_g4(g4_population_scores)
+    # Applied to the full-timeline score array (batch composition differs from
+    # the dedicated G4 population pass, but the pass/fail *classification* is
+    # invariant to that -- verified bit-exact for all 2,208,431 rows).
+    g4_pass_mask = scores <= g4["threshold"]
 
     current_environment = runtime_environment("cpu", 0)
     identity = verify_identity_bindings(
@@ -610,17 +700,16 @@ def run_derivation(
         stream_cache_root=stream_cache_root,
     )
 
-    replay = causal_refractory_replay(store, g3["pass_mask"], g4["pass_mask"], g6_pass)
+    replay = causal_refractory_replay(store, g3["pass_mask"], g4_pass_mask, g6_pass)
     cold_start = cold_start_update_fraction(store, replay["admitted_mask"])
 
+    # Every entry below reproduces the exact historical sanity.json formula:
+    # a direct mean of a fail/blocked mask, not `1 - pass_fraction`.
     refusal_fractions = {
-        "sqi": g3["combined_rejection_fraction"],
-        "normal_evidence": 1.0 - float(np.mean(g4["pass_mask"])),
-        "morphology": 1.0 - float(np.mean(g6_pass)),
-        "refractory": (
-            replay["combined_pre_refractory_admission_fraction"]
-            - replay["final_update_fraction"]
-        ),
+        "sqi": g3["direct_fail_mean"],
+        "normal_evidence": float(np.mean(~g4_pass_mask)),
+        "morphology": float(np.mean(~g6_pass)),
+        "refractory": replay["refractory_refusal_fraction"],
     }
 
     computed = {
@@ -642,7 +731,7 @@ def run_derivation(
             "physical_available_fraction": 1.0,
             "g3_sqi_pass_fraction": float(np.mean(g3["pass_mask"])),
             "g4_normal_evidence_pass_fraction_where_score_exists": float(
-                np.mean(g4["pass_mask"])
+                np.mean(g4_pass_mask)
             ),
             "g6_morphology_valid_fraction": float(np.mean(g6_pass)),
             "combined_pre_refractory_admission_fraction": replay[
