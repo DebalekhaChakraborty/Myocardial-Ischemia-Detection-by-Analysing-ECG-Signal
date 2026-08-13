@@ -34,11 +34,22 @@ candidate architectures.
 | `SIGNAL_V1` schema | `25d05f8716340e0fcc9950590025e7c58dccbfe8d0e0475ccd36bd629d4c57d4` |
 | `MORPHOLOGY_V1` schema | `13f60be400b5b957c1eb592bbafd8206d4d2855c1aa657a058671fb8d7cab434` |
 | `COMBINED_V1` schema | `6b1517cb6ffd5d113a385bb252a90630f75beec4da7345185e74dda0eff98a34` |
-| **TRAIN-only gate derivation receipt** | **`3befd05dc7e9c51ddfed99078d3020375fd610b328d19e64fc7ee3cc745f398e`** |
+| **TRAIN-only gate derivation receipt** | **`5b14c1a72f34945d59d73f152e8fdeaf929a3be56ad47d94a698bc4bfabd3f24`** |
 
 `docs/M2_GATE_DERIVATION_RECEIPT_V1.json` binds every constant below to the
 TRAIN population it was derived from. **No validation or test data was accessed
 in any derivation.**
+
+**Provenance note (canonical-runtime reproduction).** The receipt above
+supersedes an earlier receipt
+(`3befd05dc7e9c51ddfed99078d3020375fd610b328d19e64fc7ee3cc745f398e`) generated
+while the shared scientific interpreter transiently carried five unrelated
+distributions from a concurrent, unrelated application-side session (see
+`docs/RUNTIME_INTEGRITY_SENTINEL_V1.md`). Every TRAIN-only constant in this
+document was independently recomputed under the canonical, isolated `tactics`
+runtime (`b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a`)
+using the exact historical arithmetic paths of the original derivation and
+reproduced bit-exactly. **No scientific choice below changed.**
 
 ## 1. Causal signal inventory (measured from this repository)
 

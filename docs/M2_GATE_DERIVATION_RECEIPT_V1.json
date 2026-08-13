@@ -1,8 +1,24 @@
 {
   "base_scientific_tree": "8260b718ab235873bd8067ca3fbf14f158c71dcd",
+  "canonicalization": {
+    "canonical_dependency_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+    "canonical_scientific_interpreter": "/home/AI_POC/venvs/tactics/bin/python",
+    "note": "This receipt's scientific and descriptive numeric content is byte-for-byte identical to the superseded receipt below. Only environment.dependency_digest and this block were added/changed. The superseded receipt was generated while the shared scientific interpreter transiently contained five unrelated distributions (jmespath, botocore, s3transfer, boto3, awscrt) installed by a concurrent, unrelated application-side agent session; see docs/RUNTIME_INTEGRITY_SENTINEL_V1.md for that incident record. No frozen scientific dependency (numpy, torch, scipy, sklearn, wfdb, python) changed between the two receipts. Every TRAIN-only constant recorded below -- G3 bounds, NORMAL_EVIDENCE_THRESHOLD, all descriptive and sanity statistics -- was independently recomputed under the canonical b0fd6eaa... runtime using the exact historical arithmetic paths of the original derivation (recovered read-only from session provenance) and reproduced bit-exactly.",
+    "reproduction_field_level_checks_failed": 0,
+    "reproduction_field_level_checks_performed": 19,
+    "reproduction_method": "exact_historical_arithmetic_path_reproduction",
+    "reproduction_verifier_head": "1aece7f26a51d79d87fab195516c479395dc8325",
+    "reproduction_verifier_module": "src/cardiosentinel/neural/m2_gate_derivation.py",
+    "scientific_values_changed": false,
+    "status": "canonical_runtime_reproduction",
+    "superseded_receipt_dependency_digest": "78e838d2d41a0239f16dbfbaabdddc7efeaffac391ca13a8bbf1475c080cdc25",
+    "superseded_receipt_sha256": "3befd05dc7e9c51ddfed99078d3020375fd610b328d19e64fc7ee3cc745f398e",
+    "test_accessed": false,
+    "validation_accessed": false
+  },
   "environment": {
     "amp_enabled": false,
-    "dependency_digest": "78e838d2d41a0239f16dbfbaabdddc7efeaffac391ca13a8bbf1475c080cdc25",
+    "dependency_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
     "device": "cpu",
     "numpy": "2.3.2",
     "python": "3.12.6",
