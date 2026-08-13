@@ -41,6 +41,7 @@ tolerance anywhere.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -113,6 +114,32 @@ COMBINED_NEEDED_COLUMNS: Final = GATE.G3_SQI_COLUMNS + (
 # population is scored as a single batch. 4096 is reproduced here because it
 # is what the original derivation actually used.
 G4_HISTORICAL_BATCH_SIZE: Final = 4096
+
+# `torch.set_num_threads()` is process-global and sticky. Other test modules
+# in this repo (via `cardiosentinel.neural.resource_benchmark`, exercised by
+# `test_candidate_experiment.py` / `test_validation_challenge.py`) pin
+# intra-op threads to 1 for their own benchmark reproducibility, and that
+# setting persists for the rest of a shared pytest process. Verified
+# empirically: the frozen M1L head's forward pass is sensitive to intra-op
+# thread count (it changes GEMM reduction order), which shifts the
+# extreme-tail G4 descriptive minimum by a few ULP -- while every other
+# receipt field (means/medians over much larger populations) is insensitive
+# to it. Both the original derivation and every standalone run of this
+# module observed 16, this machine's untouched PyTorch default; scoring
+# always pins to it explicitly, then restores whatever was set before, so
+# this module's output never depends on -- and never leaks into -- unrelated
+# code sharing the same process.
+M1L_INTRA_OP_THREADS: Final = 16
+
+
+@contextlib.contextmanager
+def _pinned_intra_op_threads():
+    previous = torch.get_num_threads()
+    torch.set_num_threads(M1L_INTRA_OP_THREADS)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 class M2GateDerivationError(RuntimeError):
@@ -263,7 +290,7 @@ def score_m1l(
     memory = np.asarray(d_long, dtype=np.float64).reshape(-1, 1)
     features = m1_arm_features(M1L_EXPERIMENT_ID, representation, memory)
     outputs: list[np.ndarray] = []
-    with torch.no_grad():
+    with _pinned_intra_op_threads(), torch.no_grad():
         for start in range(0, features.shape[0], P1_BATCH_SIZE):
             chunk = torch.from_numpy(features[start : start + P1_BATCH_SIZE])
             outputs.append(torch.sigmoid(head(chunk)).to(torch.float64).numpy())
@@ -508,7 +535,7 @@ def score_background_negative_population(
             "G4 background-negative feature matrix contains a non-finite value."
         )
     outputs: list[np.ndarray] = []
-    with torch.no_grad():
+    with _pinned_intra_op_threads(), torch.no_grad():
         for start in range(0, features.shape[0], G4_HISTORICAL_BATCH_SIZE):
             chunk = torch.from_numpy(features[start : start + G4_HISTORICAL_BATCH_SIZE])
             outputs.append(torch.sigmoid(head(chunk)).to(torch.float64).numpy())
