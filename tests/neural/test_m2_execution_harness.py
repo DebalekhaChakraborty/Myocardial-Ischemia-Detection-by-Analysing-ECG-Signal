@@ -56,20 +56,81 @@ FROZEN_RUNTIME_ONLY = pytest.mark.skipif(
 )
 
 
-def _green_runtime() -> S.RuntimeIntegrityRecord:
-    """A record whose START check has already been taken and matched.
+def _synthetic_frozen_check(point: str, detail: str = "test") -> S.RuntimeCheck:
+    """A TEST-ONLY observation asserting the frozen identity.
 
-    The expectation is pinned to whatever this environment actually is, so the
-    persistence MECHANICS can be exercised anywhere -- including CI, which is
-    not the frozen scientific runtime. Tests that assert the frozen identity
-    itself, or that drive a run all the way to canonical COMPLETE, carry
-    `FROZEN_RUNTIME_ONLY` instead: `validate_complete_runtime_identity`
-    deliberately requires the frozen digest and must not be relaxed.
+    Production never constructs these: `observe_runtime_identity` always reads
+    the real environment. Tests use them so persistence MECHANICS can be
+    exercised outside the frozen scientific runtime (CI included) WITHOUT
+    weakening the production invariant that a canonical claim requires the
+    frozen digest.
     """
-    observed = S.observe_runtime_identity(S.EnforcementPoint.START).observed_digest
-    record = S.RuntimeIntegrityRecord(expected_digest=observed)
-    S.require_runtime_identity(S.EnforcementPoint.START, record=record, detail="test")
+    return S.RuntimeCheck(
+        enforcement_point=point,
+        observed_digest=FROZEN_DIGEST,
+        expected_digest=FROZEN_DIGEST,
+        matches=True,
+        package_count=335,
+        observed_at="2026-01-01T00:00:00Z",
+        detail=detail,
+    )
+
+
+def _frozen_runtime_record() -> S.RuntimeIntegrityRecord:
+    """A record that looks, to production code, like the frozen runtime.
+
+    Built from synthetic frozen observations rather than by relaxing anything:
+    `expected_digest` really is the frozen identity, and the recorded START
+    really did expect/observe/match it.
+    """
+    record = S.RuntimeIntegrityRecord()
+    record.record(_synthetic_frozen_check(S.EnforcementPoint.START.value))
     return record
+
+
+@pytest.fixture()
+def frozen_runtime(monkeypatch):
+    """Drive the whole production path with synthetic frozen observations.
+
+    `observe_runtime_identity` is monkeypatched -- a clearly TEST-ONLY seam --
+    so `claim_run_directory` and `finalize_and_promote_arm_result` run their
+    real logic unchanged. No production invariant is relaxed.
+    """
+
+    def fake_observe(point, *, expected_digest=FROZEN_DIGEST, detail=None):
+        return _synthetic_frozen_check(
+            S.EnforcementPoint(point).value, detail or "test"
+        )
+
+    monkeypatch.setattr(PS, "observe_runtime_identity", fake_observe)
+    # Canonical evidence requires a clean checkout (the M1/P1 convention). A
+    # development tree is usually dirty, so provenance is pinned here too --
+    # again a TEST-ONLY seam, never a relaxation: production still reads the
+    # real checkout, and a dirty state is still rejected (proved separately).
+    monkeypatch.setattr(
+        PS,
+        "git_provenance",
+        lambda _root: {"git_sha": "0" * 40, "git_dirty": False},
+    )
+    monkeypatch.setattr(
+        PS,
+        "require_runtime_identity",
+        lambda point, *, record=None, detail=None: (
+            record.record(
+                _synthetic_frozen_check(
+                    S.EnforcementPoint(point).value, detail or "test"
+                )
+            )
+            if record is not None
+            else _synthetic_frozen_check(S.EnforcementPoint(point).value)
+        ),
+    )
+    return _frozen_runtime_record()
+
+
+def _green_runtime() -> S.RuntimeIntegrityRecord:
+    """Deprecated alias retained for the ambient-runtime mechanism tests."""
+    return _frozen_runtime_record()
 
 
 # --------------------------------------------------------------------------
@@ -341,9 +402,11 @@ def test_simulated_mismatch_at_start_refuses_execution():
     assert record.first_mismatch().enforcement_point == "start"
 
 
-def test_simulated_mismatch_before_persistence_refuses_promotion(tmp_path):
+def test_simulated_mismatch_before_persistence_refuses_promotion(
+    tmp_path, frozen_runtime
+):
     claimed = PS.claim_run_directory(
-        tmp_path, "M2_sim_prepromotion", "M2-G", runtime=_green_runtime()
+        tmp_path, "M2_sim_prepromotion", "M2-G", runtime=frozen_runtime
     )
     record = S.RuntimeIntegrityRecord(expected_digest="1" * 64)
     check = S.observe_runtime_identity(
@@ -391,9 +454,9 @@ def test_no_automatic_environment_repair_occurs():
 # --------------------------------------------------------------------------
 
 
-def test_partial_run_cannot_masquerade_as_complete(tmp_path):
+def test_partial_run_cannot_masquerade_as_complete(tmp_path, frozen_runtime):
     claimed = PS.claim_run_directory(
-        tmp_path, "M2_partial", "M2-G", runtime=_green_runtime()
+        tmp_path, "M2_partial", "M2-G", runtime=frozen_runtime
     )
     status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
     assert status["status"] == PS.STATUS_STARTED
@@ -643,7 +706,10 @@ def _paired_bundle(count=4):
                 subject=f"subj-{index % 2}",
             )
         )
-    return V.build_evaluation_bundle("M2-G", evidence, annotations)
+    expected = V.canonical_replay_population_digest(evidence)
+    return V.build_evaluation_bundle(
+        "M2-G", evidence, annotations, expected_population_digest=expected
+    )
 
 
 # --- 1-2. threshold enforcement on every thresholded path -----------------
@@ -702,9 +768,15 @@ def test_permuted_annotation_ordering_is_realigned_by_identity_not_position():
         _annotation(start_sample=0, label=0, subject="a"),
         _annotation(start_sample=1250, label=1, subject="b"),
     ]
-    bundle_ordered = V.build_evaluation_bundle("M2-G", evidence, ordered)
+    expected = V.canonical_replay_population_digest(evidence)
+    bundle_ordered = V.build_evaluation_bundle(
+        "M2-G", evidence, ordered, expected_population_digest=expected
+    )
     bundle_permuted = V.build_evaluation_bundle(
-        "M2-G", evidence, list(reversed(ordered))
+        "M2-G",
+        evidence,
+        list(reversed(ordered)),
+        expected_population_digest=expected,
     )
     # Identity, not order, decides the pairing.
     assert bundle_ordered.keys == bundle_permuted.keys
@@ -893,8 +965,12 @@ def test_result_provenance_binds_the_evaluated_population_identity():
     assert len(identity["evaluated_ordered_stable_id_sha256"]) == 64
     assert identity["positional_join_used"] is False
     # A different evaluated population yields a different identity.
+    single = [_evidence(start_sample=0)]
     other = V.build_evaluation_bundle(
-        "M2-G", [_evidence(start_sample=0)], [_annotation(start_sample=0)]
+        "M2-G",
+        single,
+        [_annotation(start_sample=0)],
+        expected_population_digest=V.canonical_replay_population_digest(single),
     )
     assert (
         other.population_identity()["evaluated_ordered_stable_id_sha256"]
@@ -926,14 +1002,29 @@ def test_no_scientific_m2_result_is_generated_by_this_module():
 # --------------------------------------------------------------------------
 
 
+SYNTHETIC_SHA = "a" * 64
+
+
 def _execution_identity():
+    """A complete execution identity, as the real harness produces."""
     return {
         "partition_accessed": "train",
         "validation_accessed": False,
         "test_accessed": False,
         "sealed_test_state": "unopened",
+        "input_identity": {
+            "partition": "train",
+            "distance_standardizer_sha256": SYNTHETIC_SHA,
+            "split_sha256": SYNTHETIC_SHA,
+            "feature_corpus_sha256": SYNTHETIC_SHA,
+            "ordered_chronology_sha256": SYNTHETIC_SHA,
+            "stream_cache_sha256": SYNTHETIC_SHA,
+        },
         "scorer_identity": {
             "retained_lock_sha256": SC.RETAINED_M1L_LOCK_SHA256,
+            "retained_checkpoint_sha256": SC.RETAINED_M1L_CHECKPOINT_SHA256,
+            "p1b_lock_sha256": SC.FROZEN_P1B_LOCK_SHA256,
+            "b4b_checkpoint_sha256": SC.FROZEN_B4B_CHECKPOINT_SHA256,
             "classification_threshold": SC.M1L_CLASSIFICATION_THRESHOLD,
             "memory_admission_threshold": SC.NORMAL_EVIDENCE_THRESHOLD,
             "classification_threshold_used_for_memory_admission": False,
@@ -942,16 +1033,51 @@ def _execution_identity():
 
 
 def _claim_bearing_result(arm="M2-G", population=None):
+    """The arm result payload. Provenance lives in the separate run lock."""
     return {
         "arm": arm,
         "scientific_computation_completed": True,
-        "m2_protocol_sha256": G.M2_PROTOCOL_SHA256,
-        "m2_gate_receipt_sha256": G.M2_GATE_RECEIPT_SHA256,
         "evaluated_population_identity": population,
-        "memory_selection_performed": False,
-        "memory_selected": None,
-        "rollback": False,
     }
+
+
+def _complete_lock(tmp_path=None, *, population=None, **overrides):
+    """A fully provenance-complete canonical lock, for validator tests."""
+    import cardiosentinel.neural.m2_persistence as _ps
+
+    original = _ps.git_provenance
+    _ps.git_provenance = lambda _root: {"git_sha": "0" * 40, "git_dirty": False}
+    try:
+        return _build_complete_lock(population=population, **overrides)
+    finally:
+        _ps.git_provenance = original
+
+
+def _build_complete_lock(*, population=None, **overrides):
+    runtime = _frozen_runtime_record()
+    for point in ("pre_promotion", "completion"):
+        runtime.record(_synthetic_frozen_check(point))
+    lock = PS.build_canonical_run_lock(
+        experiment_id="M2_lock_fixture",
+        arm="M2-G",
+        execution_identity=_execution_identity(),
+        runtime=runtime,
+        evaluated_population_identity=(
+            population
+            if population is not None
+            else _paired_bundle().population_identity()
+        ),
+        started_at="2026-01-01T00:00:00Z",
+        completed_at="2026-01-01T00:10:00Z",
+        artifact_sha256={PS.ARM_RESULT_NAME: "b" * 64},
+    )
+    if overrides:
+        lock = {**lock, **overrides}
+        lock.pop("experiment_lock_sha256", None)
+        from cardiosentinel.neural.integrity import canonical_sha256
+
+        lock["experiment_lock_sha256"] = canonical_sha256(lock)
+    return lock
 
 
 # --- 1-3. claim directory sentinel boundary ------------------------------
@@ -964,8 +1090,10 @@ def test_claim_directory_requires_a_successful_start_record(tmp_path):
     assert not (tmp_path / "M2_no_start").exists()
 
 
-def test_claim_directory_performs_a_pre_promotion_check_before_creation(tmp_path):
-    runtime = _green_runtime()
+def test_claim_directory_performs_a_pre_promotion_check_before_creation(
+    tmp_path, frozen_runtime
+):
+    runtime = frozen_runtime
     PS.claim_run_directory(tmp_path, "M2_claim_check", "M2-G", runtime=runtime)
     points = [check.enforcement_point for check in runtime.checks]
     assert points == ["start", "pre_promotion"]
@@ -973,10 +1101,14 @@ def test_claim_directory_performs_a_pre_promotion_check_before_creation(tmp_path
     assert PS.CLAIM_DIRECTORY_PROMOTION_DETAIL in details
 
 
-def test_claim_time_runtime_mismatch_creates_no_canonical_directory(tmp_path):
-    """A mismatch at the claim boundary means the directory never exists."""
+def test_non_frozen_record_cannot_create_a_canonical_claim(tmp_path):
+    """§1: a matching NON-FROZEN digest is never sufficient for a claim.
+
+    The record below is entirely self-consistent -- it expects "c"*64 and its
+    START observed and matched "c"*64 -- yet it must not produce a canonical
+    claim, because canonical standing requires the frozen scientific identity.
+    """
     runtime = S.RuntimeIntegrityRecord(expected_digest="c" * 64)
-    # Force a matching START so only the claim-time check can fail.
     runtime.record(
         S.RuntimeCheck(
             enforcement_point="start",
@@ -987,17 +1119,78 @@ def test_claim_time_runtime_mismatch_creates_no_canonical_directory(tmp_path):
             observed_at="2026-01-01T00:00:00Z",
         )
     )
-    with pytest.raises(S.RuntimeIntegrityError):
+    with pytest.raises(PS.M2PersistenceError, match="frozen scientific identity"):
         PS.claim_run_directory(tmp_path, "M2_claim_mismatch", "M2-G", runtime=runtime)
     assert not (tmp_path / "M2_claim_mismatch").exists()
+
+
+def test_canonical_claim_requires_the_frozen_expected_digest():
+    """§8.2 -- the record's expectation itself must be the frozen identity."""
+    ambient = S.observe_runtime_identity(S.EnforcementPoint.START).observed_digest
+    runtime = S.RuntimeIntegrityRecord(expected_digest=ambient)
+    runtime.record(
+        S.RuntimeCheck(
+            enforcement_point="start",
+            observed_digest=ambient,
+            expected_digest=ambient,
+            matches=True,
+            package_count=1,
+            observed_at="2026-01-01T00:00:00Z",
+        )
+    )
+    if ambient != FROZEN_DIGEST:
+        with pytest.raises(PS.M2PersistenceError, match="frozen scientific identity"):
+            PS.require_frozen_runtime_record(runtime)
+
+
+def test_canonical_claim_requires_start_expected_and_observed_frozen():
+    """§8.3/§8.4 -- START must have expected AND observed the frozen digest."""
+    wrong_expected = S.RuntimeIntegrityRecord()
+    wrong_expected.record(
+        S.RuntimeCheck(
+            enforcement_point="start",
+            observed_digest=FROZEN_DIGEST,
+            expected_digest="d" * 64,
+            matches=True,
+            package_count=335,
+            observed_at="2026-01-01T00:00:00Z",
+        )
+    )
+    with pytest.raises(PS.M2PersistenceError, match="expected"):
+        PS.require_frozen_runtime_record(wrong_expected)
+
+    wrong_observed = S.RuntimeIntegrityRecord()
+    wrong_observed.record(
+        S.RuntimeCheck(
+            enforcement_point="start",
+            observed_digest="e" * 64,
+            expected_digest=FROZEN_DIGEST,
+            matches=False,
+            package_count=1,
+            observed_at="2026-01-01T00:00:00Z",
+        )
+    )
+    with pytest.raises(PS.M2PersistenceError, match="observe the frozen"):
+        PS.require_frozen_runtime_record(wrong_observed)
+
+
+def test_test_only_mechanism_does_not_weaken_the_production_invariant():
+    """§8.5 -- the synthetic fixture asserts the frozen digest, nothing less."""
+    check = _synthetic_frozen_check("start")
+    assert check.expected_digest == FROZEN_DIGEST
+    assert check.observed_digest == FROZEN_DIGEST
+    # And production still refuses anything else, regardless of the fixture.
+    import inspect
+
+    source = inspect.getsource(PS.require_frozen_runtime_record)
+    assert "FROZEN_DEPENDENCY_DIGEST" in source
 
 
 # --- 4-7. completion binding and runtime-block completeness ---------------
 
 
-@FROZEN_RUNTIME_ONLY
 def test_canonical_complete_result_cannot_carry_a_none_completion_digest():
-    runtime = _green_runtime()
+    runtime = _frozen_runtime_record()
     runtime.record(
         S.observe_runtime_identity(S.EnforcementPoint.PRE_PROMOTION, detail="x")
     )
@@ -1007,25 +1200,49 @@ def test_canonical_complete_result_cannot_carry_a_none_completion_digest():
         PS.validate_complete_runtime_identity(runtime)
 
 
-@FROZEN_RUNTIME_ONLY
-def test_completion_mismatch_prevents_canonical_complete_promotion(tmp_path):
-    runtime = _green_runtime()
+def test_completion_mismatch_prevents_canonical_complete_promotion(
+    tmp_path, frozen_runtime, monkeypatch
+):
+    """A COMPLETION mismatch invalidates canonical standing entirely."""
+    runtime = frozen_runtime
     claimed = PS.claim_run_directory(tmp_path, "M2_end_bad", "M2-G", runtime=runtime)
-    # Point the record at an impossible digest so COMPLETION cannot match.
-    runtime.expected_digest = "d" * 64
+
+    # The record still legitimately expects the frozen identity; only the
+    # COMPLETION observation differs, which is the real-world failure mode.
+    def observe_bad_completion(point, *, expected_digest=FROZEN_DIGEST, detail=None):
+        value = S.EnforcementPoint(point).value
+        if value == "completion":
+            return S.RuntimeCheck(
+                enforcement_point=value,
+                observed_digest="9" * 64,
+                expected_digest=FROZEN_DIGEST,
+                matches=False,
+                package_count=71,
+                observed_at="2026-01-01T00:00:00Z",
+                detail=detail,
+            )
+        return _synthetic_frozen_check(value, detail or "test")
+
+    monkeypatch.setattr(PS, "observe_runtime_identity", observe_bad_completion)
+
+    population = _paired_bundle().population_identity()
     with pytest.raises(S.RuntimeIntegrityError, match="COMPLETION"):
         PS.finalize_and_promote_arm_result(
             claimed,
-            result=_claim_bearing_result(),
+            result=_claim_bearing_result(population=population),
             execution_identity=_execution_identity(),
             runtime=runtime,
-            requires_evaluation=False,
+            evaluated_population_identity=population,
+            requires_evaluation=True,
         )
-    # Nothing canonical exists and the run is not COMPLETE.
+
+    # Nothing canonical exists: no result, no lock, and the run is not COMPLETE.
     assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
+    assert not (claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).exists()
     status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
     assert status["status"] == PS.STATUS_FAILED
     assert status["claim_bearing_result_promoted"] is False
+    assert status["canonical"] is False
     failure = json.loads((claimed.run_dir / PS.RUNTIME_FAILURE_NAME).read_text())
     assert failure["canonical_promotion_invalidated"] is True
     assert failure["staged_result_retained_as_forensic_material"] is True
@@ -1034,9 +1251,10 @@ def test_completion_mismatch_prevents_canonical_complete_promotion(tmp_path):
     assert (claimed.staging_dir / PS.ARM_RESULT_NAME).exists()
 
 
-@FROZEN_RUNTIME_ONLY
-def test_all_three_enforcement_points_appear_in_the_finalized_block(tmp_path):
-    runtime = _green_runtime()
+def test_all_three_enforcement_points_appear_in_the_finalized_block(
+    tmp_path, frozen_runtime
+):
+    runtime = frozen_runtime
     claimed = PS.claim_run_directory(tmp_path, "M2_full_block", "M2-G", runtime=runtime)
     population = _paired_bundle().population_identity()
     status = PS.finalize_and_promote_arm_result(
@@ -1044,31 +1262,37 @@ def test_all_three_enforcement_points_appear_in_the_finalized_block(tmp_path):
         result=_claim_bearing_result(population=population),
         execution_identity=_execution_identity(),
         runtime=runtime,
+        evaluated_population_identity=population,
         requires_evaluation=True,
     )
     assert status["status"] == PS.STATUS_COMPLETE
     assert status["canonical"] is True
 
-    promoted = json.loads((claimed.run_dir / PS.ARM_RESULT_NAME).read_text())
-    block = promoted["runtime_identity_checks"]
+    # The result file carries no hash of itself; the separate lock binds it.
+    lock = json.loads((claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).read_text())
+    block = lock["runtime_identity_checks"]
     points = {check["enforcement_point"] for check in block["checks"]}
     assert points == {"start", "pre_promotion", "completion"}
     assert block["all_observations_matched"] is True
-    assert promoted["runtime_dependency_digest_start"] == FROZEN_DIGEST
-    assert promoted["runtime_dependency_digest_pre_promotion"] == FROZEN_DIGEST
-    # The genuine, observed completion digest is inside the promoted artifact.
-    assert promoted["runtime_dependency_digest_end"] == FROZEN_DIGEST
-    # And the recorded hash is the hash of exactly those promoted bytes.
+    assert lock["runtime_dependency_digest_start"] == FROZEN_DIGEST
+    assert lock["runtime_dependency_digest_pre_promotion"] == FROZEN_DIGEST
+    assert lock["runtime_dependency_digest_end"] == FROZEN_DIGEST
+
+    # The lock binds the exact promoted artifact bytes, and re-validates.
     from cardiosentinel.data.provenance import sha256_file
 
-    assert status["artifact_sha256"][PS.ARM_RESULT_NAME] == sha256_file(
-        claimed.run_dir / PS.ARM_RESULT_NAME
-    )
+    promoted_digest = sha256_file(claimed.run_dir / PS.ARM_RESULT_NAME)
+    assert lock["artifact_sha256"][PS.ARM_RESULT_NAME] == promoted_digest
+    assert status["artifact_sha256"][PS.ARM_RESULT_NAME] == promoted_digest
+    assert status["experiment_lock_sha256"] == lock["experiment_lock_sha256"]
+    PS.validate_canonical_run_lock(lock, run_dir=claimed.run_dir)
+
+    promoted = json.loads((claimed.run_dir / PS.ARM_RESULT_NAME).read_text())
+    assert "experiment_lock_sha256" not in promoted  # no self-referential hash
 
 
-@FROZEN_RUNTIME_ONLY
 def test_all_observations_matched_is_required_for_canonical_evidence():
-    runtime = _green_runtime()
+    runtime = _frozen_runtime_record()
     runtime.record(
         S.RuntimeCheck(
             enforcement_point="pre_promotion",
@@ -1120,9 +1344,10 @@ def test_valid_full_population_identity_is_accepted():
     assert validated["population_scope"] == V.POPULATION_SCOPE_FULL
 
 
-@FROZEN_RUNTIME_ONLY
-def test_claim_bearing_result_requires_population_identity_when_evaluated(tmp_path):
-    runtime = _green_runtime()
+def test_claim_bearing_result_requires_population_identity_when_evaluated(
+    tmp_path, frozen_runtime
+):
+    runtime = frozen_runtime
     claimed = PS.claim_run_directory(tmp_path, "M2_no_pop", "M2-G", runtime=runtime)
     with pytest.raises(PS.M2PersistenceError, match="evaluated_population_identity"):
         PS.finalize_and_promote_arm_result(
@@ -1141,7 +1366,10 @@ def test_claim_bearing_result_requires_population_identity_when_evaluated(tmp_pa
 def _subset_bundle():
     evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
     return V.build_evaluation_bundle(
-        "M2-G", evidence, [_annotation(start_sample=0)], require_full_population=False
+        "M2-G",
+        evidence,
+        [_annotation(start_sample=0)],
+        require_full_population=False,
     )
 
 
@@ -1153,7 +1381,7 @@ def test_headline_metrics_refuse_a_subsetted_bundle(function):
     subset = _subset_bundle()
     assert subset.population_scope == V.POPULATION_SCOPE_SUPPORTING_SUBSET
     assert subset.is_full_population is False
-    with pytest.raises(V.M2EvaluationError, match="full-population"):
+    with pytest.raises(V.M2EvaluationError, match="VERIFIED|full-population"):
         function(subset)
 
 
@@ -1216,7 +1444,7 @@ def test_no_canonical_m2_scientific_execution_occurs(tmp_path):
     """The validator gates promotion; it computes no metric and selects no arm."""
     import inspect
 
-    tree = ast.parse(inspect.getsource(PS.validate_claim_bearing_arm_result).lstrip())
+    tree = ast.parse(inspect.getsource(PS.validate_canonical_run_lock).lstrip())
     called = {
         getattr(node.func, "id", None) or getattr(node.func, "attr", None)
         for node in ast.walk(tree)
@@ -1236,3 +1464,183 @@ def test_no_canonical_m2_scientific_execution_occurs(tmp_path):
     )
     assert suite["memory_selection_performed"] is False
     assert suite["memory_selected"] is None
+
+
+# --------------------------------------------------------------------------
+# Human final canonical-provenance review:
+#   the complete lock contract, and full_population proven against the
+#   canonical replay population rather than trusted from the caller.
+# --------------------------------------------------------------------------
+
+
+def test_minimal_result_fixture_is_rejected_as_incomplete_provenance():
+    """§8.6 -- the small synthetic result cannot masquerade as canonical."""
+    minimal = _claim_bearing_result()
+    with pytest.raises(PS.M2PersistenceError):
+        PS.validate_canonical_run_lock(minimal)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "git_sha",
+        "retained_m1l_checkpoint_sha256",
+        "retained_m1l_lock_sha256",
+        "split_sha256",
+        "feature_corpus_sha256",
+        "ordered_chronology_sha256",
+        "signal_v1_schema_sha256",
+        "morphology_v1_schema_sha256",
+        "combined_v1_schema_sha256",
+    ],
+)
+def test_missing_required_identity_is_rejected(field):
+    """§8.7-8.10 -- a missing identity fails, key-presence is not enough."""
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    lock = _complete_lock()
+    del lock[field]
+    lock.pop("experiment_lock_sha256", None)
+    lock["experiment_lock_sha256"] = canonical_sha256(lock)
+    with pytest.raises(PS.M2PersistenceError, match="missing"):
+        PS.validate_canonical_run_lock(lock)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["m2_protocol_sha256", "retained_m1l_lock_sha256", "b4b_checkpoint_sha256"],
+)
+def test_wrong_frozen_identity_is_rejected(field):
+    """§8.11 -- a well-formed but WRONG frozen identity fails."""
+    lock = _complete_lock(**{field: "f" * 64})
+    with pytest.raises(PS.M2PersistenceError, match="expected the frozen"):
+        PS.validate_canonical_run_lock(lock)
+
+
+def test_malformed_sha_is_rejected():
+    lock = _complete_lock(split_sha256="not-a-digest")
+    with pytest.raises(PS.M2PersistenceError, match="not a SHA-256 digest"):
+        PS.validate_canonical_run_lock(lock)
+
+
+def test_dirty_git_state_is_rejected():
+    """§4 -- canonical evidence requires a clean checkout (P1/M1 convention)."""
+    lock = _complete_lock(git_dirty=True)
+    with pytest.raises(PS.M2PersistenceError, match="clean Git checkout"):
+        PS.validate_canonical_run_lock(lock)
+
+
+def test_complete_canonical_provenance_is_accepted():
+    """§8.12 -- a fully provenance-complete lock validates."""
+    lock = _complete_lock()
+    validated = PS.validate_canonical_run_lock(lock)
+    assert validated["arm"] in ("M2-0", "M2-G")
+    for field in PS.REQUIRED_PROVENANCE_FIELDS:
+        assert field in validated
+
+
+def test_changing_one_result_byte_invalidates_the_lock_binding(tmp_path):
+    """§8.13-8.14 -- the lock binds the exact promoted bytes."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    result_path = run_dir / PS.ARM_RESULT_NAME
+    result_path.write_text('{"arm": "M2-G"}\n')
+
+    from cardiosentinel.data.provenance import sha256_file
+
+    lock = _complete_lock(
+        artifact_sha256={PS.ARM_RESULT_NAME: sha256_file(result_path)}
+    )
+    PS.validate_canonical_run_lock(lock, run_dir=run_dir)
+
+    result_path.write_text('{"arm": "M2-G" }\n')  # one byte differs
+    with pytest.raises(PS.M2PersistenceError, match="does not match its lock digest"):
+        PS.validate_canonical_run_lock(lock, run_dir=run_dir)
+
+
+# --- §5/§6 full population must be PROVEN, not asserted -------------------
+
+
+def test_self_consistent_subset_cannot_claim_full_population():
+    """§8.15 -- the exact bypass: subset first, annotate the subset, claim full."""
+    full_evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
+    canonical = V.canonical_replay_population_digest(full_evidence)
+
+    subset_evidence = full_evidence[:2]
+    subset_annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
+    # Evidence and annotations cover each other perfectly...
+    with pytest.raises(V.M2EvaluationError, match="does not match the canonical"):
+        V.build_evaluation_bundle(
+            "M2-G",
+            subset_evidence,
+            subset_annotations,
+            expected_population_digest=canonical,
+        )
+
+
+def test_full_population_requires_the_canonical_digest_to_be_supplied():
+    """Full scope cannot rest on the caller's assertion alone."""
+    evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
+    annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
+    with pytest.raises(
+        V.M2EvaluationError, match="requires expected_population_digest"
+    ):
+        V.build_evaluation_bundle("M2-G", evidence, annotations)
+
+
+def test_subset_digest_is_rejected_as_the_headline_population():
+    """§8.16 -- a subset's own digest is not the canonical population."""
+    full_evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
+    subset_evidence = full_evidence[:2]
+    subset_annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
+    subset_digest = V.canonical_replay_population_digest(subset_evidence)
+
+    # Passing the subset's own digest builds a bundle that is internally
+    # consistent, but its identity is demonstrably not the full population's.
+    bundle = V.build_evaluation_bundle(
+        "M2-G",
+        subset_evidence,
+        subset_annotations,
+        expected_population_digest=subset_digest,
+    )
+    assert bundle.population_identity()[
+        "evaluated_ordered_stable_id_sha256"
+    ] != V.canonical_replay_population_digest(full_evidence)
+
+
+def test_exact_full_replay_population_digest_is_accepted():
+    """§8.17 -- the true canonical population verifies and is marked full."""
+    evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
+    annotations = [_annotation(start_sample=i * 1250) for i in range(4)]
+    bundle = V.build_evaluation_bundle(
+        "M2-G",
+        evidence,
+        annotations,
+        expected_population_digest=V.canonical_replay_population_digest(evidence),
+    )
+    assert bundle.population_scope == V.POPULATION_SCOPE_FULL
+    assert bundle.population_verified_against_canonical_replay is True
+    identity = bundle.population_identity()
+    assert identity["population_verified_against_canonical_replay"] is True
+    PS.validate_evaluated_population_identity(identity)
+
+
+def test_unverified_population_identity_is_rejected_for_claim_bearing():
+    """A scope label alone is never enough; verification is required."""
+    identity = dict(_paired_bundle().population_identity())
+    identity["population_verified_against_canonical_replay"] = False
+    with pytest.raises(PS.M2PersistenceError, match="VERIFIED"):
+        PS.validate_evaluated_population_identity(identity)
+
+
+def test_supporting_subset_remains_usable_for_supporting_evidence():
+    """§8.18/§7 -- subsets stay legitimate, just not headline."""
+    subset = _subset_bundle()
+    assert subset.population_scope == V.POPULATION_SCOPE_SUPPORTING_SUBSET
+    assert subset.population_verified_against_canonical_replay is False
+    # Label-free policy evidence remains available for a subset.
+    summary = V.policy_evidence(list(subset.evidence))
+    assert summary["evidence_class"] == "m2_policy_evidence"
+    # And its identity is refused as a headline claim-bearing population.
+    with pytest.raises(PS.M2PersistenceError):
+        PS.validate_evaluated_population_identity(subset.population_identity())

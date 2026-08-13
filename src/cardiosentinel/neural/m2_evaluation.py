@@ -57,6 +57,30 @@ EvaluationKey = tuple[str, int, int]
 POPULATION_SCOPE_FULL: Final = "full_population"
 POPULATION_SCOPE_SUPPORTING_SUBSET: Final = "supporting_subset"
 
+
+def canonical_population_digest(keys: Iterable[EvaluationKey]) -> str:
+    """The frozen ordered-stable-ID digest of an evaluation population.
+
+    Reuses the repository's existing ordered-stable-ID identity rather than
+    introducing another algorithm, so an evaluated population is expressed in
+    exactly the same terms as every other frozen row identity.
+    """
+    from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+    return ordered_stable_id_digest([stable_id_for_key(key) for key in sorted(keys)])
+
+
+def canonical_replay_population_digest(evidence: Iterable[M2RowEvidence]) -> str:
+    """The expected full-population identity, derived from the canonical replay.
+
+    This is the reference a headline claim must match. It is computed from the
+    replay's own evidence, independently of whatever annotation table a caller
+    later supplies, which is what makes a self-consistent subset unable to
+    masquerade as the full development population.
+    """
+    return canonical_population_digest(evaluation_key(row) for row in evidence)
+
+
 HEADLINE_EVIDENCE_FUNCTIONS: Final = (
     "window_evidence",
     "false_alarm_evidence",
@@ -154,7 +178,9 @@ class M2EvaluationBundle:
     keys: tuple[EvaluationKey, ...]
     evidence: tuple[M2RowEvidence, ...]
     annotations: tuple[M2AnnotationRow, ...]
-    population_scope: str = POPULATION_SCOPE_FULL
+    population_scope: str = POPULATION_SCOPE_SUPPORTING_SUBSET
+    population_verified_against_canonical_replay: bool = False
+    expected_population_digest: str | None = None
 
     @property
     def is_full_population(self) -> bool:
@@ -203,6 +229,10 @@ class M2EvaluationBundle:
             "identity_corresponds_to_frozen_stable_id": True,
             "positional_join_used": False,
             "population_scope": self.population_scope,
+            "population_verified_against_canonical_replay": (
+                self.population_verified_against_canonical_replay
+            ),
+            "expected_population_digest": self.expected_population_digest,
         }
 
 
@@ -211,6 +241,7 @@ def build_evaluation_bundle(
     evidence: Sequence[M2RowEvidence],
     annotations: Iterable[M2AnnotationRow],
     *,
+    expected_population_digest: str | None = None,
     require_full_population: bool = True,
 ) -> M2EvaluationBundle:
     """Join evidence to annotations by identity, refusing every ambiguity.
@@ -271,16 +302,42 @@ def build_evaluation_bundle(
             "row is never dropped from a metric, no prediction is invented and "
             "no denominator is altered automatically."
         )
+    # Population scope is DERIVED and VERIFIED, never trusted from the caller.
+    # Evidence and annotations covering each other proves only mutual
+    # consistency: a caller could subset the evidence first, annotate exactly
+    # that subset, and still be internally consistent. Full scope therefore
+    # requires the population to match the canonical replay population digest,
+    # which is computed independently of this annotation table.
+    scope = POPULATION_SCOPE_SUPPORTING_SUBSET
+    verified = False
+    observed_digest = canonical_population_digest(keys)
+    if require_full_population:
+        if expected_population_digest is None:
+            raise M2EvaluationError(
+                "A full-population evaluation bundle requires "
+                "expected_population_digest, the canonical replay population "
+                "identity. Without it, full scope cannot be verified and would "
+                "rest on the caller's assertion alone; pass "
+                "require_full_population=False for supporting evidence."
+            )
+        if observed_digest != expected_population_digest:
+            raise M2EvaluationError(
+                "The evaluated population does not match the canonical replay "
+                f"population: observed {observed_digest}, expected "
+                f"{expected_population_digest}. A self-consistent subset is not "
+                "a full-population claim."
+            )
+        scope = POPULATION_SCOPE_FULL
+        verified = True
+
     return M2EvaluationBundle(
         arm=evaluated_arm,
         keys=keys,
         evidence=joined_evidence,
         annotations=tuple(annotation_index[key] for key in keys),
-        population_scope=(
-            POPULATION_SCOPE_FULL
-            if require_full_population
-            else POPULATION_SCOPE_SUPPORTING_SUBSET
-        ),
+        population_scope=scope,
+        population_verified_against_canonical_replay=verified,
+        expected_population_digest=expected_population_digest,
     )
 
 
@@ -293,6 +350,12 @@ def require_full_population_bundle(bundle: M2EvaluationBundle, purpose: str) -> 
     population. Challenge stratification still happens *inside* the frozen
     metric functions, from the full joined population.
     """
+    if not bundle.population_verified_against_canonical_replay:
+        raise M2EvaluationError(
+            f"{purpose} is a headline claim-bearing metric and requires a "
+            "population VERIFIED against the canonical replay population "
+            "digest; this bundle was not verified."
+        )
     if not bundle.is_full_population:
         raise M2EvaluationError(
             f"{purpose} is a headline claim-bearing metric and requires a "

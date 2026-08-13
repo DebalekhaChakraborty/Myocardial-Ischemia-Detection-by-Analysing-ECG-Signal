@@ -1,39 +1,39 @@
-"""Claim-bearing M2 result/run-lock persistence with staged-then-promote safety.
+"""Claim-bearing M2 persistence: one canonical provenance path, one lock.
 
-A partial or interrupted run must never be able to look complete. Canonical
-artifacts are staged first and promoted only after every gate passes, in this
-order:
+A partial or interrupted run must never be able to look complete, and a
+canonical claim must never rest on anything but the frozen scientific runtime.
 
-1. computation finished successfully and the result is staged, not canonical;
-2. the forbidden-partition and artifact audits are GREEN;
-3. the COMPLETION runtime check is taken, after the last scientific computation;
-4. a final PRE_PROMOTION check is taken immediately before the promotion
-   itself -- the frozen design requires one before EVERY claim-bearing
-   promotion, including the arm claim directory, and that count is never
-   reduced to simplify ordering;
-5. the canonical provenance block is finalized INCLUDING start, every promotion
-   check and completion;
-6. the artifact hash is computed over exactly the bytes that get promoted;
-7. the finalized artifact is atomically promoted and the run marked COMPLETE.
+**The frozen digest is a production invariant.** Every canonical claim boundary
+requires `RuntimeIntegrityRecord.expected_digest == FROZEN_DEPENDENCY_DIGEST`
+and requires the recorded START observation to have expected, observed and
+matched that exact identity. A record configured to expect some other digest --
+useful for isolated mechanism tests -- can never produce a canonical claim, and
+the failure is detected at the claim boundary rather than deferred to final
+validation. The claim directory itself is claim-bearing.
 
-The COMPLETION observation is deliberately taken BEFORE the canonical artifact
-is written, so a promoted result carries a genuinely observed end digest rather
-than a fabricated one. A COMPLETION mismatch INVALIDATES canonical standing:
-nothing is promoted, the run can never end COMPLETE/canonical, and the staged
-result is retained as non-claim-bearing forensic material rather than deleted
-or silently rewritten.
+**One provenance path.** `build_canonical_run_lock()` is the only construction
+of canonical identity, and `finalize_and_promote_arm_result()` calls it
+directly; there is no second, weaker route by which a minimal result can become
+canonical.
 
-Run status follows the repository's existing convention: `STARTED`,
-`COMPLETE`, `FAILED_OR_INTERRUPTED`. A claim is expressed only by a promoted
-`COMPLETE` artifact.
+**The repository's existing lock convention.** Following the M1/P1/B4 pattern
+exactly: the claim-bearing result file holds no hash of itself; a separate
+immutable `M2_EXPERIMENT_LOCK.json` binds `artifact_sha256` for the promoted
+result plus the complete provenance, and carries its own
+`experiment_lock_sha256 = canonical_sha256(body)` over everything but that
+field. No second locking system is invented for M2.
 
-**The runner never selects an arm.** A two-arm M2 suite carries
-`memory_selection_performed: false` and `memory_selected: null` until a human
-review that this authorization explicitly does not perform.
+Ordering, unchanged from the accepted correction: stage -> audit -> COMPLETION
+-> final PRE_PROMOTION -> finalize -> hash the promoted bytes -> atomic promote
+-> COMPLETE. A COMPLETION mismatch invalidates canonical standing; the staged
+result is retained as non-claim-bearing forensic material.
+
+**The runner never selects an arm.**
 """
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,7 +49,14 @@ from cardiosentinel.neural.m2_execution import (
     require_permitted_partition,
 )
 from cardiosentinel.neural.m2_policy import M2_ARMS
-from cardiosentinel.neural.m2_scorer import RETAINED_M1L_LOCK_SHA256
+from cardiosentinel.neural.m2_scorer import (
+    FROZEN_B4B_CHECKPOINT_SHA256,
+    FROZEN_P1B_LOCK_SHA256,
+    M1L_CLASSIFICATION_THRESHOLD,
+    NORMAL_EVIDENCE_THRESHOLD,
+    RETAINED_M1L_CHECKPOINT_SHA256,
+    RETAINED_M1L_LOCK_SHA256,
+)
 from cardiosentinel.neural.p1_experiment import FROZEN_DEPENDENCY_DIGEST
 from cardiosentinel.neural.patient_memory import REPOSITORY_ROOT
 from cardiosentinel.neural.runtime_sentinel import (
@@ -67,9 +74,15 @@ STATUS_FAILED: Final = "FAILED_OR_INTERRUPTED"
 
 RUN_STATUS_NAME: Final = "M2_RUN_STATUS.json"
 ARM_RESULT_NAME: Final = "M2_ARM_RESULT.json"
+EXPERIMENT_LOCK_NAME: Final = "M2_EXPERIMENT_LOCK.json"
 SUITE_RESULT_NAME: Final = "M2_SUITE_RESULT.json"
 RUNTIME_FAILURE_NAME: Final = "M2_RUNTIME_INTEGRITY_FAILURE.json"
 STAGING_PREFIX: Final = ".staging-"
+
+CLAIM_DIRECTORY_PROMOTION_DETAIL: Final = "arm_claim_directory"
+
+_SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
+_GIT_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
 
 
 class M2PersistenceError(RuntimeError):
@@ -80,8 +93,59 @@ def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _require_sha256(label: str, value: Any) -> str:
+    if not isinstance(value, str) or not _SHA256_PATTERN.match(value):
+        raise M2PersistenceError(f"{label} is not a SHA-256 digest: {value!r}.")
+    return value
+
+
 # --------------------------------------------------------------------------
-# Provenance binding required of every canonical run
+# The frozen-digest invariant for every canonical claim boundary
+# --------------------------------------------------------------------------
+
+
+def require_frozen_runtime_record(runtime: RuntimeIntegrityRecord) -> None:
+    """A canonical claim may only rest on the frozen scientific identity.
+
+    A `RuntimeIntegrityRecord` may be configured to expect any digest, which is
+    useful for isolated mechanism tests. Production canonical claims must never
+    treat a matching non-frozen digest as sufficient, so this refuses anything
+    but the frozen identity -- and refuses a START observation that expected,
+    observed or matched anything else.
+    """
+    if runtime.expected_digest != FROZEN_DEPENDENCY_DIGEST:
+        raise M2PersistenceError(
+            f"A canonical M2 claim requires the frozen scientific identity "
+            f"{FROZEN_DEPENDENCY_DIGEST!r}; this record expects "
+            f"{runtime.expected_digest!r}. A matching non-frozen digest is "
+            "never sufficient for a canonical claim."
+        )
+    starts = [
+        check
+        for check in runtime.checks
+        if check.enforcement_point == EnforcementPoint.START.value
+    ]
+    if not starts:
+        raise M2PersistenceError(
+            "A canonical M2 claim requires a successful START runtime check "
+            "before any scientific input is opened; none is recorded."
+        )
+    for check in starts:
+        if check.expected_digest != FROZEN_DEPENDENCY_DIGEST:
+            raise M2PersistenceError(
+                "The recorded START check expected "
+                f"{check.expected_digest!r}, not the frozen identity."
+            )
+        if check.observed_digest != FROZEN_DEPENDENCY_DIGEST or not check.matches:
+            raise M2PersistenceError(
+                "The recorded START check did not observe the frozen "
+                f"identity (observed {check.observed_digest!r}); no canonical "
+                "claim may be created."
+            )
+
+
+# --------------------------------------------------------------------------
+# Canonical run lock -- the ONE provenance construction path
 # --------------------------------------------------------------------------
 
 REQUIRED_PROVENANCE_FIELDS: Final = (
@@ -104,46 +168,72 @@ REQUIRED_PROVENANCE_FIELDS: Final = (
     "signal_v1_schema_sha256",
     "morphology_v1_schema_sha256",
     "combined_v1_schema_sha256",
+    "evaluated_population_identity",
+    "m1l_classification_threshold",
+    "normal_evidence_threshold",
     "runtime_dependency_digest_start",
     "runtime_dependency_digest_pre_promotion",
     "runtime_dependency_digest_end",
+    "runtime_identity_checks",
     "partition_accessed",
     "validation_accessed",
     "test_accessed",
     "sealed_test_state",
-    "m1l_classification_threshold",
-    "normal_evidence_threshold",
-    "evaluated_population_identity",
     "started_at",
     "completed_at",
     "artifact_sha256",
+    "automatic_retry_performed",
+    "repeat_attempt_permitted",
+    "rollback",
+    "memory_selection_performed",
+    "memory_selected",
 )
 
+_REQUIRED_SHA_FIELDS: Final = (
+    "m2_protocol_sha256",
+    "m2_gate_receipt_sha256",
+    "m1_retention_decision_sha256",
+    "retained_m1l_lock_sha256",
+    "retained_m1l_checkpoint_sha256",
+    "p1b_lock_sha256",
+    "b4b_checkpoint_sha256",
+    "distance_standardizer_sha256",
+    "split_sha256",
+    "feature_corpus_sha256",
+    "ordered_chronology_sha256",
+    "stream_cache_sha256",
+    "signal_v1_schema_sha256",
+    "morphology_v1_schema_sha256",
+    "combined_v1_schema_sha256",
+)
 
-def build_run_provenance(
+_FROZEN_IDENTITY_EXPECTATIONS: Final = {
+    "m2_protocol_sha256": GATE.M2_PROTOCOL_SHA256,
+    "m2_gate_receipt_sha256": GATE.M2_GATE_RECEIPT_SHA256,
+    "retained_m1l_lock_sha256": RETAINED_M1L_LOCK_SHA256,
+    "retained_m1l_checkpoint_sha256": RETAINED_M1L_CHECKPOINT_SHA256,
+    "p1b_lock_sha256": FROZEN_P1B_LOCK_SHA256,
+    "b4b_checkpoint_sha256": FROZEN_B4B_CHECKPOINT_SHA256,
+}
+
+
+def build_canonical_run_lock(
     *,
     experiment_id: str,
     arm: str,
     execution_identity: dict[str, Any],
     runtime: RuntimeIntegrityRecord,
+    evaluated_population_identity: dict[str, Any] | None,
     started_at: str,
     completed_at: str,
     artifact_sha256: dict[str, str],
-    evaluated_population_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Bind every identity a canonical M2 run must carry.
+    """Construct the one canonical M2 run lock.
 
-    `evaluated_population_identity` is the exact evaluated row set, bound
-    through the existing frozen ordered-stable-ID digest -- not merely a row
-    count, and deliberately not a second dataset identity mechanism. It comes
-    from `M2EvaluationBundle.population_identity()`. It is `None` only for a
-    run that produced no label-joined evaluation.
+    This is the only place canonical identity is assembled. Finalization calls
+    it directly, so a minimal result cannot become canonical by bypassing it.
     """
     from cardiosentinel.features.schema import COMBINED_V1, MORPHOLOGY_V1, SIGNAL_V1
-    from cardiosentinel.neural.m2_scorer import (
-        M1L_CLASSIFICATION_THRESHOLD,
-        NORMAL_EVIDENCE_THRESHOLD,
-    )
 
     if arm not in M2_ARMS:
         raise M2PersistenceError(f"Unknown M2 arm {arm!r}.")
@@ -152,7 +242,8 @@ def build_run_provenance(
     scorer = execution_identity["scorer_identity"]
     partition = require_permitted_partition(inputs["partition"])
 
-    payload: dict[str, Any] = {
+    lock: dict[str, Any] = {
+        "lock_class": "m2_v1_canonical_arm_run_lock",
         "experiment_id": experiment_id,
         "arm": arm,
         "git_sha": provenance["git_sha"],
@@ -174,6 +265,12 @@ def build_run_provenance(
         "signal_v1_schema_sha256": SIGNAL_V1.sha256,
         "morphology_v1_schema_sha256": MORPHOLOGY_V1.sha256,
         "combined_v1_schema_sha256": COMBINED_V1.sha256,
+        "evaluated_population_identity": evaluated_population_identity,
+        "m1l_classification_threshold": M1L_CLASSIFICATION_THRESHOLD,
+        "normal_evidence_threshold": NORMAL_EVIDENCE_THRESHOLD,
+        "classification_threshold_used_for_admission": False,
+        "classifier_retrained": False,
+        "threshold_selected_during_run": False,
         "runtime_dependency_digest_start": runtime.digest_at(EnforcementPoint.START),
         "runtime_dependency_digest_pre_promotion": runtime.digest_at(
             EnforcementPoint.PRE_PROMOTION
@@ -184,35 +281,202 @@ def build_run_provenance(
         "validation_accessed": False,
         "test_accessed": False,
         "sealed_test_state": "unopened",
-        "m1l_classification_threshold": M1L_CLASSIFICATION_THRESHOLD,
-        "normal_evidence_threshold": NORMAL_EVIDENCE_THRESHOLD,
-        "evaluated_population_identity": evaluated_population_identity,
-        "classification_threshold_used_for_admission": False,
-        "classifier_retrained": False,
-        "threshold_selected_during_run": False,
-        "rollback": False,
         "started_at": started_at,
         "completed_at": completed_at,
         "artifact_sha256": dict(artifact_sha256),
         "automatic_retry_performed": False,
         "repeat_attempt_permitted": False,
+        "rollback": False,
+        "memory_selection_performed": False,
+        "memory_selected": None,
     }
-    missing = [field for field in REQUIRED_PROVENANCE_FIELDS if field not in payload]
+    lock["experiment_lock_sha256"] = canonical_sha256(lock)
+    return lock
+
+
+def validate_canonical_run_lock(
+    lock: dict[str, Any],
+    *,
+    run_dir: Path | None = None,
+    requires_evaluation: bool = True,
+) -> dict[str, Any]:
+    """Validate the ACTUAL values of a canonical lock, not merely their keys."""
+    recorded = lock.get("experiment_lock_sha256")
+    body = {k: v for k, v in lock.items() if k != "experiment_lock_sha256"}
+    if recorded is None or recorded != canonical_sha256(body):
+        raise M2PersistenceError("M2 experiment lock failed digest validation.")
+
+    missing = [field for field in REQUIRED_PROVENANCE_FIELDS if field not in lock]
     if missing:
-        raise M2PersistenceError(f"Run provenance is missing {missing}.")
-    return payload
+        raise M2PersistenceError(f"Canonical M2 lock is missing {missing}.")
+    # `memory_selected` is null by design; `evaluated_population_identity` is
+    # governed by `requires_evaluation` below, so a run that produced no
+    # label-joined evaluation is not forced to invent one.
+    _nullable = {"memory_selected", "evaluated_population_identity"}
+    empty = [
+        field
+        for field in REQUIRED_PROVENANCE_FIELDS
+        if lock[field] is None and field not in _nullable
+    ]
+    if empty:
+        raise M2PersistenceError(
+            f"Canonical M2 lock carries None where a real identity is "
+            f"required: {empty}."
+        )
+
+    if lock["arm"] not in M2_ARMS:
+        raise M2PersistenceError(f"Unknown M2 arm {lock['arm']!r}.")
+    if not isinstance(lock["git_sha"], str) or not _GIT_SHA_PATTERN.match(
+        lock["git_sha"]
+    ):
+        raise M2PersistenceError(f"git_sha is malformed: {lock['git_sha']!r}.")
+    if lock["git_dirty"] is not False:
+        raise M2PersistenceError(
+            "Canonical M2 evidence requires a clean Git checkout, matching the "
+            "existing P1/M1 convention."
+        )
+    for field in _REQUIRED_SHA_FIELDS:
+        _require_sha256(field, lock[field])
+    for field, expected in _FROZEN_IDENTITY_EXPECTATIONS.items():
+        if lock[field] != expected:
+            raise M2PersistenceError(
+                f"{field} is {lock[field]!r}, expected the frozen {expected!r}."
+            )
+    if lock["m1l_classification_threshold"] != M1L_CLASSIFICATION_THRESHOLD:
+        raise M2PersistenceError("The lock does not bind the frozen M1L threshold.")
+    if lock["normal_evidence_threshold"] != NORMAL_EVIDENCE_THRESHOLD:
+        raise M2PersistenceError("The lock does not bind the frozen M2 margin.")
+    if lock.get("classification_threshold_used_for_admission") is not False:
+        raise M2PersistenceError(
+            "The classification threshold must never gate memory admission."
+        )
+
+    require_permitted_partition(lock["partition_accessed"])
+    for flag in ("validation_accessed", "test_accessed"):
+        if lock[flag] is not False:
+            raise M2PersistenceError(f"A canonical M2 lock must record {flag}=false.")
+    if lock["sealed_test_state"] != "unopened":
+        raise M2PersistenceError("The B4 sealed test must remain unopened.")
+    for flag in ("automatic_retry_performed", "repeat_attempt_permitted", "rollback"):
+        if lock[flag] is not False:
+            raise M2PersistenceError(f"A canonical M2 lock must record {flag}=false.")
+    if lock["memory_selection_performed"] is not False:
+        raise M2PersistenceError("A canonical M2 run performs no arm selection.")
+    if lock["memory_selected"] is not None:
+        raise M2PersistenceError("A canonical M2 run selects no arm automatically.")
+
+    for label in ("start", "pre_promotion", "end"):
+        _require_sha256(
+            f"runtime_dependency_digest_{label}",
+            lock[f"runtime_dependency_digest_{label}"],
+        )
+        if lock[f"runtime_dependency_digest_{label}"] != FROZEN_DEPENDENCY_DIGEST:
+            raise M2PersistenceError(
+                f"runtime_dependency_digest_{label} is not the frozen identity."
+            )
+    checks = lock["runtime_identity_checks"]
+    if checks.get("all_observations_matched") is not True:
+        raise M2PersistenceError(
+            "Canonical evidence requires every runtime observation to match."
+        )
+
+    if requires_evaluation:
+        validate_evaluated_population_identity(lock["evaluated_population_identity"])
+
+    artifacts = dict(lock["artifact_sha256"])
+    if not artifacts:
+        raise M2PersistenceError("A canonical M2 lock binds no artifact hash.")
+    for name, digest in artifacts.items():
+        _require_sha256(f"artifact_sha256[{name}]", digest)
+        if run_dir is not None:
+            path = Path(run_dir) / name
+            if not path.is_file() or sha256_file(path) != digest:
+                raise M2PersistenceError(
+                    f"M2 artifact {name} does not match its lock digest."
+                )
+    return lock
+
+
+def validate_evaluated_population_identity(
+    identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Require a real, verified, full-scope evaluated-population identity."""
+    from cardiosentinel.neural.m2_evaluation import POPULATION_SCOPE_FULL
+
+    if not identity:
+        raise M2PersistenceError(
+            "A claim-bearing M2 result containing label-joined evaluation must "
+            "bind evaluated_population_identity; None or {} is refused."
+        )
+    rows = identity.get("evaluated_rows")
+    if not isinstance(rows, int) or rows <= 0:
+        raise M2PersistenceError(
+            f"evaluated_rows must be a positive integer; received {rows!r}."
+        )
+    _require_sha256(
+        "evaluated_ordered_stable_id_sha256",
+        identity.get("evaluated_ordered_stable_id_sha256"),
+    )
+    if not identity.get("identity_key"):
+        raise M2PersistenceError("evaluated population identity names no identity key.")
+    if identity.get("positional_join_used") is not False:
+        raise M2PersistenceError(
+            "A claim-bearing evaluated population must record "
+            "positional_join_used=false."
+        )
+    if identity.get("population_scope") != POPULATION_SCOPE_FULL:
+        raise M2PersistenceError(
+            f"Headline claim-bearing evaluation requires "
+            f"{POPULATION_SCOPE_FULL!r}; received "
+            f"{identity.get('population_scope')!r}."
+        )
+    if identity.get("population_verified_against_canonical_replay") is not True:
+        raise M2PersistenceError(
+            "A claim-bearing full population must be VERIFIED against the "
+            "canonical replay population digest, not merely self-consistent."
+        )
+    return dict(identity)
+
+
+def validate_complete_runtime_identity(
+    runtime: RuntimeIntegrityRecord,
+) -> dict[str, Any]:
+    """Require a COMPLETE, GREEN, frozen runtime block -- not a present field."""
+    require_frozen_runtime_record(runtime)
+    points = {check.enforcement_point for check in runtime.checks}
+    for required in (
+        EnforcementPoint.START,
+        EnforcementPoint.PRE_PROMOTION,
+        EnforcementPoint.COMPLETION,
+    ):
+        if required.value not in points:
+            raise M2PersistenceError(
+                f"Canonical COMPLETE evidence requires a {required.value!r} "
+                "runtime observation; none is recorded."
+            )
+    for label, digest in (
+        ("start", runtime.digest_at(EnforcementPoint.START)),
+        ("completion", runtime.digest_at(EnforcementPoint.COMPLETION)),
+    ):
+        if digest is None:
+            raise M2PersistenceError(
+                f"runtime_dependency_digest_{label} is None; canonical COMPLETE "
+                "evidence may never carry an unobserved digest."
+            )
+    if not runtime.all_matched:
+        mismatch = runtime.first_mismatch()
+        raise M2PersistenceError(
+            "Canonical COMPLETE evidence requires every runtime observation to "
+            f"match; {mismatch.enforcement_point!r} observed "
+            f"{mismatch.observed_digest}."
+        )
+    return runtime.as_dict()
 
 
 def build_suite_result(
-    *,
-    suite_id: str,
-    arm_results: dict[str, dict[str, Any]],
+    *, suite_id: str, arm_results: dict[str, dict[str, Any]]
 ) -> dict[str, Any]:
-    """A two-arm suite that expresses no retention decision.
-
-    `memory_selection_performed` stays false and `memory_selected` stays null
-    until a human review. The runner never automatically prefers M2-G.
-    """
+    """A two-arm suite that expresses no retention decision."""
     if set(arm_results) != set(M2_ARMS):
         raise M2PersistenceError(
             f"An M2 suite binds exactly {M2_ARMS}; received {sorted(arm_results)}."
@@ -236,7 +500,7 @@ def build_suite_result(
 
 
 # --------------------------------------------------------------------------
-# Staged-then-promote persistence
+# Claim + staged-then-promote
 # --------------------------------------------------------------------------
 
 
@@ -254,9 +518,6 @@ class M2RunDirectory:
         return self.run_dir.parent / f"{STAGING_PREFIX}{self.run_dir.name}"
 
 
-CLAIM_DIRECTORY_PROMOTION_DETAIL: Final = "arm_claim_directory"
-
-
 def claim_run_directory(
     run_root: Path,
     experiment_id: str,
@@ -266,36 +527,15 @@ def claim_run_directory(
 ) -> M2RunDirectory:
     """Atomically claim the one canonical attempt. The directory IS the claim.
 
-    Creating an arm claim directory is itself a claim-bearing promotion under
-    the frozen sentinel design, so it carries its own PRE_PROMOTION runtime
-    check. That check is taken BEFORE `mkdir`: on mismatch no canonical claim
-    directory comes into existence at all. The START check is not accepted as a
-    substitute -- the environment can move between the two.
-
-    There is no force, overwrite, retry, reseed or delete path. If the
-    directory already exists in any state the attempt is consumed and this
-    refuses, exactly as the M1 convention does.
+    The claim boundary requires the frozen scientific identity (record
+    expectation AND the recorded START observation), then takes its own
+    PRE_PROMOTION observation against that same frozen identity, and only then
+    creates the directory. A non-frozen record is refused here rather than at
+    final validation, because the directory itself is claim-bearing.
     """
     if arm not in M2_ARMS:
         raise M2PersistenceError(f"Unknown M2 arm {arm!r}.")
-
-    start = runtime.digest_at(EnforcementPoint.START)
-    if start is None:
-        raise M2PersistenceError(
-            "A canonical M2 claim requires a successful START runtime check "
-            "before any scientific input is opened; none is recorded."
-        )
-    if not all(
-        check.matches
-        for check in runtime.checks
-        if check.enforcement_point == EnforcementPoint.START.value
-    ):
-        raise M2PersistenceError(
-            "The recorded START runtime check did not match the frozen "
-            "identity; no canonical claim may be created."
-        )
-
-    # Claim-boundary PRE_PROMOTION check. Raises before mkdir on mismatch.
+    require_frozen_runtime_record(runtime)
     require_runtime_identity(
         EnforcementPoint.PRE_PROMOTION,
         record=runtime,
@@ -339,6 +579,7 @@ def record_failure(
         "arm": claimed.arm,
         "status": STATUS_FAILED,
         "claim_bearing_result_promoted": False,
+        "canonical": False,
         "reason": reason,
         "started_at": claimed.started_at,
         "updated_at": _now(),
@@ -360,149 +601,6 @@ def record_failure(
     return payload
 
 
-def validate_complete_runtime_identity(
-    runtime: RuntimeIntegrityRecord,
-) -> dict[str, Any]:
-    """Require a COMPLETE, GREEN runtime block -- not merely a present field.
-
-    A key whose value is `None` does not satisfy a provenance contract. Every
-    required observation must exist AND match, so it is impossible to promote
-    canonical COMPLETE evidence with a missing or mismatched digest at any
-    enforcement point.
-    """
-    if runtime.expected_digest != FROZEN_DEPENDENCY_DIGEST:
-        raise M2PersistenceError(
-            f"The runtime record expects {runtime.expected_digest!r}, not the "
-            f"frozen scientific identity {FROZEN_DEPENDENCY_DIGEST!r}."
-        )
-    points = {check.enforcement_point for check in runtime.checks}
-    for required in (
-        EnforcementPoint.START,
-        EnforcementPoint.PRE_PROMOTION,
-        EnforcementPoint.COMPLETION,
-    ):
-        if required.value not in points:
-            raise M2PersistenceError(
-                f"Canonical COMPLETE evidence requires a {required.value!r} "
-                "runtime observation; none is recorded."
-            )
-    for label, digest in (
-        ("start", runtime.digest_at(EnforcementPoint.START)),
-        ("completion", runtime.digest_at(EnforcementPoint.COMPLETION)),
-    ):
-        if digest is None:
-            raise M2PersistenceError(
-                f"runtime_dependency_digest_{label} is None; canonical COMPLETE "
-                "evidence may never carry an unobserved digest."
-            )
-    if not runtime.all_matched:
-        mismatch = runtime.first_mismatch()
-        raise M2PersistenceError(
-            "Canonical COMPLETE evidence requires every runtime observation to "
-            f"match; {mismatch.enforcement_point!r} observed "
-            f"{mismatch.observed_digest}."
-        )
-    return runtime.as_dict()
-
-
-def validate_evaluated_population_identity(
-    identity: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Require a real, non-empty evaluated-population identity.
-
-    Reuses the existing frozen ordered-stable-ID digest; no second population
-    identity algorithm is introduced.
-    """
-    if not identity:
-        raise M2PersistenceError(
-            "A claim-bearing M2 result containing label-joined evaluation must "
-            "bind evaluated_population_identity; None or {} is refused."
-        )
-    rows = identity.get("evaluated_rows")
-    if not isinstance(rows, int) or rows <= 0:
-        raise M2PersistenceError(
-            f"evaluated_rows must be a positive integer; received {rows!r}."
-        )
-    digest = identity.get("evaluated_ordered_stable_id_sha256")
-    if not isinstance(digest, str) or len(digest) != 64:
-        raise M2PersistenceError(
-            f"evaluated_ordered_stable_id_sha256 is malformed: {digest!r}."
-        )
-    try:
-        int(digest, 16)
-    except ValueError as error:
-        raise M2PersistenceError(
-            f"evaluated_ordered_stable_id_sha256 is not hexadecimal: {digest!r}."
-        ) from error
-    if not identity.get("identity_key"):
-        raise M2PersistenceError("evaluated population identity names no identity key.")
-    if identity.get("positional_join_used") is not False:
-        raise M2PersistenceError(
-            "A claim-bearing evaluated population must record "
-            "positional_join_used=false."
-        )
-    return dict(identity)
-
-
-def validate_claim_bearing_arm_result(
-    result: dict[str, Any],
-    *,
-    execution_identity: dict[str, Any],
-    runtime: RuntimeIntegrityRecord,
-    requires_evaluation: bool,
-) -> dict[str, Any]:
-    """The single final gate an M2 arm result must pass before promotion.
-
-    It verifies identities, thresholds, partition authorization, runtime
-    completeness and the absence of any retention selection. It computes and
-    tunes no scientific metric, and it never selects an arm.
-    """
-    from cardiosentinel.neural.m2_scorer import (
-        M1L_CLASSIFICATION_THRESHOLD,
-        NORMAL_EVIDENCE_THRESHOLD,
-    )
-
-    if result.get("arm") not in M2_ARMS:
-        raise M2PersistenceError(
-            f"Unknown or missing arm in result: {result.get('arm')!r}."
-        )
-    if result.get("scientific_computation_completed") is not True:
-        raise M2PersistenceError(
-            "A claim-bearing result must record scientific_computation_completed=true."
-        )
-    if result.get("m2_protocol_sha256") != GATE.M2_PROTOCOL_SHA256:
-        raise M2PersistenceError("The result does not bind the frozen M2 protocol.")
-    if result.get("m2_gate_receipt_sha256") != GATE.M2_GATE_RECEIPT_SHA256:
-        raise M2PersistenceError("The result does not bind the canonical gate receipt.")
-
-    scorer = execution_identity["scorer_identity"]
-    if scorer["retained_lock_sha256"] != RETAINED_M1L_LOCK_SHA256:
-        raise M2PersistenceError("The result does not bind the retained M1L lock.")
-    if scorer["classification_threshold"] != M1L_CLASSIFICATION_THRESHOLD:
-        raise M2PersistenceError("The result does not bind the frozen M1L threshold.")
-    if scorer["memory_admission_threshold"] != NORMAL_EVIDENCE_THRESHOLD:
-        raise M2PersistenceError("The result does not bind the frozen M2 margin.")
-    if scorer["classification_threshold_used_for_memory_admission"] is not False:
-        raise M2PersistenceError(
-            "The classification threshold must never gate memory admission."
-        )
-
-    audit_forbidden_partitions(execution_identity)
-    validate_complete_runtime_identity(runtime)
-
-    if requires_evaluation:
-        validate_evaluated_population_identity(
-            result.get("evaluated_population_identity")
-        )
-    if result.get("memory_selection_performed") not in (None, False):
-        raise M2PersistenceError("A canonical M2 run performs no arm selection.")
-    if result.get("memory_selected") not in (None,):
-        raise M2PersistenceError("A canonical M2 run selects no arm automatically.")
-    if result.get("rollback") not in (None, False):
-        raise M2PersistenceError("Rollback is excluded from the claim-bearing core.")
-    return result
-
-
 def audit_forbidden_partitions(execution_identity: dict[str, Any]) -> None:
     """Refuse promotion of anything that touched a forbidden partition."""
     partition = str(execution_identity.get("partition_accessed", "")).lower()
@@ -519,6 +617,25 @@ def audit_forbidden_partitions(execution_identity: dict[str, Any]) -> None:
         raise M2PersistenceError("The B4 sealed test must remain unopened.")
 
 
+def _retain_forensic_failure(claimed: M2RunDirectory, check: Any, reason: str) -> None:
+    """Record a refused promotion. Staged evidence is retained, never deleted."""
+    provenance = git_provenance(REPOSITORY_ROOT)
+    record_failure(claimed, reason, runtime_check=check)
+    write_json_atomic(
+        claimed.run_dir / RUNTIME_FAILURE_NAME,
+        {
+            **runtime_failure_record(
+                check,
+                git_sha=str(provenance["git_sha"]),
+                git_dirty=bool(provenance["git_dirty"]),
+                experiment_id=claimed.experiment_id,
+            ),
+            "staged_result_retained_as_forensic_material": True,
+            "canonical_promotion_invalidated": True,
+        },
+    )
+
+
 def finalize_and_promote_arm_result(
     claimed: M2RunDirectory,
     *,
@@ -528,32 +645,14 @@ def finalize_and_promote_arm_result(
     evaluated_population_identity: dict[str, Any] | None = None,
     requires_evaluation: bool = True,
 ) -> dict[str, Any]:
-    """Stage, gate, finalize, then atomically promote one arm's result.
+    """Stage, gate, finalize and atomically promote one arm's result.
 
-    The ordering matters and is the frozen sentinel design's, not a
-    convenience: the COMPLETION observation is taken BEFORE the canonical
-    provenance block is constructed, so the promoted artifact carries a
-    genuinely observed end digest rather than a fabricated one.
-
-    A. computation has finished (asserted by the caller's result flag);
-    B. the result is staged, not yet canonical;
-    C. forbidden-partition and artifact validation succeed;
-    D. the COMPLETION runtime check is taken after the last computation;
-    E. a final PRE_PROMOTION check is taken immediately before the promotion
-       itself -- the design requires one before EVERY claim-bearing promotion,
-       and that count is not reduced to simplify ordering;
-    F. the canonical provenance block is finalized INCLUDING start, every
-       promotion check and completion;
-    G. the artifact hash is computed over the finalized bytes actually promoted;
-    H. the finalized artifact is atomically promoted;
-    I. the run is marked COMPLETE.
-
-    Any runtime mismatch at C-E refuses canonical promotion outright. A
-    COMPLETION mismatch INVALIDATES canonical standing: the run can never end
-    COMPLETE/canonical, nothing is promoted to the canonical location, and the
-    staged result is retained as non-claim-bearing forensic material rather
-    than deleted or silently rewritten.
+    The result file never contains a hash of itself. Following the repository's
+    existing convention, a separate immutable `M2_EXPERIMENT_LOCK.json` binds
+    the promoted result's SHA-256 alongside the complete canonical provenance,
+    and carries its own self-digest over its remaining body.
     """
+    require_frozen_runtime_record(runtime)
     staging = claimed.staging_dir
     staging.mkdir(parents=True, exist_ok=True)
     staged_path = staging / ARM_RESULT_NAME
@@ -561,14 +660,10 @@ def finalize_and_promote_arm_result(
     if result.get("arm") != claimed.arm:
         raise M2PersistenceError("The staged result's arm disagrees with the claim.")
     staged = dict(result)
-    if evaluated_population_identity is not None:
-        staged["evaluated_population_identity"] = dict(evaluated_population_identity)
     write_json_atomic(staged_path, staged)
 
-    # C. partition/authorization audit before anything else is considered.
     audit_forbidden_partitions(execution_identity)
 
-    # D. COMPLETION, taken after the last scientific computation.
     completion = observe_runtime_identity(
         EnforcementPoint.COMPLETION,
         expected_digest=runtime.expected_digest,
@@ -589,7 +684,6 @@ def finalize_and_promote_arm_result(
             "as non-claim-bearing forensic material."
         )
 
-    # E. final PRE_PROMOTION, immediately before the promotion itself.
     pre_promotion = observe_runtime_identity(
         EnforcementPoint.PRE_PROMOTION,
         expected_digest=runtime.expected_digest,
@@ -598,49 +692,42 @@ def finalize_and_promote_arm_result(
     runtime.record(pre_promotion)
     if not pre_promotion.matches:
         _retain_forensic_failure(
-            claimed,
-            pre_promotion,
-            "runtime identity differed immediately before promotion",
+            claimed, pre_promotion, "runtime identity differed before promotion"
         )
         raise RuntimeIntegrityError(
             "Runtime identity differed at PRE_PROMOTION; the claim-bearing "
-            "result was NOT promoted, the environment was NOT repaired and the "
-            "attempt is consumed."
+            "result was NOT promoted and the attempt is consumed."
         )
 
-    # F. finalize the canonical provenance with every observation present.
-    finalized = dict(staged)
-    finalized["runtime_identity_checks"] = validate_complete_runtime_identity(runtime)
-    finalized["runtime_dependency_digest_start"] = runtime.digest_at(
-        EnforcementPoint.START
-    )
-    finalized["runtime_dependency_digest_pre_promotion"] = runtime.digest_at(
-        EnforcementPoint.PRE_PROMOTION
-    )
-    finalized["runtime_dependency_digest_end"] = runtime.digest_at(
-        EnforcementPoint.COMPLETION
-    )
-    finalized["completed_at"] = _now()
-    validate_claim_bearing_arm_result(
-        finalized,
+    validate_complete_runtime_identity(runtime)
+
+    # Hash exactly the bytes that will be promoted, then bind them in the lock.
+    artifact_digest = sha256_file(staged_path)
+    lock = build_canonical_run_lock(
+        experiment_id=claimed.experiment_id,
+        arm=claimed.arm,
         execution_identity=execution_identity,
         runtime=runtime,
-        requires_evaluation=requires_evaluation,
+        evaluated_population_identity=evaluated_population_identity,
+        started_at=claimed.started_at,
+        completed_at=_now(),
+        artifact_sha256={ARM_RESULT_NAME: artifact_digest},
     )
+    validate_canonical_run_lock(lock, requires_evaluation=requires_evaluation)
 
-    # G-H. hash exactly the bytes promoted, then promote atomically.
-    write_json_atomic(staged_path, finalized)
-    artifact_digest = sha256_file(staged_path)
     canonical_path = claimed.run_dir / ARM_RESULT_NAME
-    write_json_atomic(canonical_path, finalized)
+    write_json_atomic(canonical_path, staged)
     if sha256_file(canonical_path) != artifact_digest:
         raise M2PersistenceError(
             "The promoted canonical artifact does not match the hashed bytes."
         )
+    write_json_atomic(claimed.run_dir / EXPERIMENT_LOCK_NAME, lock)
+    validate_canonical_run_lock(
+        lock, run_dir=claimed.run_dir, requires_evaluation=requires_evaluation
+    )
     staged_path.unlink()
     staging.rmdir()
 
-    # I. COMPLETE.
     status = {
         "experiment_id": claimed.experiment_id,
         "arm": claimed.arm,
@@ -649,30 +736,12 @@ def finalize_and_promote_arm_result(
         "canonical": True,
         "started_at": claimed.started_at,
         "updated_at": _now(),
+        "experiment_lock_sha256": lock["experiment_lock_sha256"],
         "artifact_sha256": {ARM_RESULT_NAME: artifact_digest},
         "runtime_identity_checks": runtime.as_dict(),
     }
     write_json_atomic(claimed.run_dir / RUN_STATUS_NAME, status)
     return status
-
-
-def _retain_forensic_failure(claimed: M2RunDirectory, check: Any, reason: str) -> None:
-    """Record a refused promotion. Staged evidence is retained, never deleted."""
-    provenance = git_provenance(REPOSITORY_ROOT)
-    record_failure(claimed, reason, runtime_check=check)
-    write_json_atomic(
-        claimed.run_dir / RUNTIME_FAILURE_NAME,
-        {
-            **runtime_failure_record(
-                check,
-                git_sha=str(provenance["git_sha"]),
-                git_dirty=bool(provenance["git_dirty"]),
-                experiment_id=claimed.experiment_id,
-            ),
-            "staged_result_retained_as_forensic_material": True,
-            "canonical_promotion_invalidated": True,
-        },
-    )
 
 
 def require_runtime_start(runtime: RuntimeIntegrityRecord, detail: str) -> None:
