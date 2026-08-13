@@ -36,6 +36,15 @@ LOCAL_SKIP = "requires the local frozen corpus/checkpoint (gitignored)"
 
 FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
 
+# Only the dedicated scientific interpreter carries the frozen package
+# identity. CI builds its own environment from pyproject extras, so a digest
+# mismatch there is the sentinel working correctly, not a defect: canonical
+# runs are expected to execute exclusively in the frozen interpreter.
+IN_FROZEN_SCIENTIFIC_RUNTIME = (
+    S.observe_runtime_identity(S.EnforcementPoint.START).observed_digest
+    == FROZEN_DIGEST
+)
+
 
 # --------------------------------------------------------------------------
 # 1-4. Frozen identities accepted; altered identities rejected
@@ -247,11 +256,38 @@ def test_execution_module_does_not_import_the_sealed_test_evaluator():
 # --------------------------------------------------------------------------
 
 
-def test_sentinel_passes_the_expected_snapshot():
+@pytest.mark.skipif(
+    not IN_FROZEN_SCIENTIFIC_RUNTIME,
+    reason=(
+        "only the frozen scientific interpreter carries the canonical "
+        "335-package identity; CI legitimately builds its own environment, and "
+        "the sentinel is SUPPOSED to report a mismatch there"
+    ),
+)
+def test_sentinel_passes_in_the_frozen_scientific_runtime():
     check = S.observe_runtime_identity(S.EnforcementPoint.START)
     assert check.matches is True
     assert check.observed_digest == FROZEN_DIGEST
     assert check.package_count == 335
+
+
+def test_sentinel_detects_a_non_frozen_runtime_in_any_environment():
+    """The mechanism, checked without assuming the ambient environment.
+
+    This must hold everywhere, including CI: an environment that is not the
+    frozen scientific runtime has to be reported as a mismatch and must refuse
+    a claim-bearing promotion. A canonical run is expected to execute only in
+    the frozen interpreter.
+    """
+    record = S.RuntimeIntegrityRecord(expected_digest="f" * 64)
+    check = S.observe_runtime_identity(
+        S.EnforcementPoint.START, expected_digest="f" * 64
+    )
+    assert check.matches is False
+    assert check.observed_digest != "f" * 64
+    with pytest.raises(S.RuntimeIntegrityError):
+        S.require_runtime_identity(S.EnforcementPoint.START, record=record)
+    assert record.all_matched is False
 
 
 def test_sentinel_uses_the_official_digest_recipe_not_a_second_one():
@@ -457,11 +493,18 @@ def test_uncertainty_and_episode_packages_remain_placeholders():
 
 
 # --------------------------------------------------------------------------
-# Real-artifact integration (local data only)
+# Real-artifact integration (frozen scientific runtime + local data only)
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not LOCAL_DATA, reason=LOCAL_SKIP)
+@pytest.mark.skipif(
+    not (LOCAL_DATA and IN_FROZEN_SCIENTIFIC_RUNTIME),
+    reason=(
+        "the smoke exercises the sentinel, which correctly refuses to run "
+        "outside the frozen scientific runtime, and needs the gitignored "
+        "frozen corpus/checkpoint"
+    ),
+)
 def test_bounded_train_smoke_is_non_claim_bearing():
     report = X.train_integration_smoke(("s20011",), max_rows_per_stream=8)
     assert report["artifact_class"] == "NON_CLAIM_BEARING_TRAIN_INTEGRATION_SMOKE"
