@@ -874,20 +874,46 @@ def contamination_evidence(
                 "trajectory; an interval may never be applied to another "
                 "stream merely because its timestamps overlap."
             )
-        entry = interval_drift_evidence(
-            trajectories[key],
-            stress_start_time=float(interval.start_time),
-            stress_end_time=float(interval.end_time),
-        )
-        entry["family"] = interval.family
-        entry["record_id"] = interval.record_id
-        entry["channel_index"] = int(interval.channel_index)
-        entry["evidence_status"] = (
-            CONDUCTION_EVIDENCE_STATUS
-            if interval.family == "conduction_change"
-            else QUANTITATIVE_CHALLENGE_STATUS
-        )
-        results.append(entry)
+        results.append(_interval_entry(trajectories[key], interval))
+    return _contamination_payload(
+        results,
+        replay_population=replay_population,
+        stress_selection_identity=stress_selection_identity,
+        streamed=False,
+    )
+
+
+def _interval_entry(
+    trajectory: PrototypeTrajectory, interval: M2StressInterval
+) -> dict[str, Any]:
+    """One interval's frozen drift evidence. The single shared implementation.
+
+    Both the whole-dict and the one-stream-at-a-time paths call this, so the
+    streaming form cannot drift numerically from the frozen one.
+    """
+    entry = interval_drift_evidence(
+        trajectory,
+        stress_start_time=float(interval.start_time),
+        stress_end_time=float(interval.end_time),
+    )
+    entry["family"] = interval.family
+    entry["record_id"] = interval.record_id
+    entry["channel_index"] = int(interval.channel_index)
+    entry["evidence_status"] = (
+        CONDUCTION_EVIDENCE_STATUS
+        if interval.family == "conduction_change"
+        else QUANTITATIVE_CHALLENGE_STATUS
+    )
+    return entry
+
+
+def _contamination_payload(
+    results: list[dict[str, Any]],
+    *,
+    replay_population: Any | None,
+    stress_selection_identity: dict[str, Any] | None,
+    streamed: bool,
+) -> dict[str, Any]:
     payload = {
         "evidence_class": "m2_prototype_contamination_evidence",
         "trajectory_produced_label_blind": True,
@@ -897,6 +923,7 @@ def contamination_evidence(
         "follow_up_fabricated": False,
         "population": POPULATION_STRESS,
         "trajectory_population": POPULATION_REPLAY,
+        "trajectories_loaded": "one_stream_at_a_time" if streamed else "all_at_once",
         "intervals": results,
     }
     if replay_population is not None:
@@ -910,6 +937,56 @@ def contamination_evidence(
     if stress_selection_identity is not None:
         payload["stress_interval_selection_identity"] = dict(stress_selection_identity)
     return payload
+
+
+def streaming_contamination_evidence(
+    *,
+    stress_intervals: Sequence[M2StressInterval],
+    load_trajectory: Any,
+    replay_population: Any | None = None,
+    stress_selection_identity: dict[str, Any] | None = None,
+    observer: Any | None = None,
+) -> dict[str, Any]:
+    """Prototype drift with ONE stream's trajectory resident at a time.
+
+    The canonical route may not hold the prototype matrices of every
+    stress-bearing stream simultaneously: at validation scale that is the
+    corpus-scale retention the M1 host-memory incident forbade. Streams are
+    visited in sorted key order; one trajectory is loaded, only that stream's
+    frozen intervals are evaluated, the compact drift entries are appended and
+    the trajectory is released before the next stream is read.
+
+    Numerically identical to `contamination_evidence`: both call
+    `_interval_entry`, so `sqrt(mean((mu_long(t) - mu_ref) ** 2))` and the
+    follow-up semantics are unchanged and no approximation is introduced.
+
+    `observer(key, resident_count)` exists so a test can prove that at most one
+    trajectory is ever resident.
+    """
+    by_stream: dict[tuple[str, int], list[M2StressInterval]] = {}
+    for interval in stress_intervals:
+        by_stream.setdefault(interval.stream_key, []).append(interval)
+
+    results: list[dict[str, Any]] = []
+    for key in sorted(by_stream):
+        trajectory = load_trajectory(key)
+        if trajectory is None:
+            raise M2EvaluationError(
+                f"Stress interval for stream {key} has no matching prototype "
+                "trajectory; an interval may never be applied to another "
+                "stream merely because its timestamps overlap."
+            )
+        if observer is not None:
+            observer(key, 1)
+        for interval in by_stream[key]:
+            results.append(_interval_entry(trajectory, interval))
+        del trajectory
+    return _contamination_payload(
+        results,
+        replay_population=replay_population,
+        stress_selection_identity=stress_selection_identity,
+        streamed=True,
+    )
 
 
 def arm_evaluation(arm: str, evidence: Sequence[M2RowEvidence]) -> dict[str, Any]:

@@ -853,9 +853,19 @@ def validate_complete_runtime_identity(
 
 
 def build_suite_result(
-    *, suite_id: str, arm_results: dict[str, dict[str, Any]]
+    *,
+    suite_id: str,
+    arm_results: dict[str, dict[str, Any]],
+    arm_lock_sha256: dict[str, str] | None = None,
+    population_identities: dict[str, Any] | None = None,
+    development_source_identity: dict[str, Any] | None = None,
+    git_sha: str | None = None,
 ) -> dict[str, Any]:
-    """A two-arm suite that expresses no retention decision."""
+    """A two-arm suite that expresses no retention decision.
+
+    An AGGREGATION of two already-frozen arm results. It computes no new
+    scientific metric, compares nothing and applies no preference.
+    """
     if set(arm_results) != set(M2_ARMS):
         raise M2PersistenceError(
             f"An M2 suite binds exactly {M2_ARMS}; received {sorted(arm_results)}."
@@ -865,17 +875,219 @@ def build_suite_result(
         "suite_class": "m2_v1_two_arm_suite",
         "arms": list(M2_ARMS),
         "arm_results": arm_results,
+        "arm_experiment_ids": {
+            arm: arm_experiment_id(suite_id, arm) for arm in M2_ARMS
+        },
+        "arm_experiment_lock_sha256": dict(arm_lock_sha256 or {}),
+        "git_sha": git_sha,
+        "development_source_identity": development_source_identity,
         "memory_selection_performed": False,
         "memory_selected": None,
         "automatic_arm_preference_applied": False,
+        "new_scientific_metric_computed": False,
         "human_review_required": True,
         "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
         "rollback_evaluated": False,
     }
+    for field in POPULATION_IDENTITY_FIELDS:
+        payload[field] = (population_identities or {}).get(field)
     payload["m2_suite_sha256"] = canonical_sha256(payload)
     return payload
+
+
+def validate_suite_result(suite: dict[str, Any]) -> dict[str, Any]:
+    """Re-verify a suite's self-digest and its no-selection invariants."""
+    recorded = suite.get("m2_suite_sha256")
+    body = {k: v for k, v in suite.items() if k != "m2_suite_sha256"}
+    if recorded is None or recorded != canonical_sha256(body):
+        raise M2PersistenceError("M2 suite result failed digest validation.")
+    if list(suite.get("arms", ())) != list(M2_ARMS):
+        raise M2PersistenceError(f"An M2 suite binds exactly {M2_ARMS}.")
+    for flag in (
+        "memory_selection_performed",
+        "automatic_arm_preference_applied",
+        "new_scientific_metric_computed",
+        "test_accessed",
+        "rollback_evaluated",
+    ):
+        if suite.get(flag) is not False:
+            raise M2PersistenceError(f"A canonical M2 suite must record {flag}=false.")
+    if suite.get("memory_selected") is not None:
+        raise M2PersistenceError("A canonical M2 suite selects no arm.")
+    if suite.get("validation_accessed") is not True:
+        raise M2PersistenceError(
+            "A canonical M2 suite records validation_accessed=true."
+        )
+    if suite.get("sealed_test_state") != "unopened":
+        raise M2PersistenceError("The B4 sealed test must remain unopened.")
+    for field in POPULATION_IDENTITY_FIELDS:
+        if not suite.get(field):
+            raise M2PersistenceError(f"A canonical M2 suite must bind {field}.")
+    if not suite.get("development_source_identity"):
+        raise M2PersistenceError(
+            "A canonical M2 suite must bind the development source-integrity "
+            "identity that the raw .stb stress selection was proven against."
+        )
+    return suite
+
+
+# --------------------------------------------------------------------------
+# Two-arm suite identity: one suite, two INDEPENDENT canonical attempts
+# --------------------------------------------------------------------------
+
+
+ARM_ID_SEPARATOR: Final = "__"
+EVIDENCE_WORKSPACE_SUFFIX: Final = f"{ARM_ID_SEPARATOR}evidence"
+
+
+def arm_experiment_id(suite_id: str, arm: str) -> str:
+    """The deterministic per-arm attempt identity, e.g. `<suite>__M2-G`.
+
+    Each arm needs its OWN immutable claim directory: a shared experiment id
+    would make M2-0 claim the directory and M2-G collide with it, so the
+    canonical two-arm run could never start. The convention is deterministic --
+    never random, never timestamped, and never auto-renamed on collision,
+    because any of those would let a consumed attempt be silently re-run.
+    """
+    if arm not in M2_ARMS:
+        raise M2PersistenceError(f"Unknown M2 arm {arm!r}.")
+    if ARM_ID_SEPARATOR in str(suite_id):
+        raise M2PersistenceError(
+            f"A suite id may not contain {ARM_ID_SEPARATOR!r}; it would make the "
+            "arm attempt identities ambiguous."
+        )
+    return f"{suite_id}{ARM_ID_SEPARATOR}{arm}"
+
+
+def suite_directory(run_root: Path, suite_id: str) -> Path:
+    return Path(run_root) / suite_id
+
+
+def evidence_workspace(run_root: Path, suite_id: str) -> Path:
+    """The disk-backed evidence workspace belonging to exactly this suite.
+
+    Derived from the suite attempt rather than caller-selected, so a generic
+    root holding a previous attempt's evidence can never be silently reused.
+    """
+    return Path(run_root) / f"{suite_id}{EVIDENCE_WORKSPACE_SUFFIX}"
+
+
+def require_unclaimed_suite(run_root: Path, suite_id: str) -> dict[str, Any]:
+    """PAIR preflight: prove nothing from this suite attempt already exists.
+
+    Run BEFORE either arm is claimed and therefore before any VALIDATION
+    access. A pre-existing arm claim, suite directory, suite result or evidence
+    workspace means the attempt is already consumed: it is never deleted,
+    reset, renamed, re-rooted, reseeded or automatically retried.
+    """
+    root = Path(run_root)
+    occupied: list[str] = []
+    for arm in M2_ARMS:
+        arm_dir = root / arm_experiment_id(suite_id, arm)
+        if arm_dir.exists():
+            occupied.append(str(arm_dir))
+        staging = arm_dir.parent / f"{STAGING_PREFIX}{arm_dir.name}"
+        if staging.exists():
+            occupied.append(str(staging))
+    for path in (suite_directory(root, suite_id), evidence_workspace(root, suite_id)):
+        if path.exists():
+            occupied.append(str(path))
+    if occupied:
+        raise M2PersistenceError(
+            f"Canonical M2 suite {suite_id} is already claimed; these paths "
+            f"exist: {sorted(occupied)}. The attempt is consumed. Nothing is "
+            "deleted, reset, renamed, re-rooted or reseeded, and no automatic "
+            "retry or alternate name is permitted. This requires documented "
+            "human review."
+        )
+    return {
+        "suite_id": suite_id,
+        "arm_experiment_ids": {
+            arm: arm_experiment_id(suite_id, arm) for arm in M2_ARMS
+        },
+        "existing_arm_claim": False,
+        "existing_suite_result": False,
+        "existing_evidence_workspace": False,
+        "automatic_alternate_name_permitted": False,
+    }
+
+
+def claim_evidence_workspace(run_root: Path, suite_id: str) -> Path:
+    """Create this suite's evidence workspace, refusing to reuse another's."""
+    workspace = evidence_workspace(run_root, suite_id)
+    workspace.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        workspace.mkdir(exist_ok=False)
+    except FileExistsError as error:
+        raise M2PersistenceError(
+            f"Evidence workspace {workspace} already exists. It may hold another "
+            "attempt's evidence; it is never overwritten, cleaned or reused."
+        ) from error
+    return workspace
+
+
+def finalize_and_promote_suite_result(
+    run_root: Path,
+    suite_id: str,
+    *,
+    suite: dict[str, Any],
+    runtime: RuntimeIntegrityRecord,
+    arm_run_dirs: dict[str, Path],
+) -> dict[str, Any]:
+    """Validate and atomically promote the one canonical suite result.
+
+    `M2_SUITE_RESULT.json` is claim-bearing in its own right, so it takes its
+    OWN PRE_PROMOTION observation -- never a reused arm observation. If either
+    arm is not COMPLETE there is no canonical suite, and if suite promotion
+    fails the two arm artifacts are retained for human review and nothing is
+    re-run automatically.
+    """
+    require_frozen_runtime_record(runtime)
+    validate_suite_result(suite)
+
+    for arm, run_dir in sorted(arm_run_dirs.items()):
+        for name in (ARM_RESULT_NAME, EXPERIMENT_LOCK_NAME):
+            if not (Path(run_dir) / name).is_file():
+                raise M2PersistenceError(
+                    f"Arm {arm} is not COMPLETE ({name} is absent); there is no "
+                    "canonical suite."
+                )
+
+    check = observe_runtime_identity(
+        EnforcementPoint.PRE_PROMOTION,
+        expected_digest=runtime.expected_digest,
+        detail=f"promote:{SUITE_RESULT_NAME}",
+    )
+    runtime.record(check)
+    if not check.matches:
+        raise RuntimeIntegrityError(
+            "Runtime identity differed before the suite promotion. The suite was "
+            "NOT promoted. Both arm results and locks are retained for human "
+            "review, never deleted or blessed, and nothing is retried "
+            "automatically."
+        )
+
+    directory = suite_directory(run_root, suite_id)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        directory.mkdir(exist_ok=False)
+    except FileExistsError as error:
+        raise M2PersistenceError(
+            f"Canonical M2 suite directory {directory} already exists."
+        ) from error
+    path = directory / SUITE_RESULT_NAME
+    write_json_atomic(path, suite)
+    validate_suite_result(read_json_result(path))
+    return suite
+
+
+def read_json_result(path: Path) -> dict[str, Any]:
+    """Read back a promoted artifact so its persisted bytes are what validate."""
+    import json
+
+    return json.loads(Path(path).read_text())
 
 
 # --------------------------------------------------------------------------

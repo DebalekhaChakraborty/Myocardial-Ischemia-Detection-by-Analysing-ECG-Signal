@@ -99,33 +99,80 @@ TEST is rejected by both firewalls, before any metadata, stream-cache,
 source-path, waveform or annotation access. No B4 sealed-test utility is
 imported by the canonical route, and no `TEST_ATTEMPT` is ever created.
 
-## 4. Execution order
+## 4. One suite, two independent canonical attempts
+
+A shared `suite_id` names the run, and each arm gets its **own** immutable claim
+directory:
+
+```
+<run_root>/<suite_id>__M2-0     the M2-0 canonical attempt
+<run_root>/<suite_id>__M2-G     the M2-G canonical attempt
+<run_root>/<suite_id>          the suite result
+<run_root>/<suite_id>__evidence the disk-backed evidence workspace
+```
+
+A single shared experiment id would make M2-0 claim the directory and M2-G
+collide with it, so the two-arm run could never start. The identities are
+deterministic: never random, never timestamped, and never auto-renamed on
+collision, because any of those would let a consumed attempt be silently re-run.
+
+The evidence workspace is derived from the suite attempt rather than chosen by
+the caller, so a generic root holding a previous attempt's evidence can never be
+silently reused. It is created with `exist_ok=False` and is never cleaned,
+overwritten or retried.
+
+## 5. Execution order
 
 The canonical runner is `src/cardiosentinel/neural/m2_development_run.py`. It is
 the only public route to a claim-bearing M2 development result, it always runs
 both arms in the frozen order `M2-0` then `M2-G`, and it never selects between
-them. Nothing executes on import.
+them. Nothing executes on import, and `__main__` dispatch is the last statement
+in the file so module execution can never enter the run with an undefined
+runtime helper.
 
-1. **PRE-CLAIM.** Runtime identity; clean Git checkout; HEAD equal to the
-   human-authorized `--expected-git-sha`; protocol/receipt identities; scorer
-   and locks; label firewall; TEST firewall. Nothing scientific is opened.
+1. **PRE-CLAIM ARTIFACT READINESS.** In this order, and all of it before any
+   VALIDATION access: the exact Git SHA on a clean checkout; the frozen
+   dependency runtime; the M2 protocol digest; the M2 gate receipt digest; the
+   stress-eligibility decision document digest; the retained M1L lock; the
+   retained M1L checkpoint; the P1-B lock; the B4-B checkpoint identity; the
+   frozen TRAIN-only distance standardizer; the label firewall; the TEST
+   firewall; and the pair-claim absence check. The scorer and standardizer are
+   readied here because neither requires VALIDATION — and discovering a missing
+   or altered checkpoint *after* claiming two canonical attempts would consume
+   them for nothing. Any failure means no arm claim, no VALIDATION access and
+   no retry.
 2. **START / CLAIM.** An independent `RuntimeIntegrityRecord` per arm; a
-   successful START recorded for **both** arms; both canonical attempts claimed
-   — all before the shared validation input is read. A failed claim stops for
-   human review without opening validation.
-3. **FULL LABEL-BLIND REPLAY.** The validation input is loaded exactly once and
+   successful START recorded for **both** arms; then M2-0 claimed and M2-G
+   claimed. **Only after BOTH claims succeed may VALIDATION be opened.** A
+   failed claim stops for human review without opening validation.
+3. **DEVELOPMENT SOURCE INTEGRITY.** The stress selection later reads raw
+   LTSTDB `.stb`, so an arbitrary local directory is never trusted. The
+   repository's existing `validate_development_feature_integrity` and
+   `validate_development_source_integrity` bind the `.hea`/`.dat`/`.stb` files
+   to the official pinned manifest, the frozen per-record source digests and the
+   frozen feature-corpus identity, over the train/validation development
+   partitions only. TEST files are never hashed. The resulting receipt is bound
+   into the arm provenance, the experiment lock, the stress-selection identity
+   and the suite provenance.
+4. **FULL LABEL-BLIND REPLAY.** The validation input is loaded exactly once and
    the canonical full replay identity is proven. Both arms replay the identical
    frozen rows with the identical frozen scorer, each keeping its own stream
    state. No annotation is loaded until both trajectories are complete, so no
    M2-0 result can alter M2-G's replay.
-4. **POST-REPLAY.** Only then: primary membership, challenge membership,
+5. **POST-REPLAY.** Only then: primary membership, challenge membership,
    source-defined stress intervals, identity-keyed joins, frozen evidence.
-5. **PERSIST.** Per arm: validate the result payload, stage, COMPLETION check,
+6. **PERSIST.** Per arm: validate the result payload, stage, COMPLETION check,
    separate PRE_PROMOTION observations for `M2_ARM_RESULT.json` and
    `M2_EXPERIMENT_LOCK.json`, atomic promotion.
-6. **SUITE.** A two-arm suite that expresses no retention decision.
+7. **SUITE.** One aggregating two-arm suite that expresses no retention
+   decision. `M2_SUITE_RESULT.json` is claim-bearing in its own right, so it
+   takes its **own** PRE_PROMOTION observation — never a reused arm
+   observation. If either arm is not COMPLETE there is no canonical suite; if
+   suite promotion fails, both arm artifacts are retained for human review and
+   nothing is re-run automatically. The suite computes no new scientific metric
+   and applies no preference: it aggregates two already-frozen arm results.
 
-## 5. Execution consent and the Git gate
+## 6. Execution consent, the Git gate, and the deterministic roots
 
 Execution requires **both** `--execute-canonical-development` and
 `--expected-git-sha <HUMAN_REVIEWED_MASTER_SHA>`. HEAD must equal that SHA on a
@@ -134,10 +181,30 @@ tree stops without consuming an attempt.
 
 The expected SHA is deliberately **not defaulted or hard-coded**: the scientific
 run happens only after the activation PR is merged and the resulting master SHA
-is human-verified. There is no CLI option that selects a partition, no
-single-arm route and no third arm.
+is human-verified.
 
-## 6. Bounded memory
+Those two flags are the **only** CLI options. Every root and identity is
+deterministic, from the repository's existing conventions:
+
+| Root | Path |
+|---|---|
+| source | `cardiosentinel-data/ltstdb/1.0.0` |
+| feature | `cardiosentinel-features/ltstdb-baseline-v1` |
+| stream cache | `cardiosentinel-features/m1-stream-memory-v2` |
+| P1 cache | `cardiosentinel-features/p1-b4b-embeddings-v1` |
+| M1 run | `cardiosentinel-runs/phase5-m1-dual-memory-v2` |
+| M2 run | `cardiosentinel-runs/phase6-m2-development-v1` |
+
+The P1 embedding cache and the M1 stream-memory cache are **different
+artifacts**. The primary metric population lives only in the former, and there
+is no fallback from one to the other anywhere on the route.
+
+There is no partition option, no arm option, no threshold option, no retry
+option, no seed option and no alternative data-source option. A private
+`_roots`/`_loaders` dependency-injection seam exists for synthetic tests only;
+it is absent from the CLI and from the public scientific contract.
+
+## 7. Bounded memory
 
 The M1 host-memory incident established that corpus-scale Python row retention
 is unsafe. The canonical route therefore replays **stream by stream**, one
@@ -147,8 +214,17 @@ it. No whole-corpus row list, no whole-corpus duplicate representation matrix
 and no two-arm whole-corpus object duplication exists at any point.
 
 The full causal prototype trajectory is written to a disk-backed evidence store
-per stream and read back only for the stream being evaluated. Its schema and
-content digest are bound in canonical provenance.
+per stream, and **drift evaluation loads one stream at a time**: one trajectory
+is read, only that stream's frozen stress intervals are evaluated, the compact
+drift entries are appended and the trajectory is released before the next stream
+is read. The process never holds the prototype matrices of several streams at
+once. The streaming and whole-dictionary forms share one implementation, so
+`sqrt(mean((mu_long(t) - mu_ref) ** 2))` and the follow-up semantics are
+identical and no approximation is introduced.
+
+The store's schema and content digest are bound in canonical provenance, and the
+manifest is re-validated against the actual persisted files after finalization,
+before it may enter a claim-bearing result.
 
 Precision is preserved end to end: scores, availability times and prototypes are
 stored and read back as float64, so `sqrt(mean((mu_long(t) - mu_ref) ** 2))` is
@@ -158,7 +234,7 @@ Prototype persistence is label-blind: the whole trajectory is written first, and
 stress annotations select points from it only afterwards. Annotations never
 decide which prototypes are kept.
 
-## 7. The result and lock contract
+## 8. The result and lock contract
 
 A canonical arm result binds four separate identities — the single
 `evaluated_population_identity` that once stood for all of them is gone, because
@@ -176,7 +252,14 @@ that declaration must equal the arm result's own identity for that population. A
 section that borrows another's denominator, or declares none, is fatal. The
 experiment lock binds all four and must agree with the result exactly.
 
-## 8. What this protocol does not do
+## 9. Execution history is read, never asserted
+
+No source constant records whether a canonical run has happened: source code
+cannot rewrite itself, so such a boolean could only ever become a lie.
+`canonical_execution_history()` reports run history from the canonical claim
+directories, the run-status files, the experiment locks and the suite result.
+
+## 10. What this protocol does not do
 
 It defines no metric, computes no value, selects no threshold and expresses no
 retention or rollback decision. It does not modify the frozen M2 gate protocol,

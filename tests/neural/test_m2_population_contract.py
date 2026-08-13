@@ -444,10 +444,11 @@ def test_stress_intervals_are_selected_only_after_replay():
     assert identity["selection_influenced_by_m2_outputs"] is False
     # And the runner constructs the selection only after both replays finish.
     source = inspect.getsource(R._run)
-    replay_call = source.index("replay_both_arms(\n")
+    replay_call = source.index("    replay_both_arms(")
     assert replay_call < source.index("build_stress_selection_from_parsed(")
-    assert replay_call < source.index("primary_evaluation_population(")
-    assert replay_call < source.index("challenge_evaluation_population(")
+    assert replay_call < source.index('_use("primary_evaluation_population"')
+    assert replay_call < source.index('_use("challenge_evaluation_population"')
+    assert replay_call < source.index('_use("parsed_validation_annotations"')
 
 
 # --------------------------------------------------------------------------
@@ -608,7 +609,8 @@ def test_the_runner_does_not_execute_on_import():
         if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
     ]
     assert top_level_calls == []
-    assert R.NO_SCIENTIFIC_EXECUTION_YET is True
+    # No source constant may assert run history; it is read from artifacts.
+    assert not hasattr(R, "NO_SCIENTIFIC_EXECUTION_YET")
 
 
 # --------------------------------------------------------------------------
@@ -878,9 +880,17 @@ def test_no_validation_or_test_data_is_opened_by_this_test_module():
     assert not (called & forbidden), sorted(called & forbidden)
 
 
-def test_the_canonical_runner_was_not_invoked():
-    assert R.NO_SCIENTIFIC_EXECUTION_YET is True
-    assert R.PLANNED_EXECUTION_ORDER[0] == "pre_claim_identity_checks"
+def test_execution_history_comes_from_artifacts_not_a_source_constant(tmp_path):
+    """A source boolean could never update itself after a real run."""
+    assert not hasattr(R, "NO_SCIENTIFIC_EXECUTION_YET")
+    history = R.canonical_execution_history(tmp_path)
+    assert history["any_attempt_claimed"] is False
+    assert history["suite_result_promoted"] is False
+    assert set(history["arms"]) == set(R.CANONICAL_ARM_ORDER)
+    assert history["evidence_source"].startswith("canonical claim directories")
+    # The static constant that remains describes the implementation only.
+    assert R.ROUTE_IMPLEMENTS_TWO_ARM_SUITE is True
+    assert R.PLANNED_EXECUTION_ORDER[0] == "pre_claim_artifact_readiness"
     assert R.PLANNED_EXECUTION_ORDER[-1] == "two_arm_suite_without_selection"
 
 
