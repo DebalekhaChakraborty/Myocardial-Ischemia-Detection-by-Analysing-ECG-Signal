@@ -23,7 +23,9 @@ from cardiosentinel.neural import m2_execution as X
 from cardiosentinel.neural import m2_gate as G
 from cardiosentinel.neural import m2_persistence as PS
 from cardiosentinel.neural import m2_policy as P
+from cardiosentinel.neural import m2_populations as PP
 from cardiosentinel.neural import m2_scorer as SC
+from cardiosentinel.neural import m2_stress_intervals as SI
 from cardiosentinel.neural import runtime_sentinel as S
 from cardiosentinel.neural.m2_gate_derivation import (
     DEFAULT_M1_RUN_ROOT,
@@ -144,7 +146,7 @@ def _canonical_population_token(evidence):
     from cardiosentinel.neural.m2_evaluation import _observed_population_digest
 
     keys = [V.evaluation_key(row) for row in evidence]
-    return X.M2CanonicalPopulation(
+    return X.M2ReplayPopulation(
         partition="train",
         row_count=len(keys),
         ordered_stable_id_sha256=_observed_population_digest(keys),
@@ -152,10 +154,116 @@ def _canonical_population_token(evidence):
     )
 
 
-def _full_result(population, arm="M2-G"):
-    """A complete canonical arm result payload."""
-    section = {"population_identity": population}
+def _population_identities():
+    """The four distinct population identities a canonical lock must bind."""
     return {
+        "replay_population_identity": _replay_identity(),
+        "primary_evaluation_population_identity": _primary_identity(),
+        "challenge_evaluation_population_identity": _challenge_identity(),
+        "stress_interval_selection_identity": _stress_identity(),
+    }
+
+
+def _primary_population_from_evidence(evidence):
+    """A PRIMARY authority token matching a synthetic evidence set exactly."""
+    return _primary_population(
+        [
+            _annotation(
+                record_id=row.record_id,
+                channel_index=int(row.channel_index),
+                start_sample=int(row.start_sample),
+            )
+            for row in evidence
+        ]
+    )
+
+
+def _replay_identity(rows=473_897):
+    """A FULL REPLAY identity payload. Never a metric denominator."""
+    return X.M2ReplayPopulation(
+        partition="validation",
+        row_count=rows,
+        ordered_stable_id_sha256="1" * 64,
+        stream_cache_sha256="2" * 64,
+    ).identity()
+
+
+def _primary_identity():
+    """A PRIMARY identity payload carrying the frozen validation counts."""
+    return {
+        "population": PP.POPULATION_PRIMARY,
+        "partition": "validation",
+        "authority": PP.PRIMARY_AUTHORITY,
+        "authority_detail": "frozen P1 validation embedding cache",
+        "row_count": PP.PRIMARY_VALIDATION_POPULATION["total"],
+        "counts": dict(PP.PRIMARY_VALIDATION_POPULATION),
+        "ordered_stable_id_sha256": "3" * 64,
+        "p1_embedding_cache_sha256": "4" * 64,
+        "membership_derived_from_m2_scores": False,
+        "binary_labels_present": True,
+        "evaluated_rows": PP.PRIMARY_VALIDATION_POPULATION["total"],
+        "evaluated_ordered_stable_id_sha256": "3" * 64,
+        "identity_key": "(record_id, channel_index, start_sample)",
+        "identity_corresponds_to_frozen_stable_id": True,
+        "positional_join_used": False,
+        "matches_frozen_authority_exactly": True,
+    }
+
+
+def _challenge_identity():
+    """A CHALLENGE identity payload carrying the frozen selection digest."""
+    from cardiosentinel.neural.validation_challenge import (
+        CHALLENGE_EXPECTED_COUNTS,
+        CHALLENGE_SELECTION_SHA256,
+        CHALLENGE_TOTAL_WINDOWS,
+    )
+
+    return {
+        "population": PP.POPULATION_CHALLENGE,
+        "partition": "validation",
+        "authority": PP.CHALLENGE_AUTHORITY,
+        "authority_detail": "build_validation_challenge_index(...)",
+        "row_count": CHALLENGE_TOTAL_WINDOWS,
+        "counts": {k: dict(v) for k, v in CHALLENGE_EXPECTED_COUNTS.items()},
+        "challenge_selection_sha256": CHALLENGE_SELECTION_SHA256,
+        "ordered_stable_id_sha256": "5" * 64,
+        "binary_labels_invented": False,
+        "membership_derived_from_m2_scores": False,
+        "evaluated_rows": CHALLENGE_TOTAL_WINDOWS,
+        "evaluated_ordered_stable_id_sha256": "5" * 64,
+        "identity_key": "(record_id, channel_index, start_sample)",
+        "identity_corresponds_to_frozen_stable_id": True,
+        "positional_join_used": False,
+        "matches_frozen_authority_exactly": True,
+    }
+
+
+def _source_identity():
+    """A development source-integrity receipt, as the real verifier produces."""
+    return {
+        "identity_class": PS.DEVELOPMENT_SOURCE_IDENTITY_CLASS,
+        "feature_receipt": {"verification_result": "passed"},
+        "source_receipt": {"verification_result": "passed"},
+        "annotation_set": "stb",
+        "test_partition_hashed": False,
+        "verified_before_stress_selection": True,
+    }
+
+
+def _stress_identity():
+    """A real source-defined stress selection identity."""
+    identity = dict(SI.build_stress_selection().identity())
+    identity["development_source_identity"] = _source_identity()
+    return identity
+
+
+def _full_result(arm="M2-G", **overrides):
+    """A complete canonical arm result payload, with FOUR distinct populations."""
+    replay = _replay_identity()
+    primary = _primary_identity()
+    challenge = _challenge_identity()
+    stress = _stress_identity()
+    result = {
         "artifact_class": PS.ARM_RESULT_CLASS,
         "arm": arm,
         "scientific_computation_completed": True,
@@ -166,17 +274,33 @@ def _full_result(population, arm="M2-G"):
         "memory_selection_performed": False,
         "memory_selected": None,
         "rollback": False,
-        "partition_accessed": "train",
-        "evaluated_population_identity": population,
-        "validation_accessed": False,
+        "partition_accessed": "validation",
+        "replay_population_identity": replay,
+        "primary_evaluation_population_identity": primary,
+        "challenge_evaluation_population_identity": challenge,
+        "stress_interval_selection_identity": stress,
+        "development_source_identity": _source_identity(),
+        "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
-        "policy_evidence": {"update_admission_fraction": 0.2},
-        "window_evidence": dict(section),
-        "false_alarm_evidence": dict(section),
-        "cold_start_evidence": dict(section),
-        "contamination_evidence": {"intervals": []},
+        "policy_evidence": {
+            "update_admission_fraction": 0.2,
+            "population_identity": replay,
+        },
+        "window_evidence": {"population_identity": primary},
+        "false_alarm_evidence": {
+            "background_population_identity": primary,
+            "challenge_population_identity": challenge,
+        },
+        "cold_start_evidence": {"population_identity": primary},
+        "contamination_evidence": {
+            "intervals": [],
+            "replay_population_identity": replay,
+            "stress_interval_selection_identity": stress,
+        },
     }
+    result.update(overrides)
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -323,8 +447,11 @@ def test_timeline_row_carries_no_identity_or_annotation_field():
 def test_post_replay_join_misalignment_fails_loudly():
     """Identity mismatch is refused; a positional join is not even possible."""
     evidence = [_evidence(start_sample=0)]
-    with pytest.raises(V.M2EvaluationError, match="no evidence row"):
-        V.build_evaluation_bundle("M2-G", evidence, [_annotation(start_sample=7777)])
+    stray = [_annotation(start_sample=7777)]
+    with pytest.raises(V.M2EvaluationError, match="no replay evidence"):
+        V.build_primary_bundle(
+            "M2-G", evidence, stray, primary_population=_primary_population(stray)
+        )
 
 
 def test_evaluation_functions_require_an_identity_joined_bundle():
@@ -333,12 +460,16 @@ def test_evaluation_functions_require_an_identity_joined_bundle():
 
     for function in (
         V.window_evidence,
-        V.false_alarm_evidence,
+        V.background_false_positive_evidence,
         V.cold_start_stratified_evidence,
+        V.challenge_false_positive_evidence,
     ):
         parameters = set(inspect.signature(function).parameters)
         assert not (parameters & {"labels", "subject_ids", "target_families"}), function
         assert "bundle" in parameters
+    # The combined false-alarm section takes BOTH denominators, explicitly.
+    combined = set(inspect.signature(V.false_alarm_evidence).parameters)
+    assert {"primary_bundle", "challenge_bundle"} <= combined
 
 
 @pytest.mark.skipif(not LOCAL_DATA, reason=LOCAL_SKIP)
@@ -516,12 +647,12 @@ def test_partial_run_cannot_masquerade_as_complete(tmp_path, frozen_runtime):
 def test_forbidden_partition_audit_blocks_promotion():
     with pytest.raises(Exception):
         PS.audit_forbidden_partitions({"partition_accessed": "test"})
-    with pytest.raises(PS.M2PersistenceError, match="validation_accessed"):
+    with pytest.raises(PS.M2PersistenceError, match="test_accessed"):
         PS.audit_forbidden_partitions(
             {
-                "partition_accessed": "train",
+                "partition_accessed": "validation",
                 "validation_accessed": True,
-                "test_accessed": False,
+                "test_accessed": True,
                 "sealed_test_state": "unopened",
             }
         )
@@ -723,23 +854,90 @@ def _annotation(
     channel_index=0,
     start_sample=0,
     label=0,
-    family="background_negative",
     subject="subj-1",
     bin_name="over_60_minutes",
 ):
-    return V.M2AnnotationRow(
+    """A PRIMARY annotation. It carries a label and no target family."""
+    return V.M2PrimaryAnnotation(
         record_id=record_id,
         channel_index=channel_index,
         start_sample=start_sample,
         label=label,
-        target_family=family,
         subject_id=subject,
         cold_start_bin=bin_name,
     )
 
 
+def _challenge_annotation(
+    record_id="s00001",
+    channel_index=0,
+    start_sample=0,
+    family="rate_related_confounder",
+    subject="subj-1",
+):
+    """A CHALLENGE annotation. There is nowhere to put a binary label."""
+    return V.M2ChallengeAnnotation(
+        record_id=record_id,
+        channel_index=channel_index,
+        start_sample=start_sample,
+        target_family=family,
+        subject_id=subject,
+    )
+
+
+def _primary_population(annotations):
+    """A frozen-authority PRIMARY token for a synthetic annotation set.
+
+    Real runs obtain this from `m2_populations.primary_evaluation_population`,
+    which proves the frozen 473,897/21,628/452,269/12 identity against the P1
+    embedding cache. Synthetic tests supply their own expected counts; the
+    point under test is that evaluation accepts ONLY an authority token and
+    then requires the evaluated rows to be exactly that population.
+    """
+    rows = list(annotations)
+    labels = [int(a.label) for a in rows]
+    subjects = [str(a.subject_id) for a in rows]
+    return PP.verify_primary_population(
+        stable_ids=[a.stable_id for a in rows],
+        labels=labels,
+        subject_ids=subjects,
+        cache_sha256="a" * 64,
+        expected_counts={
+            "total": len(rows),
+            "positive": sum(1 for v in labels if v == 1),
+            "negative": sum(1 for v in labels if v == 0),
+            "subjects": len(set(subjects)),
+        },
+    )
+
+
+def _challenge_population(annotations):
+    """A frozen-authority CHALLENGE token for a synthetic selection."""
+    rows = list(annotations)
+    families = [str(a.target_family) for a in rows]
+    counts = {
+        family: {
+            "windows": sum(1 for f in families if f == family),
+            "subjects": len(
+                {str(a.subject_id) for a in rows if str(a.target_family) == family}
+            ),
+        }
+        for family in PP.CHALLENGE_FAMILIES
+    }
+    return PP.verify_challenge_population(
+        stable_ids=[a.stable_id for a in rows],
+        target_families=families,
+        subject_ids=[str(a.subject_id) for a in rows],
+        selection_sha256="d" * 64,
+        counts=counts,
+        expected_selection_sha256="d" * 64,
+        expected_counts=counts,
+        expected_total=len(rows),
+    )
+
+
 def _paired_bundle(count=4):
-    """A minimal well-formed bundle with both classes and two subjects."""
+    """A minimal well-formed PRIMARY bundle with both classes and two subjects."""
     evidence, annotations = [], []
     for index in range(count):
         start = index * 1250
@@ -748,15 +946,35 @@ def _paired_bundle(count=4):
             _annotation(
                 start_sample=start,
                 label=index % 2,
-                family="ischemic_positive" if index % 2 else "background_negative",
                 subject=f"subj-{index % 2}",
             )
         )
-    return V.build_evaluation_bundle(
+    return V.build_primary_bundle(
         "M2-G",
         evidence,
         annotations,
-        canonical_population=_canonical_population_token(evidence),
+        primary_population=_primary_population(annotations),
+    )
+
+
+def _challenge_bundle(count=3):
+    """A minimal well-formed CHALLENGE bundle over confounder rows."""
+    evidence, annotations = [], []
+    for index in range(count):
+        start = 500_000 + index * 1250
+        evidence.append(_evidence(start_sample=start, score=0.1 + 0.1 * index))
+        annotations.append(
+            _challenge_annotation(
+                start_sample=start,
+                family=PP.CHALLENGE_FAMILIES[index % len(PP.CHALLENGE_FAMILIES)],
+                subject=f"subj-{index % 2}",
+            )
+        )
+    return V.build_challenge_bundle(
+        "M2-G",
+        evidence,
+        annotations,
+        challenge_population=_challenge_population(annotations),
     )
 
 
@@ -765,24 +983,37 @@ def _paired_bundle(count=4):
 
 def test_every_thresholded_metric_rejects_a_non_frozen_threshold():
     bundle = _paired_bundle()
+    challenge = _challenge_bundle()
     for function in (
         V.window_evidence,
-        V.false_alarm_evidence,
+        V.background_false_positive_evidence,
         V.cold_start_stratified_evidence,
     ):
         with pytest.raises(V.M2EvaluationError, match="frozen retained M1L"):
             function(bundle, threshold=ALT_THRESHOLD)
+    with pytest.raises(V.M2EvaluationError, match="frozen retained M1L"):
+        V.challenge_false_positive_evidence(challenge, threshold=ALT_THRESHOLD)
+    with pytest.raises(V.M2EvaluationError, match="frozen retained M1L"):
+        V.false_alarm_evidence(
+            primary_bundle=bundle,
+            challenge_bundle=challenge,
+            threshold=ALT_THRESHOLD,
+        )
 
 
 def test_normal_evidence_threshold_is_rejected_as_a_classification_threshold():
     bundle = _paired_bundle()
     for function in (
         V.window_evidence,
-        V.false_alarm_evidence,
+        V.background_false_positive_evidence,
         V.cold_start_stratified_evidence,
     ):
         with pytest.raises(V.M2EvaluationError):
             function(bundle, threshold=SC.NORMAL_EVIDENCE_THRESHOLD)
+    with pytest.raises(V.M2EvaluationError):
+        V.challenge_false_positive_evidence(
+            _challenge_bundle(), threshold=SC.NORMAL_EVIDENCE_THRESHOLD
+        )
 
 
 def test_the_frozen_classification_threshold_is_accepted():
@@ -803,8 +1034,10 @@ def test_equal_length_but_wrong_identities_are_rejected():
     evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
     wrong = [_annotation(start_sample=9999), _annotation(start_sample=8888)]
     assert len(evidence) == len(wrong)
-    with pytest.raises(V.M2EvaluationError, match="no evidence row"):
-        V.build_evaluation_bundle("M2-G", evidence, wrong)
+    with pytest.raises(V.M2EvaluationError, match="no replay evidence"):
+        V.build_primary_bundle(
+            "M2-G", evidence, wrong, primary_population=_primary_population(wrong)
+        )
 
 
 def test_permuted_annotation_ordering_is_realigned_by_identity_not_position():
@@ -816,15 +1049,15 @@ def test_permuted_annotation_ordering_is_realigned_by_identity_not_position():
         _annotation(start_sample=0, label=0, subject="a"),
         _annotation(start_sample=1250, label=1, subject="b"),
     ]
-    token = _canonical_population_token(evidence)
-    bundle_ordered = V.build_evaluation_bundle(
-        "M2-G", evidence, ordered, canonical_population=token
+    token = _primary_population(ordered)
+    bundle_ordered = V.build_primary_bundle(
+        "M2-G", evidence, ordered, primary_population=token
     )
-    bundle_permuted = V.build_evaluation_bundle(
-        "M2-G", evidence, list(reversed(ordered)), canonical_population=token
+    bundle_permuted = V.build_primary_bundle(
+        "M2-G", evidence, list(reversed(ordered)), primary_population=token
     )
     # Identity, not order, decides the pairing.
-    assert bundle_ordered.keys == bundle_permuted.keys
+    assert np.array_equal(bundle_ordered.stable_ids, bundle_permuted.stable_ids)
     assert np.array_equal(bundle_ordered.labels, bundle_permuted.labels)
     assert np.array_equal(bundle_ordered.scores, bundle_permuted.scores)
     # And the score/label pairing is the correct one.
@@ -836,38 +1069,68 @@ def test_permuted_annotation_ordering_is_realigned_by_identity_not_position():
 
 def test_duplicate_annotation_identities_are_rejected():
     evidence = [_evidence(start_sample=0)]
-    with pytest.raises(V.M2EvaluationError, match="Duplicate annotation"):
-        V.build_evaluation_bundle(
-            "M2-G", evidence, [_annotation(start_sample=0), _annotation(start_sample=0)]
+    single = [_annotation(start_sample=0)]
+    with pytest.raises(V.M2EvaluationError, match="Duplicate primary annotation"):
+        V.build_primary_bundle(
+            "M2-G",
+            evidence,
+            [_annotation(start_sample=0), _annotation(start_sample=0)],
+            primary_population=_primary_population(single),
         )
 
 
 def test_duplicate_evidence_identities_are_rejected():
     duplicated = [_evidence(start_sample=0), _evidence(start_sample=0)]
+    single = [_annotation(start_sample=0)]
     with pytest.raises(V.M2EvaluationError, match="Duplicate evidence"):
-        V.build_evaluation_bundle("M2-G", duplicated, [_annotation(start_sample=0)])
+        V.build_primary_bundle(
+            "M2-G",
+            duplicated,
+            single,
+            primary_population=_primary_population(single),
+        )
 
 
 def test_missing_annotation_identities_are_rejected():
     evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
-    with pytest.raises(V.M2EvaluationError, match="carry no annotation"):
-        V.build_evaluation_bundle("M2-G", evidence, [_annotation(start_sample=0)])
+    both = [_annotation(start_sample=0), _annotation(start_sample=1250)]
+    partial = [_annotation(start_sample=0)]
+    with pytest.raises(V.M2EvaluationError, match="not the frozen population"):
+        V.build_primary_bundle(
+            "M2-G", evidence, partial, primary_population=_primary_population(both)
+        )
 
 
 def test_extra_annotation_identities_are_rejected():
     evidence = [_evidence(start_sample=0)]
     extra = [_annotation(start_sample=0), _annotation(start_sample=1250)]
-    with pytest.raises(V.M2EvaluationError, match="no evidence row"):
-        V.build_evaluation_bundle("M2-G", evidence, extra)
+    with pytest.raises(V.M2EvaluationError, match="no replay evidence"):
+        V.build_primary_bundle(
+            "M2-G", evidence, extra, primary_population=_primary_population(extra)
+        )
 
 
-def test_subset_population_requires_an_explicit_opt_in():
+def test_a_subset_can_never_opt_into_being_the_primary_population():
+    """There is no `require_full_population=False` escape hatch any more.
+
+    The primary denominator is the frozen P1 population, full stop. A caller
+    cannot narrow it by annotating fewer rows and asking for a subset bundle.
+    """
+    import inspect
+
+    parameters = set(inspect.signature(V.build_primary_bundle).parameters)
+    assert "require_full_population" not in parameters
+    assert "primary_population" in parameters
+
     evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
-    annotations = [_annotation(start_sample=0)]
-    bundle = V.build_evaluation_bundle(
-        "M2-G", evidence, annotations, require_full_population=False
-    )
-    assert len(bundle.keys) == 1
+    both = [_annotation(start_sample=0), _annotation(start_sample=1250)]
+    with pytest.raises(V.M2EvaluationError, match="never widened or narrowed"):
+        V.build_primary_bundle(
+            "M2-G",
+            evidence,
+            [_annotation(start_sample=0)],
+            primary_population=_primary_population(both),
+        )
 
 
 def test_evaluation_key_corresponds_to_the_frozen_stable_id():
@@ -884,8 +1147,14 @@ def test_subject_and_family_remain_evaluation_only():
     replay_fields = set(P.M2TimelineRow.__dataclass_fields__)
     assert "subject_id" not in replay_fields
     assert "target_family" not in replay_fields
-    evaluation_fields = set(V.M2AnnotationRow.__dataclass_fields__)
-    assert {"subject_id", "target_family"} <= evaluation_fields
+    primary_fields = set(V.M2PrimaryAnnotation.__dataclass_fields__)
+    challenge_fields = set(V.M2ChallengeAnnotation.__dataclass_fields__)
+    assert "subject_id" in primary_fields and "subject_id" in challenge_fields
+    # The two annotation types are purpose-specific and NOT interchangeable:
+    # only primary carries a label, only challenge carries a target family.
+    assert "label" in primary_fields and "label" not in challenge_fields
+    assert "target_family" in challenge_fields
+    assert "target_family" not in primary_fields
     # Neither reaches the gate.
     import inspect
 
@@ -958,8 +1227,11 @@ def test_unscored_row_is_refused_exactly_as_frozen_m1_refuses_it():
     assert "never silently altered" in frozen_doc
 
     evidence = [_evidence(start_sample=0, score=None)]
+    single = [_annotation(start_sample=0)]
     with pytest.raises(V.M2EvaluationError) as caught:
-        V.build_evaluation_bundle("M2-G", evidence, [_annotation(start_sample=0)])
+        V.build_primary_bundle(
+            "M2-G", evidence, single, primary_population=_primary_population(single)
+        )
     message = str(caught.value)
     assert "STOP FOR HUMAN REVIEW" in message
     assert "never dropped from a metric" in message
@@ -1002,8 +1274,18 @@ def test_bounded_smoke_stable_ids_match_its_rows_exactly():
     assert bounded_ids != list(bundle.stable_ids[: len(bounded)])
 
 
-def test_result_provenance_binds_the_evaluated_population_identity():
-    assert "evaluated_population_identity" in PS.REQUIRED_PROVENANCE_FIELDS
+def test_result_provenance_binds_all_four_population_identities():
+    assert PS.POPULATION_IDENTITY_FIELDS == (
+        "replay_population_identity",
+        "primary_evaluation_population_identity",
+        "challenge_evaluation_population_identity",
+        "stress_interval_selection_identity",
+    )
+    for field in PS.POPULATION_IDENTITY_FIELDS:
+        assert field in PS.REQUIRED_PROVENANCE_FIELDS
+    # And the single catch-all identity is gone, so no population can stand in
+    # for another.
+    assert "evaluated_population_identity" not in PS.REQUIRED_PROVENANCE_FIELDS
     bundle = _paired_bundle()
     identity = bundle.population_identity()
     assert identity["evaluated_rows"] == 4
@@ -1011,11 +1293,11 @@ def test_result_provenance_binds_the_evaluated_population_identity():
     assert identity["positional_join_used"] is False
     # A different evaluated population yields a different identity.
     single = [_evidence(start_sample=0)]
-    other = V.build_evaluation_bundle(
+    other = V.build_primary_bundle(
         "M2-G",
         single,
         [_annotation(start_sample=0)],
-        canonical_population=_canonical_population_token(single),
+        primary_population=_primary_population_from_evidence(single),
     )
     assert (
         other.population_identity()["evaluated_ordered_stable_id_sha256"]
@@ -1027,8 +1309,8 @@ def test_result_provenance_binds_the_evaluated_population_identity():
 
 
 def test_no_scientific_m2_result_is_generated_by_this_module():
-    bundle = _paired_bundle()
-    payload = V.arm_evaluation("M2-G", list(bundle.evidence))
+    evidence = [_evidence(start_sample=index * 1250) for index in range(4)]
+    payload = V.arm_evaluation("M2-G", evidence)
     assert payload["window_evidence"] is None
     assert payload["false_alarm_evidence"] is None
     assert payload["contamination_evidence"] is None
@@ -1053,12 +1335,12 @@ SYNTHETIC_SHA = "a" * 64
 def _execution_identity():
     """A complete execution identity, as the real harness produces."""
     return {
-        "partition_accessed": "train",
-        "validation_accessed": False,
+        "partition_accessed": "validation",
+        "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
         "input_identity": {
-            "partition": "train",
+            "partition": "validation",
             "distance_standardizer_sha256": SYNTHETIC_SHA,
             "split_sha256": SYNTHETIC_SHA,
             "feature_corpus_sha256": SYNTHETIC_SHA,
@@ -1107,11 +1389,8 @@ def _build_complete_lock(*, population=None, **overrides):
         arm="M2-G",
         execution_identity=_execution_identity(),
         runtime=runtime,
-        evaluated_population_identity=(
-            population
-            if population is not None
-            else _paired_bundle().population_identity()
-        ),
+        population_identities=(population or _population_identities()),
+        development_source_identity=_source_identity(),
         started_at="2026-01-01T00:00:00Z",
         completed_at="2026-01-01T00:10:00Z",
         artifact_sha256={PS.ARM_RESULT_NAME: "b" * 64},
@@ -1270,11 +1549,10 @@ def test_completion_mismatch_prevents_canonical_complete_promotion(
 
     monkeypatch.setattr(PS, "observe_runtime_identity", observe_bad_completion)
 
-    population = _paired_bundle().population_identity()
     with pytest.raises(S.RuntimeIntegrityError, match="COMPLETION"):
         PS.finalize_and_promote_arm_result(
             claimed,
-            result=_full_result(population),
+            result=_full_result(),
             execution_identity=_execution_identity(),
             runtime=runtime,
             requires_evaluation=True,
@@ -1300,10 +1578,9 @@ def test_all_three_enforcement_points_appear_in_the_finalized_block(
 ):
     runtime = frozen_runtime
     claimed = PS.claim_run_directory(tmp_path, "M2_full_block", "M2-G", runtime=runtime)
-    population = _paired_bundle().population_identity()
     status = PS.finalize_and_promote_arm_result(
         claimed,
-        result=_full_result(population),
+        result=_full_result(),
         execution_identity=_execution_identity(),
         runtime=runtime,
         requires_evaluation=True,
@@ -1356,35 +1633,87 @@ def test_all_observations_matched_is_required_for_canonical_evidence():
 # --- 8-10. evaluated population identity ---------------------------------
 
 
-def test_none_population_identity_is_rejected_for_claim_bearing_evaluation():
+@pytest.mark.parametrize(
+    ("validator", "field"),
+    [
+        ("validate_replay_population_identity", "replay_population_identity"),
+        (
+            "validate_primary_population_identity",
+            "primary_evaluation_population_identity",
+        ),
+        (
+            "validate_challenge_population_identity",
+            "challenge_evaluation_population_identity",
+        ),
+        (
+            "validate_stress_selection_identity",
+            "stress_interval_selection_identity",
+        ),
+    ],
+)
+def test_none_population_identity_is_rejected_for_claim_bearing_evaluation(
+    validator, field
+):
     for empty in (None, {}):
-        with pytest.raises(
-            PS.M2PersistenceError, match="evaluated_population_identity"
-        ):
-            PS.validate_evaluated_population_identity(empty)
+        with pytest.raises(PS.M2PersistenceError, match=field):
+            getattr(PS, validator)(empty)
 
 
-def test_malformed_population_identity_is_rejected():
-    valid = _paired_bundle().population_identity()
+def test_malformed_primary_population_identity_is_rejected():
+    valid = _primary_identity()
     for mutation in (
         {"evaluated_rows": 0},
         {"evaluated_rows": -1},
         {"evaluated_ordered_stable_id_sha256": "short"},
-        {"evaluated_ordered_stable_id_sha256": "z" * 64},
         {"positional_join_used": True},
         {"identity_key": ""},
+        {"matches_frozen_authority_exactly": False},
+        {"counts": {"total": 1, "positive": 1, "negative": 0, "subjects": 1}},
+        {"membership_derived_from_m2_scores": True},
+        {"binary_labels_present": False},
+        {"authority": "some_other_authority"},
     ):
-        broken = {**valid, **mutation}
         with pytest.raises(PS.M2PersistenceError):
-            PS.validate_evaluated_population_identity(broken)
+            PS.validate_primary_population_identity({**valid, **mutation})
 
 
-def test_valid_full_population_identity_is_accepted():
-    identity = _paired_bundle().population_identity()
-    validated = PS.validate_evaluated_population_identity(identity)
-    assert validated["evaluated_rows"] == 4
-    assert validated["positional_join_used"] is False
-    assert validated["population_scope"] == V.POPULATION_SCOPE_FULL
+def test_malformed_challenge_population_identity_is_rejected():
+    valid = _challenge_identity()
+    for mutation in (
+        {"challenge_selection_sha256": "z" * 64},
+        {"row_count": 8136},
+        {"binary_labels_invented": True},
+        {"authority": "frozen_p1_validation_population"},
+        {"population": PP.POPULATION_PRIMARY},
+    ):
+        with pytest.raises(PS.M2PersistenceError):
+            PS.validate_challenge_population_identity({**valid, **mutation})
+
+
+def test_malformed_stress_selection_identity_is_rejected():
+    valid = _stress_identity()
+    for mutation in (
+        {"decision_sha256": "z" * 64},
+        {"decision_document": "docs/other.md"},
+        {"marker_vicinity_reused_as_stress_duration": True},
+        {"persistence_duration_invented": True},
+        {"merge_gap_applied": True},
+        {"selection_influenced_by_m2_outputs": True},
+        {"selection_performed_after_label_blind_replay": False},
+        {"source_defined_families": ["ischemic"]},
+    ):
+        with pytest.raises(PS.M2PersistenceError):
+            PS.validate_stress_selection_identity({**valid, **mutation})
+
+
+def test_valid_population_identities_are_accepted():
+    assert PS.validate_replay_population_identity(_replay_identity())["row_count"] > 0
+    primary = PS.validate_primary_population_identity(_primary_identity())
+    assert primary["counts"] == dict(PP.PRIMARY_VALIDATION_POPULATION)
+    challenge = PS.validate_challenge_population_identity(_challenge_identity())
+    assert challenge["binary_labels_invented"] is False
+    stress = PS.validate_stress_selection_identity(_stress_identity())
+    assert stress["decision_sha256"] == SI.DECISION_SHA256
 
 
 def test_claim_bearing_result_requires_population_identity_when_evaluated(
@@ -1392,12 +1721,14 @@ def test_claim_bearing_result_requires_population_identity_when_evaluated(
 ):
     runtime = frozen_runtime
     claimed = PS.claim_run_directory(tmp_path, "M2_no_pop", "M2-G", runtime=runtime)
-    # An otherwise-complete result whose population identity is absent.
+    # An otherwise-complete result whose primary population identity is absent.
     result = {
-        **_full_result(_paired_bundle().population_identity()),
-        "evaluated_population_identity": None,
+        **_full_result(),
+        "primary_evaluation_population_identity": None,
     }
-    with pytest.raises(PS.M2PersistenceError, match="evaluated_population_identity"):
+    with pytest.raises(
+        PS.M2PersistenceError, match="primary_evaluation_population_identity"
+    ):
         PS.finalize_and_promote_arm_result(
             claimed,
             result=result,
@@ -1412,35 +1743,36 @@ def test_claim_bearing_result_requires_population_identity_when_evaluated(
 # --- 11-14. headline metrics require full-population bundles --------------
 
 
-def _subset_bundle():
-    evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
-    return V.build_evaluation_bundle(
-        "M2-G",
-        evidence,
-        [_annotation(start_sample=0)],
-        require_full_population=False,
-    )
-
-
 @pytest.mark.parametrize(
     "function",
-    [V.window_evidence, V.false_alarm_evidence, V.cold_start_stratified_evidence],
+    [
+        V.window_evidence,
+        V.background_false_positive_evidence,
+        V.cold_start_stratified_evidence,
+    ],
 )
-def test_headline_metrics_refuse_a_subsetted_bundle(function):
-    subset = _subset_bundle()
-    assert subset.population_scope == V.POPULATION_SCOPE_SUPPORTING_SUBSET
-    assert subset.is_full_population is False
-    with pytest.raises(V.M2EvaluationError, match="VERIFIED|full-population"):
-        function(subset)
+def test_primary_metrics_refuse_a_challenge_bundle(function):
+    """A primary headline metric can never run on the challenge denominator."""
+    with pytest.raises(V.M2EvaluationError, match="PRIMARY metric population"):
+        function(_challenge_bundle())
 
 
-def test_full_population_bundles_continue_to_work():
-    bundle = _paired_bundle()
-    assert bundle.is_full_population is True
-    payload = V.cold_start_stratified_evidence(bundle)
-    assert payload["population_identity"]["population_scope"] == (
-        V.POPULATION_SCOPE_FULL
-    )
+def test_challenge_fpr_refuses_the_primary_bundle():
+    """p1_challenge_evidence is never called over the primary population."""
+    with pytest.raises(V.M2EvaluationError, match="CHALLENGE metric population"):
+        V.challenge_false_positive_evidence(_paired_bundle())
+
+
+def test_population_specific_bundles_carry_their_own_authority():
+    primary = _paired_bundle()
+    challenge = _challenge_bundle()
+    assert primary.authority == PP.PRIMARY_AUTHORITY
+    assert challenge.authority == PP.CHALLENGE_AUTHORITY
+    payload = V.cold_start_stratified_evidence(primary)
+    assert payload["population"] == PP.POPULATION_PRIMARY
+    assert payload["population_identity"]["authority"] == PP.PRIMARY_AUTHORITY
+    # The challenge bundle has no labels at all, so none can be invented.
+    assert not hasattr(challenge, "labels")
 
 
 # --- 15. stress evidence stays separate and stream-bound ------------------
@@ -1607,120 +1939,113 @@ def test_changing_one_result_byte_invalidates_the_lock_binding(tmp_path):
         PS.validate_canonical_run_lock(lock, run_dir=run_dir)
 
 
-# --- §5/§6 full population must be PROVEN, not asserted -------------------
+# --- §5/§6 the metric population must be PROVEN, not asserted -------------
 
 
-def test_self_consistent_subset_cannot_claim_full_population():
-    """§8.15 -- the exact bypass: subset first, annotate the subset, claim full."""
-    full_evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
-    canonical = _canonical_population_token(full_evidence)
-
-    subset_evidence = full_evidence[:2]
-    subset_annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
-    # Evidence and annotations cover each other perfectly...
-    with pytest.raises(V.M2EvaluationError, match="does not match the canonical"):
-        V.build_evaluation_bundle(
-            "M2-G", subset_evidence, subset_annotations, canonical_population=canonical
+def test_self_consistent_subset_cannot_claim_the_primary_population():
+    """The exact bypass: subset first, annotate the subset, claim the whole."""
+    full_annotations = [_annotation(start_sample=i * 1250) for i in range(4)]
+    subset_evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
+    subset_annotations = full_annotations[:2]
+    # Evidence and annotations cover each other perfectly, and it is still
+    # refused: mutual consistency is not membership in the frozen population.
+    with pytest.raises(V.M2EvaluationError, match="not the frozen population"):
+        V.build_primary_bundle(
+            "M2-G",
+            subset_evidence,
+            subset_annotations,
+            primary_population=_primary_population(full_annotations),
         )
 
 
-def test_full_population_requires_the_canonical_digest_to_be_supplied():
-    """Full scope cannot rest on the caller's assertion alone."""
-    evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
-    annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
-    with pytest.raises(V.M2EvaluationError, match="canonical population authority"):
-        V.build_evaluation_bundle("M2-G", evidence, annotations)
-
-
-def test_subset_cannot_self_author_its_expected_digest(monkeypatch):
-    """§3/§4 -- the exact bypass must RAISE, not merely compare unfavourably.
-
-    The previous version of this test built the bundle successfully and only
-    compared digests afterwards, which proved nothing about refusal. The
-    public API no longer accepts a caller-computed digest at all, so the
-    bypass cannot even be expressed: full scope requires the canonical
-    authority token.
-    """
+def test_primary_scope_requires_the_frozen_authority_to_be_supplied():
+    """Membership cannot rest on the caller's assertion alone."""
     import inspect
 
-    from cardiosentinel.neural.m2_evaluation import _observed_population_digest
+    evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
+    annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
+    parameters = inspect.signature(V.build_primary_bundle).parameters
+    assert parameters["primary_population"].default is inspect.Parameter.empty
+    with pytest.raises(TypeError):
+        V.build_primary_bundle("M2-G", evidence, annotations)
 
-    full_evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
-    subset_evidence = full_evidence[:2]
-    subset_annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
 
-    # 1. There is no public digest-authoring helper any more.
+def test_a_forged_authority_token_is_refused(monkeypatch):
+    """A non-authoritative reference cannot stand in for the frozen authority.
+
+    The public API accepts no caller-computed digest at all, so the bypass
+    cannot even be expressed: the population must arrive as a token whose
+    source is the frozen P1 validation authority.
+    """
+    annotations = [_annotation(start_sample=i * 1250) for i in range(2)]
+    evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
+
     assert not hasattr(V, "canonical_replay_population_digest")
-    # 2. The parameter that once accepted a raw digest is gone.
-    parameters = set(inspect.signature(V.build_evaluation_bundle).parameters)
-    assert "expected_population_digest" not in parameters
-    assert "canonical_population" in parameters
+    assert not hasattr(V, "build_evaluation_bundle")
 
-    # 3. Handing in a self-authored, non-authoritative reference is refused.
     forged = type(
         "ForgedPopulation",
         (),
         {
             "source": "caller_supplied",
-            "ordered_stable_id_sha256": _observed_population_digest(
-                [V.evaluation_key(row) for row in subset_evidence]
-            ),
+            "stable_ids": tuple(a.stable_id for a in annotations),
+            "labels": tuple(int(a.label) for a in annotations),
+            "subject_ids": tuple(str(a.subject_id) for a in annotations),
+            "identity": lambda self: {},
         },
     )()
-    with pytest.raises(V.M2EvaluationError, match="verified full input bundle"):
-        V.build_evaluation_bundle(
-            "M2-G",
-            subset_evidence,
-            subset_annotations,
-            canonical_population=forged,
+    with pytest.raises(V.M2EvaluationError, match="frozen P1 validation authority"):
+        V.build_primary_bundle("M2-G", evidence, annotations, primary_population=forged)
+    with pytest.raises(V.M2EvaluationError, match="frozen validation challenge"):
+        V.build_challenge_bundle("M2-G", evidence, [], challenge_population=forged)
+
+
+def test_the_frozen_authority_cannot_be_relabelled_by_the_annotations():
+    """A caller cannot flip a label on the way into the primary denominator."""
+    annotations = [_annotation(start_sample=0, label=0)]
+    evidence = [_evidence(start_sample=0)]
+    authority = _primary_population(annotations)
+    relabelled = [_annotation(start_sample=0, label=1)]
+    with pytest.raises(V.M2EvaluationError, match="never reassigned"):
+        V.build_primary_bundle(
+            "M2-G", evidence, relabelled, primary_population=authority
         )
 
-    # 4. And a genuine token for the FULL population refuses the subset.
-    with pytest.raises(V.M2EvaluationError, match="does not match the canonical"):
-        V.build_evaluation_bundle(
-            "M2-G",
-            subset_evidence,
-            subset_annotations,
-            canonical_population=_canonical_population_token(full_evidence),
-        )
 
-
-def test_exact_full_replay_population_digest_is_accepted():
-    """§8.17 -- the true canonical population verifies and is marked full."""
+def test_the_exact_frozen_population_is_accepted():
     evidence = [_evidence(start_sample=i * 1250) for i in range(4)]
     annotations = [_annotation(start_sample=i * 1250) for i in range(4)]
-    bundle = V.build_evaluation_bundle(
+    bundle = V.build_primary_bundle(
         "M2-G",
         evidence,
         annotations,
-        canonical_population=_canonical_population_token(evidence),
+        primary_population=_primary_population(annotations),
     )
-    assert bundle.population_scope == V.POPULATION_SCOPE_FULL
-    assert bundle.population_verified_against_canonical_replay is True
     identity = bundle.population_identity()
-    assert identity["population_verified_against_canonical_replay"] is True
-    PS.validate_evaluated_population_identity(identity)
+    assert identity["matches_frozen_authority_exactly"] is True
+    assert identity["evaluated_rows"] == 4
+    assert identity["positional_join_used"] is False
+    assert identity["authority"] == PP.PRIMARY_AUTHORITY
 
 
-def test_unverified_population_identity_is_rejected_for_claim_bearing():
-    """A scope label alone is never enough; verification is required."""
-    identity = dict(_paired_bundle().population_identity())
-    identity["population_verified_against_canonical_replay"] = False
-    with pytest.raises(PS.M2PersistenceError, match="VERIFIED"):
-        PS.validate_evaluated_population_identity(identity)
+def test_an_unproven_population_identity_is_rejected_for_claim_bearing():
+    """A scope label alone is never enough; the exactness proof is required."""
+    identity = dict(_primary_identity())
+    identity["matches_frozen_authority_exactly"] = False
+    with pytest.raises(PS.M2PersistenceError, match="EXACTLY the frozen population"):
+        PS.validate_primary_population_identity(identity)
 
 
-def test_supporting_subset_remains_usable_for_supporting_evidence():
-    """§8.18/§7 -- subsets stay legitimate, just not headline."""
-    subset = _subset_bundle()
-    assert subset.population_scope == V.POPULATION_SCOPE_SUPPORTING_SUBSET
-    assert subset.population_verified_against_canonical_replay is False
-    # Label-free policy evidence remains available for a subset.
-    summary = V.policy_evidence(list(subset.evidence))
+def test_policy_evidence_stays_available_without_a_metric_denominator():
+    """Label-free policy evidence binds the FULL REPLAY population, not a metric."""
+    evidence = [_evidence(start_sample=i * 1250) for i in range(2)]
+    summary = V.policy_evidence(evidence)
     assert summary["evidence_class"] == "m2_policy_evidence"
-    # And its identity is refused as a headline claim-bearing population.
-    with pytest.raises(PS.M2PersistenceError):
-        PS.validate_evaluated_population_identity(subset.population_identity())
+    assert summary["population"] == PP.POPULATION_REPLAY
+    # And it refuses to bind anything but the verified replay authority.
+    forged = type("Forged", (), {"source": "caller_supplied"})()
+    with pytest.raises(V.M2EvaluationError, match="FULL REPLAY authority"):
+        V.policy_evidence(evidence, replay_population=forged)
 
 
 # --------------------------------------------------------------------------
@@ -1846,7 +2171,10 @@ def test_minimal_result_fails_through_the_real_finalization_path(
         "cold_start_evidence",
         "contamination_evidence",
         "scientific_computation_completed",
-        "evaluated_population_identity",
+        "replay_population_identity",
+        "primary_evaluation_population_identity",
+        "challenge_evaluation_population_identity",
+        "stress_interval_selection_identity",
     ],
 )
 def test_result_missing_any_mandatory_section_fails(tmp_path, frozen_runtime, section):
@@ -1854,7 +2182,7 @@ def test_result_missing_any_mandatory_section_fails(tmp_path, frozen_runtime, se
     claimed = PS.claim_run_directory(
         tmp_path, f"M2_missing_{section}", "M2-G", runtime=frozen_runtime
     )
-    result = _full_result(_paired_bundle().population_identity())
+    result = _full_result()
     del result[section]
     with pytest.raises(PS.M2PersistenceError):
         PS.finalize_and_promote_arm_result(
@@ -1870,7 +2198,7 @@ def test_result_missing_any_mandatory_section_fails(tmp_path, frozen_runtime, se
 
 def test_empty_mandatory_section_is_rejected():
     """An omitted section may not be smuggled in as an empty object."""
-    result = _full_result(_paired_bundle().population_identity())
+    result = _full_result()
     result["window_evidence"] = {}
     with pytest.raises(PS.M2PersistenceError, match="protocol-valid exclusion"):
         PS.validate_claim_bearing_arm_result_payload(result)
@@ -1880,13 +2208,28 @@ def test_empty_mandatory_section_is_rejected():
 
 
 def test_section_population_identity_must_agree_with_the_result(tmp_path):
-    """§11.11 -- metrics and the declared population must describe same rows."""
-    population = _paired_bundle().population_identity()
-    result = _full_result(population)
-    other = dict(population)
-    other["evaluated_rows"] = population["evaluated_rows"] + 1
+    """Each metric and ITS OWN declared population must describe same rows."""
+    primary = _primary_identity()
+    other = dict(primary)
+    other["evaluated_rows"] = primary["evaluated_rows"] + 1
+    result = _full_result()
     result["window_evidence"] = {"population_identity": other}
     with pytest.raises(PS.M2PersistenceError, match="differs from"):
+        PS.validate_claim_bearing_arm_result_payload(result)
+
+
+def test_a_section_may_not_borrow_another_populations_denominator():
+    """Window evidence declaring the CHALLENGE population is fatal."""
+    result = _full_result()
+    result["window_evidence"] = {"population_identity": _challenge_identity()}
+    with pytest.raises(PS.M2PersistenceError, match="differs from"):
+        PS.validate_claim_bearing_arm_result_payload(result)
+
+
+def test_a_section_must_declare_the_population_it_was_computed_over():
+    result = _full_result()
+    result["cold_start_evidence"] = {"strata": {}}
+    with pytest.raises(PS.M2PersistenceError, match="does not declare"):
         PS.validate_claim_bearing_arm_result_payload(result)
 
 
@@ -1895,21 +2238,20 @@ def test_result_and_lock_population_identities_are_identical(tmp_path, frozen_ru
     claimed = PS.claim_run_directory(
         tmp_path, "M2_coherent", "M2-G", runtime=frozen_runtime
     )
-    population = _paired_bundle().population_identity()
     PS.finalize_and_promote_arm_result(
         claimed,
-        result=_full_result(population),
+        result=_full_result(),
         execution_identity=_execution_identity(),
         runtime=frozen_runtime,
         requires_evaluation=True,
     )
     promoted = json.loads((claimed.run_dir / PS.ARM_RESULT_NAME).read_text())
     lock = json.loads((claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).read_text())
-    assert (
-        promoted["evaluated_population_identity"]
-        == lock["evaluated_population_identity"]
-        == population
-    )
+    for field in PS.POPULATION_IDENTITY_FIELDS:
+        assert promoted[field] == lock[field]
+    # And the four remain distinct: none stands in for another.
+    identities = [promoted[f] for f in PS.POPULATION_IDENTITY_FIELDS]
+    assert len({json.dumps(i, sort_keys=True) for i in identities}) == 4
 
 
 # --- §11.12-16 separate promotion observations ----------------------------
@@ -1924,7 +2266,7 @@ def test_result_and_lock_each_have_their_own_pre_promotion_check(
     )
     PS.finalize_and_promote_arm_result(
         claimed,
-        result=_full_result(_paired_bundle().population_identity()),
+        result=_full_result(),
         execution_identity=_execution_identity(),
         runtime=frozen_runtime,
         requires_evaluation=True,
@@ -1950,7 +2292,7 @@ def test_lock_binds_its_own_promotion_observation(tmp_path, frozen_runtime):
     )
     PS.finalize_and_promote_arm_result(
         claimed,
-        result=_full_result(_paired_bundle().population_identity()),
+        result=_full_result(),
         execution_identity=_execution_identity(),
         runtime=frozen_runtime,
         requires_evaluation=True,
@@ -1993,7 +2335,7 @@ def test_lock_promotion_mismatch_leaves_the_run_non_canonical(
     with pytest.raises(S.RuntimeIntegrityError, match="experiment-lock promotion"):
         PS.finalize_and_promote_arm_result(
             claimed,
-            result=_full_result(_paired_bundle().population_identity()),
+            result=_full_result(),
             execution_identity=_execution_identity(),
             runtime=frozen_runtime,
             requires_evaluation=True,
