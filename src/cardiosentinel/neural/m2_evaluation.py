@@ -10,9 +10,15 @@ replay-side modules neither name an annotation quantity nor import this module
 length proves nothing: a permuted annotation vector of the same length would be
 silently accepted by a positional join. Every annotation therefore carries the
 frozen `(record_id, channel_index, start_sample)` identity, which maps
-one-to-one onto the frozen `stable_id`, and `M2EvaluationBundle` performs a
+one-to-one onto the frozen `stable_id`, and each bundle performs a
 deterministic keyed join that rejects duplicates, missing identities, extra
 identities and any mismatch.
+
+**Three populations, three contracts.** PRIMARY and CHALLENGE are separate
+structures with separate annotation types and separate frozen authorities (see
+`m2_populations`), because forcing them into one permissive record is exactly
+how a challenge confounder acquires an invented binary label or a headline
+metric silently widens its denominator to the full causal timeline.
 
 **Unscored rows are refused, not dropped.** This reproduces the frozen M1
 governance rule verbatim (`m1_experiment.require_available_rows`): a
@@ -42,6 +48,15 @@ from cardiosentinel.neural.m2_evidence import (
     summarize_admission,
 )
 from cardiosentinel.neural.m2_policy import M2RowEvidence, require_m2_arm
+from cardiosentinel.neural.m2_populations import (
+    CHALLENGE_AUTHORITY,
+    POPULATION_CHALLENGE,
+    POPULATION_PRIMARY,
+    POPULATION_REPLAY,
+    POPULATION_STRESS,
+    PRIMARY_AUTHORITY,
+    REPLAY_AUTHORITY,
+)
 from cardiosentinel.neural.m2_scorer import (
     M1L_CLASSIFICATION_THRESHOLD,
     NORMAL_EVIDENCE_THRESHOLD,
@@ -53,9 +68,6 @@ QUANTITATIVE_CHALLENGE_STATUS: Final = "quantitative_secondary"
 
 EvaluationKey = tuple[str, int, int]
 """`(record_id, channel_index, start_sample)` -- immutable frozen row identity."""
-
-POPULATION_SCOPE_FULL: Final = "full_population"
-POPULATION_SCOPE_SUPPORTING_SUBSET: Final = "supporting_subset"
 
 
 class M2EvaluationError(RuntimeError):
@@ -124,21 +136,33 @@ def stable_id_for_key(key: EvaluationKey) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class M2AnnotationRow:
-    """One frozen annotation, bound to an immutable row identity.
+class M2PrimaryAnnotation:
+    """One PRIMARY metric annotation, bound to an immutable row identity.
 
-    `subject_id` and `target_family` exist for evaluation only. Neither is ever
-    a runtime predictive or gating input -- they are absent from
-    `M2TimelineRow`, from `evaluate_gate` and from the whole replay path.
+    Carries a binary label because the primary population IS the classification
+    denominator. `subject_id` exists for subject-macro and subject-FPR
+    reporting only, and `cold_start_bin` for the frozen recording-age strata.
+    None of them is ever a runtime predictive or gating input: all three are
+    absent from `M2TimelineRow`, from `evaluate_gate` and from the replay path.
+
+    Deliberately NOT interchangeable with `M2ChallengeAnnotation`. Forcing both
+    into one permissive record is how a challenge row acquires an invented
+    binary label.
     """
 
     record_id: str
     channel_index: int
     start_sample: int
     label: int
-    target_family: str
     subject_id: str
     cold_start_bin: str
+
+    def __post_init__(self) -> None:
+        if int(self.label) not in (0, 1):
+            raise M2EvaluationError(
+                f"A primary annotation carries the binary label 0 or 1; "
+                f"received {self.label!r}."
+            )
 
     @property
     def key(self) -> EvaluationKey:
@@ -150,296 +174,598 @@ class M2AnnotationRow:
 
 
 @dataclass(frozen=True, slots=True)
-class M2EvaluationBundle:
-    """Evidence joined to annotations by identity, in one deterministic order."""
+class M2ChallengeAnnotation:
+    """One CHALLENGE metric annotation. It has NO binary label, by design.
 
-    arm: str
-    keys: tuple[EvaluationKey, ...]
-    evidence: tuple[M2RowEvidence, ...]
-    annotations: tuple[M2AnnotationRow, ...]
-    population_scope: str = POPULATION_SCOPE_SUPPORTING_SUBSET
-    population_verified_against_canonical_replay: bool = False
-    canonical_population_source: str | None = None
-    canonical_population_digest: str | None = None
-
-    @property
-    def is_full_population(self) -> bool:
-        return self.population_scope == POPULATION_SCOPE_FULL
-
-    @property
-    def scores(self) -> np.ndarray:
-        return np.asarray(
-            [row.decision.score for row in self.evidence], dtype=np.float64
-        )
-
-    @property
-    def labels(self) -> np.ndarray:
-        return np.asarray([int(a.label) for a in self.annotations], dtype=np.int64)
-
-    @property
-    def subject_ids(self) -> np.ndarray:
-        return np.asarray([str(a.subject_id) for a in self.annotations], dtype=np.str_)
-
-    @property
-    def target_families(self) -> np.ndarray:
-        return np.asarray(
-            [str(a.target_family) for a in self.annotations], dtype=np.str_
-        )
-
-    @property
-    def cold_start_bins(self) -> np.ndarray:
-        return np.asarray(
-            [str(a.cold_start_bin) for a in self.annotations], dtype=np.str_
-        )
-
-    @property
-    def stable_ids(self) -> tuple[str, ...]:
-        return tuple(stable_id_for_key(key) for key in self.keys)
-
-    def population_identity(self) -> dict[str, Any]:
-        """The exact evaluated population, bound by the frozen identity digest."""
-        from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
-
-        return {
-            "evaluated_rows": len(self.keys),
-            "evaluated_ordered_stable_id_sha256": ordered_stable_id_digest(
-                self.stable_ids
-            ),
-            "identity_key": "(record_id, channel_index, start_sample)",
-            "identity_corresponds_to_frozen_stable_id": True,
-            "positional_join_used": False,
-            "population_scope": self.population_scope,
-            "population_verified_against_canonical_replay": (
-                self.population_verified_against_canonical_replay
-            ),
-            "canonical_population_source": self.canonical_population_source,
-            "canonical_population_digest": self.canonical_population_digest,
-        }
-
-
-def build_evaluation_bundle(
-    arm: str,
-    evidence: Sequence[M2RowEvidence],
-    annotations: Iterable[M2AnnotationRow],
-    *,
-    canonical_population: Any | None = None,
-    require_full_population: bool = True,
-) -> M2EvaluationBundle:
-    """Join evidence to annotations by identity, refusing every ambiguity.
-
-    Rejected: duplicate evidence identities, duplicate annotation identities,
-    annotations with no matching evidence row, and -- when
-    `require_full_population` is set -- evidence rows carrying no annotation.
-    A permuted annotation ordering cannot be silently accepted: rows are
-    realigned deterministically by identity, so order carries no meaning.
-
-    An annotated row that produced no score is a REFUSAL, reproducing the
-    frozen M1 rule exactly: it is never dropped from a metric, no prediction is
-    invented for it, and no denominator is altered automatically.
+    A challenge confounder row is not an ischemia-positive/negative
+    classification row, so no primary label exists for it and none is invented.
+    The structure simply has nowhere to put one.
     """
-    evaluated_arm = require_m2_arm(arm)
 
-    evidence_index: dict[EvaluationKey, M2RowEvidence] = {}
-    for row in evidence:
-        key = evaluation_key(row)
-        if key in evidence_index:
-            raise M2EvaluationError(
-                f"Duplicate evidence identity {key}; the evaluated population "
-                "would be ambiguous."
-            )
-        evidence_index[key] = row
+    record_id: str
+    channel_index: int
+    start_sample: int
+    target_family: str
+    subject_id: str
 
-    annotation_index: dict[EvaluationKey, M2AnnotationRow] = {}
-    for annotation in annotations:
-        if annotation.key in annotation_index:
-            raise M2EvaluationError(f"Duplicate annotation identity {annotation.key}.")
-        annotation_index[annotation.key] = annotation
+    @property
+    def key(self) -> EvaluationKey:
+        return (self.record_id, int(self.channel_index), int(self.start_sample))
 
-    missing = sorted(set(annotation_index) - set(evidence_index))
-    if missing:
-        raise M2EvaluationError(
-            f"{len(missing)} annotation identities have no evidence row, "
-            f"beginning {missing[:3]}. Annotations are never dropped silently."
-        )
-    unannotated = sorted(set(evidence_index) - set(annotation_index))
-    if unannotated and require_full_population:
-        raise M2EvaluationError(
-            f"{len(unannotated)} evidence rows carry no annotation, beginning "
-            f"{unannotated[:3]}. Pass require_full_population=False only when "
-            "the evaluated population is deliberately a subset."
-        )
-
-    keys = tuple(sorted(annotation_index))
-    joined_evidence = tuple(evidence_index[key] for key in keys)
-    unscored = [
-        key
-        for key, row in zip(keys, joined_evidence, strict=True)
-        if row.decision.score is None
-    ]
-    if unscored:
-        raise M2EvaluationError(
-            f"Score-bearing M2 population contains {len(unscored)} rows with no "
-            f"prediction, beginning {unscored[:3]}. STOP FOR HUMAN REVIEW. The "
-            "row is never dropped from a metric, no prediction is invented and "
-            "no denominator is altered automatically."
-        )
-    # Population scope is DERIVED and VERIFIED, never trusted from the caller.
-    # Evidence and annotations covering each other proves only mutual
-    # consistency: a caller could subset the evidence first, annotate exactly
-    # that subset, and still be internally consistent. Full scope therefore
-    # requires the population to match the canonical replay population digest,
-    # which is computed independently of this annotation table.
-    # Full scope is granted ONLY by the canonical input authority. A caller
-    # cannot hand in a digest computed from these very rows: the reference is a
-    # token that `M2InputBundle.canonical_input_population_identity()` issues
-    # after proving the bundle is the complete frozen partition.
-    scope = POPULATION_SCOPE_SUPPORTING_SUBSET
-    verified = False
-    source = None
-    reference_digest = None
-    observed_digest = _observed_population_digest(keys)
-
-    if require_full_population:
-        if canonical_population is None:
-            raise M2EvaluationError(
-                "A full-population evaluation bundle requires the canonical "
-                "population authority from the verified full M2 input bundle "
-                "(M2InputBundle.canonical_input_population_identity()). Full "
-                "scope may never rest on a caller-supplied digest; pass "
-                "require_full_population=False for supporting evidence."
-            )
-        source = getattr(canonical_population, "source", None)
-        if source != "verified_full_input_bundle":
-            raise M2EvaluationError(
-                "The canonical population reference must come from a verified "
-                f"full input bundle; received source {source!r}."
-            )
-        reference_digest = getattr(
-            canonical_population, "ordered_stable_id_sha256", None
-        )
-        if observed_digest != reference_digest:
-            raise M2EvaluationError(
-                "The evaluated population does not match the canonical input "
-                f"population: observed {observed_digest}, canonical "
-                f"{reference_digest}. A self-consistent subset is not a "
-                "full-population claim."
-            )
-        scope = POPULATION_SCOPE_FULL
-        verified = True
-
-    return M2EvaluationBundle(
-        arm=evaluated_arm,
-        keys=keys,
-        evidence=joined_evidence,
-        annotations=tuple(annotation_index[key] for key in keys),
-        population_scope=scope,
-        population_verified_against_canonical_replay=verified,
-        canonical_population_source=source,
-        canonical_population_digest=reference_digest,
-    )
-
-
-def require_full_population_bundle(bundle: M2EvaluationBundle, purpose: str) -> None:
-    """Headline claim-bearing metrics require full evidence/annotation cover.
-
-    A deliberately subsetted bundle is legitimate supporting evidence, but it
-    must never become the silent input to a headline window, false-alarm or
-    cold-start metric: that would report a claim over an arbitrarily narrowed
-    population. Challenge stratification still happens *inside* the frozen
-    metric functions, from the full joined population.
-    """
-    if not bundle.population_verified_against_canonical_replay:
-        raise M2EvaluationError(
-            f"{purpose} is a headline claim-bearing metric and requires a "
-            "population VERIFIED against the canonical replay population "
-            "digest; this bundle was not verified."
-        )
-    if not bundle.is_full_population:
-        raise M2EvaluationError(
-            f"{purpose} is a headline claim-bearing metric and requires a "
-            f"full-population evaluation bundle; received a "
-            f"{bundle.population_scope!r} bundle built with "
-            "require_full_population=False. Subsetted bundles remain available "
-            "for supporting evidence only."
-        )
+    @property
+    def stable_id(self) -> str:
+        return stable_id_for_key(self.key)
 
 
 # --------------------------------------------------------------------------
-# Thresholded evaluation, every path guarded
+# Annotation tables: compact, purpose-specific, and structurally incompatible
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class M2PrimaryAnnotationTable:
+    """PRIMARY annotations as compact arrays. Carries labels."""
+
+    stable_ids: np.ndarray
+    labels: np.ndarray
+    subject_ids: np.ndarray
+    cold_start_bins: np.ndarray
+
+    def __post_init__(self) -> None:
+        widths = {
+            self.stable_ids.shape[0],
+            self.labels.shape[0],
+            self.subject_ids.shape[0],
+            self.cold_start_bins.shape[0],
+        }
+        if len(widths) != 1:
+            raise M2EvaluationError("Primary annotation columns are not row-aligned.")
+        if len(set(self.stable_ids.tolist())) != self.stable_ids.shape[0]:
+            raise M2EvaluationError("Duplicate primary annotation identity.")
+        unexpected = sorted(set(np.asarray(self.labels).tolist()) - {0, 1})
+        if unexpected:
+            raise M2EvaluationError(
+                f"Primary annotations carry non-binary labels {unexpected}."
+            )
+
+    @classmethod
+    def from_rows(cls, rows: Iterable[M2PrimaryAnnotation]) -> M2PrimaryAnnotationTable:
+        collected = list(rows)
+        for row in collected:
+            if not isinstance(row, M2PrimaryAnnotation):
+                raise M2EvaluationError(
+                    f"A primary annotation table accepts M2PrimaryAnnotation "
+                    f"only; received {type(row).__name__}. A challenge "
+                    "confounder never enters the classification denominator."
+                )
+        return cls(
+            stable_ids=np.asarray([r.stable_id for r in collected], dtype=np.str_),
+            labels=np.asarray([int(r.label) for r in collected], dtype=np.int64),
+            subject_ids=np.asarray(
+                [str(r.subject_id) for r in collected], dtype=np.str_
+            ),
+            cold_start_bins=np.asarray(
+                [str(r.cold_start_bin) for r in collected], dtype=np.str_
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class M2ChallengeAnnotationTable:
+    """CHALLENGE annotations as compact arrays. There is no label column."""
+
+    stable_ids: np.ndarray
+    target_families: np.ndarray
+    subject_ids: np.ndarray
+
+    def __post_init__(self) -> None:
+        widths = {
+            self.stable_ids.shape[0],
+            self.target_families.shape[0],
+            self.subject_ids.shape[0],
+        }
+        if len(widths) != 1:
+            raise M2EvaluationError("Challenge annotation columns are not row-aligned.")
+        if len(set(self.stable_ids.tolist())) != self.stable_ids.shape[0]:
+            raise M2EvaluationError("Duplicate challenge annotation identity.")
+
+    @classmethod
+    def from_rows(
+        cls, rows: Iterable[M2ChallengeAnnotation]
+    ) -> M2ChallengeAnnotationTable:
+        collected = list(rows)
+        for row in collected:
+            if not isinstance(row, M2ChallengeAnnotation):
+                raise M2EvaluationError(
+                    f"A challenge annotation table accepts M2ChallengeAnnotation "
+                    f"only; received {type(row).__name__}. A labelled primary row "
+                    "is not a challenge confounder."
+                )
+        return cls(
+            stable_ids=np.asarray([r.stable_id for r in collected], dtype=np.str_),
+            target_families=np.asarray(
+                [str(r.target_family) for r in collected], dtype=np.str_
+            ),
+            subject_ids=np.asarray(
+                [str(r.subject_id) for r in collected], dtype=np.str_
+            ),
+        )
+
+
+def _as_annotation_table(annotations: Any, kind: str) -> Any:
+    """Accept either a compact table or an iterable of row objects."""
+    expected = (
+        M2PrimaryAnnotationTable if kind == "primary" else M2ChallengeAnnotationTable
+    )
+    if isinstance(annotations, expected):
+        return annotations
+    other = (
+        M2ChallengeAnnotationTable if kind == "primary" else M2PrimaryAnnotationTable
+    )
+    if isinstance(annotations, other):
+        raise M2EvaluationError(
+            f"A {kind} bundle was given a {type(annotations).__name__}. The two "
+            "populations are different denominators and are never interchanged."
+        )
+    return expected.from_rows(annotations)
+
+
+def _as_score_table(arm: str, scores: Any) -> Any:
+    """Accept a compact `M2ScoreTable` or a bounded sequence of evidence rows.
+
+    The canonical route always passes a table: at validation scale the row
+    objects are exactly the corpus-scale retention the M1 incident forbade.
+    """
+    if hasattr(scores, "scores_for"):
+        if getattr(scores, "arm", arm) != arm:
+            raise M2EvaluationError(
+                f"The score table belongs to arm {scores.arm!r}, not {arm!r}."
+            )
+        return scores
+    from cardiosentinel.neural.m2_evidence_store import (
+        M2EvidenceStoreError,
+        M2ScoreTable,
+    )
+
+    rows = list(scores)
+    if not rows:
+        raise M2EvaluationError("No replay evidence was supplied.")
+    keys = [evaluation_key(row) for row in rows]
+    if len(set(keys)) != len(keys):
+        raise M2EvaluationError(
+            "Duplicate evidence identity; the evaluated population would be ambiguous."
+        )
+    try:
+        return M2ScoreTable(
+            arm=require_m2_arm(arm),
+            stable_ids=np.asarray(
+                [stable_id_for_key(key) for key in keys], dtype=np.str_
+            ),
+            scores=np.asarray(
+                [
+                    np.nan if row.decision.score is None else float(row.decision.score)
+                    for row in rows
+                ],
+                dtype=np.float64,
+            ),
+            scored=np.asarray(
+                [row.decision.score is not None for row in rows], dtype=np.bool_
+            ),
+        )
+    except M2EvidenceStoreError as error:
+        raise M2EvaluationError(str(error)) from error
+
+
+def _scores_for(table: Any, stable_ids: Sequence[str]) -> np.ndarray:
+    """Align scores to an exact identity list, as one evaluation error type."""
+    from cardiosentinel.neural.m2_evidence_store import M2EvidenceStoreError
+
+    try:
+        return table.scores_for(list(stable_ids))
+    except M2EvidenceStoreError as error:
+        raise M2EvaluationError(str(error)) from error
+
+
+def _require_exact_population(
+    observed: np.ndarray,
+    authority_stable_ids: Sequence[str],
+    *,
+    population_name: str,
+) -> None:
+    """The evaluated rows must be EXACTLY the frozen population, no more, no less."""
+    seen = set(observed.tolist())
+    expected = set(str(value) for value in authority_stable_ids)
+    missing = sorted(expected - seen)
+    extra = sorted(seen - expected)
+    if missing or extra:
+        raise M2EvaluationError(
+            f"The evaluated {population_name} population is not the frozen "
+            f"population: {len(missing)} frozen rows absent (beginning "
+            f"{missing[:3]}) and {len(extra)} rows present that the frozen "
+            f"authority does not contain (beginning {extra[:3]}). The "
+            "denominator is never widened or narrowed to fit the evidence."
+        )
+
+
+def _authority_column(
+    stable_ids: Sequence[str], values: Sequence[Any]
+) -> dict[str, Any]:
+    return dict(zip((str(v) for v in stable_ids), values, strict=True))
+
+
+@dataclass(frozen=True, slots=True)
+class M2PrimaryBundle:
+    """PRIMARY metric rows, aligned by identity and held as compact arrays.
+
+    This is the classification denominator, and its membership comes from the
+    frozen P1 validation population -- never from an M2 score.
+    """
+
+    arm: str
+    stable_ids: np.ndarray
+    scores: np.ndarray
+    labels: np.ndarray
+    subject_ids: np.ndarray
+    cold_start_bins: np.ndarray
+    authority: str
+    authority_identity: dict[str, Any]
+
+    @property
+    def row_count(self) -> int:
+        return int(self.stable_ids.shape[0])
+
+    def population_identity(self) -> dict[str, Any]:
+        from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+        payload = dict(self.authority_identity)
+        payload.update(
+            {
+                "evaluated_rows": self.row_count,
+                "evaluated_ordered_stable_id_sha256": ordered_stable_id_digest(
+                    sorted(self.stable_ids.tolist())
+                ),
+                "identity_key": "(record_id, channel_index, start_sample)",
+                "identity_corresponds_to_frozen_stable_id": True,
+                "positional_join_used": False,
+                "matches_frozen_authority_exactly": True,
+            }
+        )
+        return payload
+
+
+@dataclass(frozen=True, slots=True)
+class M2ChallengeBundle:
+    """CHALLENGE metric rows. There is no `labels` field, deliberately."""
+
+    arm: str
+    stable_ids: np.ndarray
+    scores: np.ndarray
+    target_families: np.ndarray
+    subject_ids: np.ndarray
+    authority: str
+    authority_identity: dict[str, Any]
+
+    @property
+    def row_count(self) -> int:
+        return int(self.stable_ids.shape[0])
+
+    def population_identity(self) -> dict[str, Any]:
+        from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+        payload = dict(self.authority_identity)
+        payload.update(
+            {
+                "evaluated_rows": self.row_count,
+                "evaluated_ordered_stable_id_sha256": ordered_stable_id_digest(
+                    sorted(self.stable_ids.tolist())
+                ),
+                "identity_key": "(record_id, channel_index, start_sample)",
+                "identity_corresponds_to_frozen_stable_id": True,
+                "positional_join_used": False,
+                "matches_frozen_authority_exactly": True,
+                "binary_labels_invented": False,
+            }
+        )
+        return payload
+
+
+def build_primary_bundle(
+    arm: str,
+    scores: Any,
+    annotations: Any,
+    *,
+    primary_population: Any,
+) -> M2PrimaryBundle:
+    """Join PRIMARY scores to labels by identity, under the frozen P1 authority.
+
+    The annotation table never gets to define the population: the evaluated
+    rows must be exactly the frozen P1 validation population, and every label
+    and subject must agree with it. Alignment is by stable identity in one
+    deterministic order, so a permuted annotation table carries no meaning and
+    equal length proves nothing.
+    """
+    evaluated_arm = require_m2_arm(arm)
+    if getattr(primary_population, "source", None) != PRIMARY_AUTHORITY:
+        raise M2EvaluationError(
+            "The primary metric population must come from the frozen P1 "
+            "validation authority "
+            "(m2_populations.primary_evaluation_population); received source "
+            f"{getattr(primary_population, 'source', None)!r}."
+        )
+    table = _as_annotation_table(annotations, "primary")
+    _require_exact_population(
+        table.stable_ids, primary_population.stable_ids, population_name="primary"
+    )
+
+    order = np.argsort(table.stable_ids, kind="stable")
+    stable_ids = table.stable_ids[order]
+    labels = np.asarray(table.labels, dtype=np.int64)[order]
+    subject_ids = table.subject_ids[order]
+    cold_start_bins = table.cold_start_bins[order]
+
+    frozen_labels = _authority_column(
+        primary_population.stable_ids, primary_population.labels
+    )
+    frozen_subjects = _authority_column(
+        primary_population.stable_ids, primary_population.subject_ids
+    )
+    for stable_id, label, subject in zip(
+        stable_ids.tolist(), labels.tolist(), subject_ids.tolist(), strict=True
+    ):
+        if int(label) != int(frozen_labels[stable_id]):
+            raise M2EvaluationError(
+                f"Primary annotation {stable_id} carries label {label}, but the "
+                f"frozen P1 validation population records "
+                f"{frozen_labels[stable_id]}. Labels are never reassigned "
+                "during M2 evaluation."
+            )
+        if str(subject) != str(frozen_subjects[stable_id]):
+            raise M2EvaluationError(
+                f"Primary annotation {stable_id} carries subject {subject!r}, "
+                f"but the frozen population records "
+                f"{frozen_subjects[stable_id]!r}."
+            )
+    return M2PrimaryBundle(
+        arm=evaluated_arm,
+        stable_ids=stable_ids,
+        scores=_scores_for(_as_score_table(evaluated_arm, scores), stable_ids.tolist()),
+        labels=labels,
+        subject_ids=subject_ids,
+        cold_start_bins=cold_start_bins,
+        authority=PRIMARY_AUTHORITY,
+        authority_identity=primary_population.identity(),
+    )
+
+
+def build_challenge_bundle(
+    arm: str,
+    scores: Any,
+    annotations: Any,
+    *,
+    challenge_population: Any,
+) -> M2ChallengeBundle:
+    """Join CHALLENGE scores by identity, under the frozen challenge selection."""
+    evaluated_arm = require_m2_arm(arm)
+    if getattr(challenge_population, "source", None) != CHALLENGE_AUTHORITY:
+        raise M2EvaluationError(
+            "The challenge metric population must come from the frozen "
+            "validation challenge selection "
+            "(m2_populations.challenge_evaluation_population); received source "
+            f"{getattr(challenge_population, 'source', None)!r}."
+        )
+    table = _as_annotation_table(annotations, "challenge")
+    _require_exact_population(
+        table.stable_ids, challenge_population.stable_ids, population_name="challenge"
+    )
+
+    order = np.argsort(table.stable_ids, kind="stable")
+    stable_ids = table.stable_ids[order]
+    families = table.target_families[order]
+    subject_ids = table.subject_ids[order]
+
+    frozen_families = _authority_column(
+        challenge_population.stable_ids, challenge_population.target_families
+    )
+    frozen_subjects = _authority_column(
+        challenge_population.stable_ids, challenge_population.subject_ids
+    )
+    for stable_id, family, subject in zip(
+        stable_ids.tolist(), families.tolist(), subject_ids.tolist(), strict=True
+    ):
+        if str(family) != str(frozen_families[stable_id]):
+            raise M2EvaluationError(
+                f"Challenge annotation {stable_id} carries family {family!r}, "
+                f"but the frozen selection records {frozen_families[stable_id]!r}."
+            )
+        if str(subject) != str(frozen_subjects[stable_id]):
+            raise M2EvaluationError(
+                f"Challenge annotation {stable_id} carries subject {subject!r}, "
+                f"but the frozen selection records {frozen_subjects[stable_id]!r}."
+            )
+    return M2ChallengeBundle(
+        arm=evaluated_arm,
+        stable_ids=stable_ids,
+        scores=_scores_for(_as_score_table(evaluated_arm, scores), stable_ids.tolist()),
+        target_families=families,
+        subject_ids=subject_ids,
+        authority=CHALLENGE_AUTHORITY,
+        authority_identity=challenge_population.identity(),
+    )
+
+
+def require_primary_bundle(bundle: Any, purpose: str) -> M2PrimaryBundle:
+    """Refuse anything but a frozen-authority PRIMARY bundle."""
+    if not isinstance(bundle, M2PrimaryBundle):
+        raise M2EvaluationError(
+            f"{purpose} is computed over the PRIMARY metric population only; "
+            f"received {type(bundle).__name__}. The full replay population and "
+            "the challenge population are different denominators."
+        )
+    if bundle.authority != PRIMARY_AUTHORITY:
+        raise M2EvaluationError(
+            f"{purpose} requires the frozen P1 validation authority; the bundle "
+            f"carries {bundle.authority!r}."
+        )
+    return bundle
+
+
+def require_challenge_bundle(bundle: Any, purpose: str) -> M2ChallengeBundle:
+    """Refuse anything but a frozen-authority CHALLENGE bundle."""
+    if not isinstance(bundle, M2ChallengeBundle):
+        raise M2EvaluationError(
+            f"{purpose} is computed over the CHALLENGE metric population only; "
+            f"received {type(bundle).__name__}. It must never run over the "
+            "primary population."
+        )
+    if bundle.authority != CHALLENGE_AUTHORITY:
+        raise M2EvaluationError(
+            f"{purpose} requires the frozen validation challenge authority; the "
+            f"bundle carries {bundle.authority!r}."
+        )
+    return bundle
+
+
+# --------------------------------------------------------------------------
+# Thresholded evaluation: every path guarded, every path bound to ONE population
 # --------------------------------------------------------------------------
 
 
 def window_evidence(
-    bundle: M2EvaluationBundle,
+    bundle: M2PrimaryBundle,
     *,
     threshold: float = M1L_CLASSIFICATION_THRESHOLD,
 ) -> dict[str, Any]:
-    """Pooled and subject-macro window discrimination for one arm."""
+    """Pooled and subject-macro window discrimination over the PRIMARY rows."""
     from cardiosentinel.neural.p1_experiment import p1_validation_evidence
 
     frozen = require_frozen_m1l_classification_threshold(threshold)
-    require_full_population_bundle(bundle, "window_evidence")
+    primary = require_primary_bundle(bundle, "window_evidence")
     payload = p1_validation_evidence(
-        bundle.labels, bundle.scores, bundle.subject_ids, frozen
+        primary.labels, primary.scores, primary.subject_ids, frozen
     )
     payload["evidence_class"] = "m2_window_evidence"
-    payload["arm"] = bundle.arm
+    payload["arm"] = primary.arm
     payload["threshold_source"] = "frozen_retained_m1l_classification_threshold"
     payload["threshold_selected_here"] = False
-    payload["population_identity"] = bundle.population_identity()
+    payload["population"] = POPULATION_PRIMARY
+    payload["population_identity"] = primary.population_identity()
+    return payload
+
+
+def background_false_positive_evidence(
+    bundle: M2PrimaryBundle,
+    *,
+    threshold: float = M1L_CLASSIFICATION_THRESHOLD,
+) -> dict[str, Any]:
+    """Background FPR and its subject distribution, over the PRIMARY rows.
+
+    The frozen M1 definition needs background-negative rows, which exist only
+    in the primary classification population. Running it over the full replay
+    timeline or the challenge selection would silently change its denominator.
+    """
+    from cardiosentinel.neural.m1_experiment import subject_false_positive_evidence
+
+    frozen = require_frozen_m1l_classification_threshold(threshold)
+    primary = require_primary_bundle(bundle, "background_false_positive_evidence")
+    payload = subject_false_positive_evidence(
+        primary.labels, primary.scores, primary.subject_ids, frozen
+    )
+    payload["arm"] = primary.arm
+    payload["population"] = POPULATION_PRIMARY
+    payload["population_identity"] = primary.population_identity()
+    payload["threshold_source"] = "frozen_retained_m1l_classification_threshold"
+    payload["threshold_selected_here"] = False
+    return payload
+
+
+def challenge_false_positive_evidence(
+    bundle: M2ChallengeBundle,
+    *,
+    threshold: float = M1L_CLASSIFICATION_THRESHOLD,
+) -> dict[str, Any]:
+    """Challenge FPR over the CHALLENGE rows, never over the primary rows.
+
+    Challenge-target precedence is preserved exactly as the frozen production
+    metric defines it: an ischemic-positive row is never removed merely because
+    a challenge context also applies to it. That precedence lives upstream in
+    the frozen selection, which is why this path consumes that selection rather
+    than re-deriving membership here.
+    """
+    from cardiosentinel.neural.p1_experiment import p1_challenge_evidence
+
+    frozen = require_frozen_m1l_classification_threshold(threshold)
+    challenge = require_challenge_bundle(bundle, "challenge_false_positive_evidence")
+    payload = p1_challenge_evidence(
+        challenge.target_families, challenge.scores, challenge.subject_ids, frozen
+    )
+    payload["evidence_class"] = "m2_challenge_evidence"
+    payload["arm"] = challenge.arm
+    payload["threshold_source"] = "frozen_retained_m1l_classification_threshold"
+    payload["threshold_selected_here"] = False
+    payload["conduction_change_evidence_status"] = CONDUCTION_EVIDENCE_STATUS
+    payload["ischemic_positive_rows_removed_for_challenge_context"] = False
+    payload["binary_labels_invented_for_challenge_rows"] = False
+    payload["population"] = POPULATION_CHALLENGE
+    payload["population_identity"] = challenge.population_identity()
     return payload
 
 
 def false_alarm_evidence(
-    bundle: M2EvaluationBundle,
     *,
+    primary_bundle: M2PrimaryBundle,
+    challenge_bundle: M2ChallengeBundle,
     threshold: float = M1L_CLASSIFICATION_THRESHOLD,
 ) -> dict[str, Any]:
-    """Background FPR, its subject distribution, and challenge FPRs.
+    """The one top-level false-alarm section, explicit about its TWO denominators.
 
-    Challenge-target precedence is preserved exactly as the frozen production
-    metric defines it: an ischemic-positive row is never removed merely because
-    a challenge context also applies to it.
+    Background/subject FPR comes from the PRIMARY metric population; challenge
+    FPR comes from the CHALLENGE metric population. Each subsection carries its
+    own validated population identity, so the result never implies that one
+    denominator served both.
     """
-    from cardiosentinel.neural.m1_experiment import subject_false_positive_evidence
-    from cardiosentinel.neural.p1_experiment import p1_challenge_evidence
-
     frozen = require_frozen_m1l_classification_threshold(threshold)
-    require_full_population_bundle(bundle, "false_alarm_evidence")
-    subject_fpr = subject_false_positive_evidence(
-        bundle.labels, bundle.scores, bundle.subject_ids, frozen
-    )
-    challenge = p1_challenge_evidence(
-        bundle.target_families, bundle.scores, bundle.subject_ids, frozen
-    )
+    background = background_false_positive_evidence(primary_bundle, threshold=frozen)
+    challenge = challenge_false_positive_evidence(challenge_bundle, threshold=frozen)
+    if background["population_identity"] == challenge["population_identity"]:
+        raise M2EvaluationError(
+            "The background and challenge false-alarm subsections report the "
+            "same population identity; they must be computed over the distinct "
+            "frozen primary and challenge populations."
+        )
     return {
         "evidence_class": "m2_false_alarm_evidence",
-        "arm": bundle.arm,
+        "arm": primary_bundle.arm,
         "threshold": frozen,
         "threshold_source": "frozen_retained_m1l_classification_threshold",
         "threshold_selected_here": False,
-        "background_false_positive": subject_fpr,
-        "challenge": challenge,
+        "background_and_subject_fpr": background,
+        "challenge_fpr": challenge,
         "conduction_change_evidence_status": CONDUCTION_EVIDENCE_STATUS,
         "ischemic_positive_rows_removed_for_challenge_context": False,
-        "population_identity": bundle.population_identity(),
+        "single_denominator_served_both": False,
+        "background_population_identity": background["population_identity"],
+        "challenge_population_identity": challenge["population_identity"],
     }
 
 
 def cold_start_stratified_evidence(
-    bundle: M2EvaluationBundle,
+    bundle: M2PrimaryBundle,
     *,
     threshold: float = M1L_CLASSIFICATION_THRESHOLD,
 ) -> dict[str, Any]:
-    """Frozen recording-age strata, with the inherited limitation preserved."""
+    """Frozen recording-age strata over the PRIMARY rows, matching frozen M1.
+
+    Headline cold-start evidence is never computed over the full replay
+    timeline: the frozen M1 route stratifies the primary validation metric rows.
+    """
     from cardiosentinel.baseline.metrics import binary_metrics
     from cardiosentinel.neural.patient_memory import COLD_START_BINS
 
     frozen = require_frozen_m1l_classification_threshold(threshold)
-    require_full_population_bundle(bundle, "cold_start_stratified_evidence")
-    labels = bundle.labels
-    scores = bundle.scores
-    bins = bundle.cold_start_bins
+    primary = require_primary_bundle(bundle, "cold_start_stratified_evidence")
+    labels = primary.labels
+    scores = primary.scores
+    bins = primary.cold_start_bins
 
     strata: dict[str, Any] = {}
     for name, _low, _high in COLD_START_BINS:
@@ -451,11 +777,12 @@ def cold_start_stratified_evidence(
         strata[name] = entry
     return {
         "evidence_class": "m2_cold_start_evidence",
-        "arm": bundle.arm,
+        "arm": primary.arm,
         "threshold": frozen,
         "threshold_source": "frozen_retained_m1l_classification_threshold",
         "threshold_selected_here": False,
         "post_hoc_early_threshold_defined": False,
+        "population": POPULATION_PRIMARY,
         "inherited_limitation": (
             "M1's zero sensitivity in the 0-5 minute bin at the frozen "
             "thresholds is inherited by every M2 arm and is not addressed by "
@@ -463,16 +790,38 @@ def cold_start_stratified_evidence(
             "conservative"
         ),
         "strata": strata,
-        "population_identity": bundle.population_identity(),
+        "population_identity": primary.population_identity(),
     }
 
 
-def policy_evidence(evidence: Sequence[M2RowEvidence]) -> dict[str, Any]:
-    """Update-admission and refusal accounting. Label-free by construction."""
-    summary = summarize_admission(evidence)
+def policy_evidence(
+    evidence: Sequence[M2RowEvidence], *, replay_population: Any | None = None
+) -> dict[str, Any]:
+    """Update-admission and refusal accounting. Label-free by construction.
+
+    Bound to the FULL REPLAY population, not to a metric denominator: update
+    admission happened over the entire causal timeline, including rows that
+    never enter the primary or challenge metrics.
+    """
+    # Accepts a bounded sequence of rows, or the streaming accumulator the
+    # canonical route folds each stream into. Both produce the identical
+    # payload; only the memory profile differs.
+    summary = (
+        evidence.summary()
+        if hasattr(evidence, "summary")
+        else summarize_admission(evidence)
+    )
     summary["evidence_class"] = "m2_policy_evidence"
     summary["memory_admission_threshold"] = NORMAL_EVIDENCE_THRESHOLD
     summary["classification_threshold_used_for_admission"] = False
+    summary["population"] = POPULATION_REPLAY
+    if replay_population is not None:
+        if getattr(replay_population, "source", None) != REPLAY_AUTHORITY:
+            raise M2EvaluationError(
+                "Policy evidence binds the verified FULL REPLAY authority; "
+                f"received source {getattr(replay_population, 'source', None)!r}."
+            )
+        summary["population_identity"] = replay_population.identity()
     return summary
 
 
@@ -505,6 +854,8 @@ def contamination_evidence(
     trajectories: dict[tuple[str, int], PrototypeTrajectory],
     *,
     stress_intervals: Sequence[M2StressInterval],
+    replay_population: Any | None = None,
+    stress_selection_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Prototype drift for annotation-defined intervals, per stream.
 
@@ -537,15 +888,28 @@ def contamination_evidence(
             else QUANTITATIVE_CHALLENGE_STATUS
         )
         results.append(entry)
-    return {
+    payload = {
         "evidence_class": "m2_prototype_contamination_evidence",
         "trajectory_produced_label_blind": True,
         "annotations_applied_after_replay": True,
         "intervals_bound_to_stream_identity": True,
         "recovery_threshold_defined": False,
         "follow_up_fabricated": False,
+        "population": POPULATION_STRESS,
+        "trajectory_population": POPULATION_REPLAY,
         "intervals": results,
     }
+    if replay_population is not None:
+        if getattr(replay_population, "source", None) != REPLAY_AUTHORITY:
+            raise M2EvaluationError(
+                "Prototype contamination binds the verified FULL REPLAY "
+                "authority for its trajectory; received source "
+                f"{getattr(replay_population, 'source', None)!r}."
+            )
+        payload["replay_population_identity"] = replay_population.identity()
+    if stress_selection_identity is not None:
+        payload["stress_interval_selection_identity"] = dict(stress_selection_identity)
+    return payload
 
 
 def arm_evaluation(arm: str, evidence: Sequence[M2RowEvidence]) -> dict[str, Any]:

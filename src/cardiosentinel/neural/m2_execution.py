@@ -73,6 +73,7 @@ from cardiosentinel.neural.runtime_sentinel import (
 
 FORBIDDEN_PARTITIONS: Final = ("test",)
 PARTITIONS_PERMITTED_HERE: Final = ("train",)
+CANONICAL_DEVELOPMENT_PARTITION: Final = "validation"
 
 SMOKE_ARTIFACT_CLASS: Final = "NON_CLAIM_BEARING_TRAIN_INTEGRATION_SMOKE"
 
@@ -105,6 +106,34 @@ def require_permitted_partition(partition: str) -> str:
             f"Partition {evaluated!r} is not permitted by this authorization; "
             f"only {PARTITIONS_PERMITTED_HERE} may be touched, and only for a "
             "bounded non-claim-bearing engineering smoke."
+        )
+    return evaluated
+
+
+def require_canonical_development_partition(partition: str) -> str:
+    """The canonical M2 DEVELOPMENT partition is hard-fixed to VALIDATION.
+
+    A separate firewall from `require_permitted_partition` on purpose: widening
+    that one to `("train", "validation")` would have let the bounded TRAIN
+    engineering smoke become claim-bearing development evidence. TRAIN stays
+    permitted there and is refused here; TEST is refused by both, before any
+    metadata, stream-cache, source-path, waveform or annotation access.
+
+    There is deliberately no argument that selects a different partition, so no
+    CLI flag can offer one.
+    """
+    evaluated = str(partition).strip().lower()
+    if evaluated in FORBIDDEN_PARTITIONS:
+        raise M2ExecutionError(
+            f"Canonical M2 development hard-rejects the {evaluated!r} partition "
+            "before any path resolution. The B4 sealed test remains unopened."
+        )
+    if evaluated != CANONICAL_DEVELOPMENT_PARTITION:
+        raise M2ExecutionError(
+            f"Canonical M2 DEVELOPMENT evidence is {CANONICAL_DEVELOPMENT_PARTITION!r} "
+            f"only; {evaluated!r} can never become a claim-bearing M2 "
+            "development result. The TRAIN path remains available solely for "
+            "the explicitly non-claim-bearing engineering smoke."
         )
     return evaluated
 
@@ -261,13 +290,21 @@ SELECTION_SCOPE_BOUNDED: Final = "bounded_subset"
 
 
 @dataclass(frozen=True, slots=True)
-class M2CanonicalPopulation:
-    """The AUTHORITY for what the full canonical evaluation population is.
+class M2ReplayPopulation:
+    """The AUTHORITY for the FULL CAUSAL REPLAY population -- and only that.
 
     Produced only by `M2InputBundle.canonical_input_population_identity()`,
     which proves the bundle is the complete frozen partition before returning
-    one. Evaluation accepts this token instead of a caller-supplied digest, so
-    the reference can never be authored by the very rows being evaluated.
+    one, so the reference can never be authored by the rows being evaluated.
+
+    This population carries causal memory evolution, the M2-0/M2-G update
+    policy, policy evidence and the prototype trajectory. It deliberately holds
+    every frozen timeline row -- including challenge, quality, boundary and
+    censored rows -- because dropping them would corrupt causal history.
+
+    It is NOT a metric denominator. The primary and challenge headline metrics
+    have their own frozen authorities in `m2_populations`, and this token must
+    never stand in for either.
     """
 
     partition: str
@@ -278,12 +315,19 @@ class M2CanonicalPopulation:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "population": "full_replay",
             "partition": self.partition,
             "row_count": self.row_count,
             "ordered_stable_id_sha256": self.ordered_stable_id_sha256,
             "stream_cache_sha256": self.stream_cache_sha256,
             "source": self.source,
+            "authority_detail": "verified full VALIDATION M1 stream cache",
+            "is_metric_denominator": False,
+            "causal_history_rows_dropped": False,
         }
+
+    def identity(self) -> dict[str, Any]:
+        return self.as_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,7 +384,7 @@ class M2InputBundle:
             "subject_identifiers_present": False,
         }
 
-    def canonical_input_population_identity(self) -> M2CanonicalPopulation:
+    def canonical_input_population_identity(self) -> M2ReplayPopulation:
         """Prove this bundle IS the full frozen partition, then vouch for it.
 
         Refuses a bounded/selected bundle, refuses a row count that disagrees
@@ -369,7 +413,7 @@ class M2InputBundle:
                 f"frozen manifest identity: observed {observed}, frozen "
                 f"{frozen}."
             )
-        return M2CanonicalPopulation(
+        return M2ReplayPopulation(
             partition=self.partition,
             row_count=expected_rows,
             ordered_stable_id_sha256=frozen,
@@ -526,23 +570,177 @@ def replay_arm(
     }
 
 
+def iter_timeline_streams(
+    partition: str,
+    *,
+    stream_cache_root: Path = DEFAULT_STREAM_CACHE_ROOT,
+    feature_root: Path = DEFAULT_FEATURE_ROOT,
+):
+    """Yield one `(record_id, channel_index)` stream of rows at a time.
+
+    The bounded-memory counterpart of `assemble_timeline_rows`. The stream cache
+    is memory-mapped and the COMBINED_V1 columns are read per stream, so the
+    process holds one stream's rows rather than the corpus: at validation scale
+    the whole-corpus row list is exactly the retention the M1 host-memory
+    incident forbade.
+
+    Yields `(stream_key, rows)`; the caller is expected to release `rows` before
+    requesting the next stream. Streams are yielded in sorted key order and each
+    stream's rows in strict `start_sample` chronology.
+    """
+    evaluated = require_canonical_development_partition(partition)
+    store, manifest = load_stream_store(Path(stream_cache_root), evaluated)
+    if manifest["partition"] != evaluated:
+        raise M2ExecutionError("The stream cache manifest partition disagrees.")
+    try:
+        record_column = np.asarray(store.array(RECORD_ID_FILE))
+        channel_column = np.asarray(store.array(CHANNEL_INDEX_FILE))
+        start_column = np.asarray(store.array(START_SAMPLE_FILE))
+        state_column = np.asarray(store.array(OBSERVATION_STATE_FILE))
+        representation = store.array(REPRESENTATION_FILE)
+
+        columns = join_sqi_and_morphology(store, manifest, Path(feature_root))
+        for name, values in columns.items():
+            if values.shape[0] != record_column.shape[0]:
+                raise M2ExecutionError(
+                    f"COMBINED_V1 column {name!r} is not row-aligned with the "
+                    "stream cache; this is a fatal integrity error."
+                )
+
+        for key in sorted(
+            {(str(r), int(c)) for r, c in zip(record_column, channel_column)}
+        ):
+            selected = np.flatnonzero(
+                (record_column == key[0]) & (channel_column == key[1])
+            )
+            selected = selected[np.argsort(start_column[selected], kind="stable")]
+            rows = [
+                M2TimelineRow(
+                    record_id=key[0],
+                    channel_index=key[1],
+                    start_sample=int(start_column[index]),
+                    observation_state=int(state_column[index]),
+                    representation=(
+                        np.asarray(representation[index], dtype=np.float64)
+                        if int(state_column[index]) == OBSERVATION_AVAILABLE
+                        else None
+                    ),
+                    finite_sample_fraction=float(
+                        columns["finite_sample_fraction"][index]
+                    ),
+                    sqi={
+                        name: float(columns[name][index])
+                        for name in GATE.G3_SQI_COLUMNS
+                    },
+                    morphology_valid=float(columns["morphology_valid"][index]),
+                )
+                for index in selected
+            ]
+            yield key, rows
+            del rows
+    finally:
+        store.close()
+
+
+def canonical_replay_population(
+    partition: str,
+    *,
+    stream_cache_root: Path = DEFAULT_STREAM_CACHE_ROOT,
+) -> tuple[M2ReplayPopulation, tuple[str, ...], dict[str, Any]]:
+    """The FULL REPLAY authority, proven from the frozen stream-cache manifest.
+
+    The streaming counterpart of
+    `M2InputBundle.canonical_input_population_identity()`: it proves the same
+    two things -- the row count equals the manifest's `full_stream_row_count`
+    and the ordered stable-ID digest equals the manifest's frozen
+    `ordered_stable_id_sha256` -- without materialising a single timeline row.
+
+    Returns the token, the ordered stable IDs (for the containment proof, and
+    released by the caller afterwards) and the manifest.
+    """
+    from cardiosentinel.neural.p1_experiment import ordered_stable_id_digest
+
+    evaluated = require_canonical_development_partition(partition)
+    store, manifest = load_stream_store(Path(stream_cache_root), evaluated)
+    try:
+        stable_ids = tuple(str(v) for v in np.asarray(store.array(STABLE_ID_FILE)))
+    finally:
+        store.close()
+
+    expected_rows = int(manifest["full_stream_row_count"])
+    if len(stable_ids) != expected_rows:
+        raise M2ExecutionError(
+            f"The {evaluated} stream cache holds {len(stable_ids)} rows, but the "
+            f"frozen manifest records {expected_rows}."
+        )
+    observed = ordered_stable_id_digest(stable_ids)
+    frozen = manifest["ordered_stable_id_sha256"]
+    if observed != frozen:
+        raise M2ExecutionError(
+            "The stream cache's ordered stable-ID digest does not match the "
+            f"frozen manifest identity: observed {observed}, frozen {frozen}."
+        )
+    population = M2ReplayPopulation(
+        partition=evaluated,
+        row_count=expected_rows,
+        ordered_stable_id_sha256=frozen,
+        stream_cache_sha256=manifest["stream_cache_sha256"],
+    )
+    return population, stable_ids, dict(manifest)
+
+
+def streaming_input_identity(manifest: dict[str, Any]) -> dict[str, Any]:
+    """The input identity for the bounded stream-by-stream canonical route.
+
+    Reports the same frozen upstream identities as `M2InputBundle.identity()`,
+    read from the manifest rather than from materialised rows, so the canonical
+    route never has to build a whole-corpus bundle just to describe itself.
+    """
+    return {
+        "partition": manifest["partition"],
+        "rows": int(manifest["full_stream_row_count"]),
+        "selection_scope": SELECTION_SCOPE_FULL,
+        "selected_row_count": int(manifest["full_stream_row_count"]),
+        "selected_ordered_stable_id_sha256": manifest["ordered_stable_id_sha256"],
+        "stream_cache_sha256": manifest["stream_cache_sha256"],
+        "ordered_chronology_sha256": manifest["ordered_chronology_sha256"],
+        "manifest_ordered_stable_id_sha256": manifest["ordered_stable_id_sha256"],
+        "split_sha256": manifest["split_sha256"],
+        "feature_corpus_sha256": manifest["feature_corpus_sha256"],
+        "representation_dim": manifest["representation_dim"],
+        "distance_standardizer_sha256": manifest["distance_standardizer_sha256"],
+        "labels_present": False,
+        "subject_identifiers_present": False,
+        "assembled": "stream_by_stream",
+    }
+
+
 def m2_execution_identity(
-    bundle: M2InputBundle,
+    source: M2InputBundle | dict[str, Any],
     scorer: FrozenM1LScorer,
     runtime: RuntimeIntegrityRecord,
+    *,
+    validation_accessed: bool = False,
 ) -> dict[str, Any]:
-    """Everything a future canonical run must bind about its execution path."""
+    """Everything a canonical run must bind about its execution path.
+
+    `source` is either a materialised `M2InputBundle` (bounded smoke) or the
+    streaming input identity produced by `streaming_input_identity()` (the
+    canonical route). `validation_accessed` is true exactly when this is a
+    canonical VALIDATION development run; TEST is false on every path.
+    """
+    identity = source.identity() if isinstance(source, M2InputBundle) else dict(source)
     return {
         "arms": list(M2_ARMS),
         "third_arm_present": False,
         "rollback": False,
-        "input_identity": bundle.identity(),
+        "input_identity": identity,
         "scorer_identity": scorer.identity(),
         "gate_identity": GATE.m2_gate_identity(),
         "label_firewall": assert_label_firewall(),
         "runtime_identity_checks": runtime.as_dict(),
-        "partition_accessed": bundle.partition,
-        "validation_accessed": False,
+        "partition_accessed": identity["partition"],
+        "validation_accessed": bool(validation_accessed),
         "test_accessed": False,
         "sealed_test_state": "unopened",
     }

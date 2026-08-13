@@ -46,7 +46,7 @@ from cardiosentinel.neural.integrity import canonical_sha256
 from cardiosentinel.neural.m2_execution import (
     FORBIDDEN_PARTITIONS,
     M2ExecutionError,
-    require_permitted_partition,
+    require_canonical_development_partition,
 )
 from cardiosentinel.neural.m2_policy import M2_ARMS
 from cardiosentinel.neural.m2_scorer import (
@@ -148,6 +148,19 @@ def require_frozen_runtime_record(runtime: RuntimeIntegrityRecord) -> None:
 # Canonical run lock -- the ONE provenance construction path
 # --------------------------------------------------------------------------
 
+POPULATION_IDENTITY_FIELDS: Final = (
+    "replay_population_identity",
+    "primary_evaluation_population_identity",
+    "challenge_evaluation_population_identity",
+    "stress_interval_selection_identity",
+)
+"""The four distinct populations a canonical arm result must bind separately.
+
+One `evaluated_population_identity` used to stand for all of them, which let
+the full causal replay population masquerade as a metric denominator. Each
+headline section now has to agree with its OWN population.
+"""
+
 REQUIRED_PROVENANCE_FIELDS: Final = (
     "experiment_id",
     "arm",
@@ -168,7 +181,7 @@ REQUIRED_PROVENANCE_FIELDS: Final = (
     "signal_v1_schema_sha256",
     "morphology_v1_schema_sha256",
     "combined_v1_schema_sha256",
-    "evaluated_population_identity",
+    *POPULATION_IDENTITY_FIELDS,
     "m1l_classification_threshold",
     "normal_evidence_threshold",
     "runtime_dependency_digest_start",
@@ -239,7 +252,7 @@ REQUIRED_RESULT_FIELDS: Final = (
     "memory_selected",
     "rollback",
     "partition_accessed",
-    "evaluated_population_identity",
+    *POPULATION_IDENTITY_FIELDS,
     "validation_accessed",
     "test_accessed",
     "sealed_test_state",
@@ -288,18 +301,24 @@ def validate_claim_bearing_arm_result_payload(
         "classifier_retrained",
         "memory_selection_performed",
         "rollback",
-        "validation_accessed",
         "test_accessed",
     ):
         if result[flag] is not False:
             raise M2PersistenceError(
                 f"A canonical M2 arm result must record {flag}=false."
             )
+    # VALIDATION *is* the M2 development evidence partition, so a canonical arm
+    # result records that it was read. TEST stays sealed and unopened.
+    if result["validation_accessed"] is not True:
+        raise M2PersistenceError(
+            "Canonical M2 development evidence is computed on VALIDATION and "
+            "must record validation_accessed=true."
+        )
     if result["memory_selected"] is not None:
         raise M2PersistenceError("A canonical M2 arm result selects no arm.")
     if result["sealed_test_state"] != "unopened":
         raise M2PersistenceError("The B4 sealed test must remain unopened.")
-    require_permitted_partition(result["partition_accessed"])
+    require_canonical_development_partition(result["partition_accessed"])
 
     for section in MANDATORY_RESULT_SECTIONS:
         payload = result[section]
@@ -314,24 +333,71 @@ def validate_claim_bearing_arm_result_payload(
                 f"Result section {section!r} must be a structured object."
             )
 
-    population = validate_evaluated_population_identity(
-        result["evaluated_population_identity"]
+    replay = validate_replay_population_identity(result["replay_population_identity"])
+    primary = validate_primary_population_identity(
+        result["primary_evaluation_population_identity"]
     )
+    challenge = validate_challenge_population_identity(
+        result["challenge_evaluation_population_identity"]
+    )
+    stress = validate_stress_selection_identity(
+        result["stress_interval_selection_identity"]
+    )
+    if primary == challenge or primary == replay or challenge == replay:
+        raise M2PersistenceError(
+            "The replay, primary and challenge populations must be distinct "
+            "identities; at least two are identical, which means one "
+            "denominator is masquerading as another."
+        )
 
-    # Every headline section that carries a population identity must agree with
-    # the arm result's. A disagreement means the metrics and the declared
-    # population describe different row sets, which is fatal.
-    for section in ("window_evidence", "false_alarm_evidence", "cold_start_evidence"):
-        embedded = result[section].get("population_identity")
-        if embedded is None:
-            continue
-        if embedded != population:
-            raise M2PersistenceError(
-                f"{section} declares a population identity that differs from "
-                "the arm result's evaluated population. The metrics and the "
-                "declared population must describe the same rows."
-            )
+    # Every headline section must agree with ITS OWN population. A disagreement
+    # means the metric and the declared denominator describe different rows.
+    _require_section_population(
+        result, "window_evidence", "population_identity", primary
+    )
+    _require_section_population(
+        result, "cold_start_evidence", "population_identity", primary
+    )
+    _require_section_population(
+        result, "false_alarm_evidence", "background_population_identity", primary
+    )
+    _require_section_population(
+        result, "false_alarm_evidence", "challenge_population_identity", challenge
+    )
+    _require_section_population(
+        result, "policy_evidence", "population_identity", replay
+    )
+    _require_section_population(
+        result, "contamination_evidence", "replay_population_identity", replay
+    )
+    _require_section_population(
+        result,
+        "contamination_evidence",
+        "stress_interval_selection_identity",
+        stress,
+    )
     return result
+
+
+def _require_section_population(
+    result: dict[str, Any],
+    section: str,
+    field: str,
+    expected: dict[str, Any],
+) -> None:
+    """A section's declared population must be exactly the result's own."""
+    embedded = result[section].get(field)
+    if embedded is None:
+        raise M2PersistenceError(
+            f"{section} does not declare {field}. Every headline section must "
+            "name the population it was computed over, so no section can "
+            "silently borrow another's denominator."
+        )
+    if embedded != expected:
+        raise M2PersistenceError(
+            f"{section}.{field} differs from the arm result's own identity. The "
+            "metric and its declared population must describe the same rows."
+        )
 
 
 def build_canonical_run_lock(
@@ -340,7 +406,7 @@ def build_canonical_run_lock(
     arm: str,
     execution_identity: dict[str, Any],
     runtime: RuntimeIntegrityRecord,
-    evaluated_population_identity: dict[str, Any] | None,
+    population_identities: dict[str, Any],
     started_at: str,
     completed_at: str,
     artifact_sha256: dict[str, str],
@@ -357,7 +423,7 @@ def build_canonical_run_lock(
     provenance = git_provenance(REPOSITORY_ROOT)
     inputs = execution_identity["input_identity"]
     scorer = execution_identity["scorer_identity"]
-    partition = require_permitted_partition(inputs["partition"])
+    partition = require_canonical_development_partition(inputs["partition"])
 
     lock: dict[str, Any] = {
         "lock_class": "m2_v1_canonical_arm_run_lock",
@@ -382,7 +448,10 @@ def build_canonical_run_lock(
         "signal_v1_schema_sha256": SIGNAL_V1.sha256,
         "morphology_v1_schema_sha256": MORPHOLOGY_V1.sha256,
         "combined_v1_schema_sha256": COMBINED_V1.sha256,
-        "evaluated_population_identity": evaluated_population_identity,
+        **{
+            field: population_identities.get(field)
+            for field in POPULATION_IDENTITY_FIELDS
+        },
         "m1l_classification_threshold": M1L_CLASSIFICATION_THRESHOLD,
         "normal_evidence_threshold": NORMAL_EVIDENCE_THRESHOLD,
         "classification_threshold_used_for_admission": False,
@@ -395,7 +464,7 @@ def build_canonical_run_lock(
         "runtime_dependency_digest_end": runtime.digest_at(EnforcementPoint.COMPLETION),
         "runtime_identity_checks": runtime.as_dict(),
         "partition_accessed": partition,
-        "validation_accessed": False,
+        "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
         "started_at": started_at,
@@ -426,10 +495,10 @@ def validate_canonical_run_lock(
     missing = [field for field in REQUIRED_PROVENANCE_FIELDS if field not in lock]
     if missing:
         raise M2PersistenceError(f"Canonical M2 lock is missing {missing}.")
-    # `memory_selected` is null by design; `evaluated_population_identity` is
+    # `memory_selected` is null by design; the four population identities are
     # governed by `requires_evaluation` below, so a run that produced no
     # label-joined evaluation is not forced to invent one.
-    _nullable = {"memory_selected", "evaluated_population_identity"}
+    _nullable = {"memory_selected", *POPULATION_IDENTITY_FIELDS}
     empty = [
         field
         for field in REQUIRED_PROVENANCE_FIELDS
@@ -468,10 +537,14 @@ def validate_canonical_run_lock(
             "The classification threshold must never gate memory admission."
         )
 
-    require_permitted_partition(lock["partition_accessed"])
-    for flag in ("validation_accessed", "test_accessed"):
-        if lock[flag] is not False:
-            raise M2PersistenceError(f"A canonical M2 lock must record {flag}=false.")
+    require_canonical_development_partition(lock["partition_accessed"])
+    if lock["validation_accessed"] is not True:
+        raise M2PersistenceError(
+            "Canonical M2 development evidence is computed on VALIDATION and "
+            "must record validation_accessed=true."
+        )
+    if lock["test_accessed"] is not False:
+        raise M2PersistenceError("A canonical M2 lock must record test_accessed=false.")
     if lock["sealed_test_state"] != "unopened":
         raise M2PersistenceError("The B4 sealed test must remain unopened.")
     for flag in ("automatic_retry_performed", "repeat_attempt_permitted", "rollback"):
@@ -498,7 +571,14 @@ def validate_canonical_run_lock(
         )
 
     if requires_evaluation:
-        validate_evaluated_population_identity(lock["evaluated_population_identity"])
+        validate_replay_population_identity(lock["replay_population_identity"])
+        validate_primary_population_identity(
+            lock["primary_evaluation_population_identity"]
+        )
+        validate_challenge_population_identity(
+            lock["challenge_evaluation_population_identity"]
+        )
+        validate_stress_selection_identity(lock["stress_interval_selection_identity"])
 
     artifacts = dict(lock["artifact_sha256"])
     if not artifacts:
@@ -514,45 +594,227 @@ def validate_canonical_run_lock(
     return lock
 
 
-def validate_evaluated_population_identity(
-    identity: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Require a real, verified, full-scope evaluated-population identity."""
-    from cardiosentinel.neural.m2_evaluation import POPULATION_SCOPE_FULL
-
-    if not identity:
+def _require_identity_payload(identity: Any, name: str) -> dict[str, Any]:
+    if not identity or not isinstance(identity, dict):
         raise M2PersistenceError(
-            "A claim-bearing M2 result containing label-joined evaluation must "
-            "bind evaluated_population_identity; None or {} is refused."
+            f"A claim-bearing M2 result must bind a real {name}; None, {{}} and "
+            "non-object values are refused."
         )
+    return dict(identity)
+
+
+def _require_evaluated_rows(identity: dict[str, Any], name: str) -> None:
     rows = identity.get("evaluated_rows")
     if not isinstance(rows, int) or rows <= 0:
         raise M2PersistenceError(
-            f"evaluated_rows must be a positive integer; received {rows!r}."
+            f"{name}.evaluated_rows must be a positive integer; received {rows!r}."
         )
     _require_sha256(
-        "evaluated_ordered_stable_id_sha256",
+        f"{name}.evaluated_ordered_stable_id_sha256",
         identity.get("evaluated_ordered_stable_id_sha256"),
     )
     if not identity.get("identity_key"):
-        raise M2PersistenceError("evaluated population identity names no identity key.")
+        raise M2PersistenceError(f"{name} names no identity key.")
     if identity.get("positional_join_used") is not False:
+        raise M2PersistenceError(f"{name} must record positional_join_used=false.")
+    if identity.get("matches_frozen_authority_exactly") is not True:
         raise M2PersistenceError(
-            "A claim-bearing evaluated population must record "
-            "positional_join_used=false."
+            f"{name} must be proven to be EXACTLY the frozen population; a "
+            "self-consistent subset is not a headline claim."
         )
-    if identity.get("population_scope") != POPULATION_SCOPE_FULL:
+
+
+def validate_replay_population_identity(
+    identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The FULL CAUSAL REPLAY population -- never a metric denominator."""
+    from cardiosentinel.neural.m2_populations import POPULATION_REPLAY, REPLAY_AUTHORITY
+
+    payload = _require_identity_payload(identity, "replay_population_identity")
+    if payload.get("population") != POPULATION_REPLAY:
         raise M2PersistenceError(
-            f"Headline claim-bearing evaluation requires "
-            f"{POPULATION_SCOPE_FULL!r}; received "
-            f"{identity.get('population_scope')!r}."
+            f"replay_population_identity must declare population "
+            f"{POPULATION_REPLAY!r}; received {payload.get('population')!r}."
         )
-    if identity.get("population_verified_against_canonical_replay") is not True:
+    if payload.get("source") != REPLAY_AUTHORITY:
         raise M2PersistenceError(
-            "A claim-bearing full population must be VERIFIED against the "
-            "canonical replay population digest, not merely self-consistent."
+            "The replay population must come from the verified full input "
+            f"bundle; received {payload.get('source')!r}."
         )
-    return dict(identity)
+    rows = payload.get("row_count")
+    if not isinstance(rows, int) or rows <= 0:
+        raise M2PersistenceError(
+            f"replay row_count must be a positive integer; received {rows!r}."
+        )
+    _require_sha256(
+        "replay ordered_stable_id_sha256", payload.get("ordered_stable_id_sha256")
+    )
+    _require_sha256("replay stream_cache_sha256", payload.get("stream_cache_sha256"))
+    if payload.get("causal_history_rows_dropped") is not False:
+        raise M2PersistenceError(
+            "The full replay population must retain every frozen timeline row; "
+            "dropping causal history invalidates the memory trajectory."
+        )
+    return payload
+
+
+def validate_primary_population_identity(
+    identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The PRIMARY classification denominator, frozen upstream by P1/M1."""
+    from cardiosentinel.neural.m2_populations import (
+        POPULATION_PRIMARY,
+        PRIMARY_AUTHORITY,
+        PRIMARY_VALIDATION_POPULATION,
+    )
+
+    payload = _require_identity_payload(
+        identity, "primary_evaluation_population_identity"
+    )
+    if payload.get("population") != POPULATION_PRIMARY:
+        raise M2PersistenceError(
+            f"primary_evaluation_population_identity must declare "
+            f"{POPULATION_PRIMARY!r}; received {payload.get('population')!r}."
+        )
+    if payload.get("authority") != PRIMARY_AUTHORITY:
+        raise M2PersistenceError(
+            "The primary metric population must come from the frozen P1 "
+            f"validation population; received {payload.get('authority')!r}."
+        )
+    if payload.get("counts") != dict(PRIMARY_VALIDATION_POPULATION):
+        raise M2PersistenceError(
+            f"The primary metric population {payload.get('counts')!r} differs "
+            f"from the frozen identity {dict(PRIMARY_VALIDATION_POPULATION)!r}."
+        )
+    if payload.get("membership_derived_from_m2_scores") is not False:
+        raise M2PersistenceError(
+            "Primary membership is fixed by P1/M1 upstream and may never be "
+            "derived from an M2 score."
+        )
+    if payload.get("binary_labels_present") is not True:
+        raise M2PersistenceError(
+            "The primary classification denominator requires binary labels."
+        )
+    _require_evaluated_rows(payload, "primary_evaluation_population_identity")
+    return payload
+
+
+def validate_challenge_population_identity(
+    identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The CHALLENGE population, from the frozen validation challenge selection."""
+    from cardiosentinel.neural.m2_populations import (
+        CHALLENGE_AUTHORITY,
+        POPULATION_CHALLENGE,
+    )
+    from cardiosentinel.neural.validation_challenge import (
+        CHALLENGE_EXPECTED_COUNTS,
+        CHALLENGE_SELECTION_SHA256,
+        CHALLENGE_TOTAL_WINDOWS,
+    )
+
+    payload = _require_identity_payload(
+        identity, "challenge_evaluation_population_identity"
+    )
+    if payload.get("population") != POPULATION_CHALLENGE:
+        raise M2PersistenceError(
+            f"challenge_evaluation_population_identity must declare "
+            f"{POPULATION_CHALLENGE!r}; received {payload.get('population')!r}."
+        )
+    if payload.get("authority") != CHALLENGE_AUTHORITY:
+        raise M2PersistenceError(
+            "The challenge metric population must come from the frozen "
+            f"validation challenge selection; received {payload.get('authority')!r}."
+        )
+    if payload.get("challenge_selection_sha256") != CHALLENGE_SELECTION_SHA256:
+        raise M2PersistenceError(
+            "The challenge population does not bind the frozen challenge "
+            "selection digest."
+        )
+    if payload.get("row_count") != CHALLENGE_TOTAL_WINDOWS:
+        raise M2PersistenceError(
+            f"The challenge population holds {payload.get('row_count')!r} "
+            f"windows; the frozen selection holds {CHALLENGE_TOTAL_WINDOWS}."
+        )
+    expected_counts = {k: dict(v) for k, v in CHALLENGE_EXPECTED_COUNTS.items()}
+    if payload.get("counts") != expected_counts:
+        raise M2PersistenceError(
+            "The challenge family counts differ from the frozen identity."
+        )
+    if payload.get("binary_labels_invented") is not False:
+        raise M2PersistenceError(
+            "No binary primary label may be invented for a challenge row."
+        )
+    _require_evaluated_rows(payload, "challenge_evaluation_population_identity")
+    return payload
+
+
+def validate_stress_selection_identity(
+    identity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The source-defined stress-interval selection and its frozen decision."""
+    from cardiosentinel.neural.m2_stress_intervals import (
+        DECISION_DOCUMENT,
+        DECISION_SHA256,
+        EXCLUDED_MARKER_FAMILIES,
+        SOURCE_DEFINED_FAMILIES,
+    )
+
+    payload = _require_identity_payload(identity, "stress_interval_selection_identity")
+    if payload.get("decision_document") != DECISION_DOCUMENT:
+        raise M2PersistenceError(
+            "The stress selection must bind the frozen eligibility decision "
+            f"{DECISION_DOCUMENT!r}."
+        )
+    if payload.get("decision_sha256") != DECISION_SHA256:
+        raise M2PersistenceError(
+            "The stress selection does not bind the frozen eligibility decision "
+            "digest; the implementation and the decision have drifted apart."
+        )
+    _require_sha256(
+        "stress_interval_selection_sha256",
+        payload.get("stress_interval_selection_sha256"),
+    )
+    if payload.get("source_defined_families") != list(SOURCE_DEFINED_FAMILIES):
+        raise M2PersistenceError(
+            "The stress selection admits families other than the frozen "
+            f"source-defined set {list(SOURCE_DEFINED_FAMILIES)}."
+        )
+    count = payload.get("eligible_interval_count")
+    if not isinstance(count, int) or count < 0:
+        raise M2PersistenceError(
+            f"eligible_interval_count must be a non-negative integer; received "
+            f"{count!r}."
+        )
+    excluded = payload.get("excluded_marker_families")
+    if not isinstance(excluded, dict) or set(excluded) != set(EXCLUDED_MARKER_FAMILIES):
+        raise M2PersistenceError(
+            "The stress selection must audit every excluded marker family "
+            f"{sorted(EXCLUDED_MARKER_FAMILIES)}."
+        )
+    for family, entry in excluded.items():
+        if entry.get("reason") != EXCLUDED_MARKER_FAMILIES[family]:
+            raise M2PersistenceError(
+                f"Excluded family {family} records a non-canonical reason."
+            )
+        if entry.get("drift_value_produced") is not False:
+            raise M2PersistenceError(
+                f"Excluded family {family} must produce no drift value; a zero "
+                "is a measurement, and no measurement was possible."
+            )
+    for flag in (
+        "marker_vicinity_reused_as_stress_duration",
+        "persistence_duration_invented",
+        "merge_gap_applied",
+        "selection_influenced_by_m2_outputs",
+    ):
+        if payload.get(flag) is not False:
+            raise M2PersistenceError(f"The stress selection must record {flag}=false.")
+    if payload.get("selection_performed_after_label_blind_replay") is not True:
+        raise M2PersistenceError(
+            "Stress intervals are selected only AFTER the label-blind replay."
+        )
+    return payload
 
 
 def validate_complete_runtime_identity(
@@ -607,7 +869,7 @@ def build_suite_result(
         "memory_selected": None,
         "automatic_arm_preference_applied": False,
         "human_review_required": True,
-        "validation_accessed": False,
+        "validation_accessed": True,
         "test_accessed": False,
         "sealed_test_state": "unopened",
         "rollback_evaluated": False,
@@ -725,11 +987,10 @@ def audit_forbidden_partitions(execution_identity: dict[str, Any]) -> None:
         raise M2ExecutionError(
             f"Forbidden partition {partition!r} reached the promotion gate."
         )
-    for flag in ("validation_accessed", "test_accessed"):
-        if execution_identity.get(flag) is not False:
-            raise M2PersistenceError(
-                f"A claim-bearing M2 artifact must record {flag}=false."
-            )
+    if execution_identity.get("test_accessed") is not False:
+        raise M2PersistenceError(
+            "A claim-bearing M2 artifact must record test_accessed=false."
+        )
     if execution_identity.get("sealed_test_state") != "unopened":
         raise M2PersistenceError("The B4 sealed test must remain unopened.")
 
@@ -783,9 +1044,9 @@ def finalize_and_promote_arm_result(
     # §5: the payload must be a complete canonical result in its own right.
     if requires_evaluation:
         validate_claim_bearing_arm_result_payload(result)
-        population = dict(result["evaluated_population_identity"])
-    else:
-        population = result.get("evaluated_population_identity")
+    # The RESULT owns its population identities; finalization extracts them
+    # rather than accepting free-standing arguments that could disagree.
+    populations = {field: result.get(field) for field in POPULATION_IDENTITY_FIELDS}
 
     staging = claimed.staging_dir
     staging.mkdir(parents=True, exist_ok=True)
@@ -866,15 +1127,17 @@ def finalize_and_promote_arm_result(
         arm=claimed.arm,
         execution_identity=execution_identity,
         runtime=runtime,
-        evaluated_population_identity=population,
+        population_identities=populations,
         started_at=claimed.started_at,
         completed_at=_now(),
         artifact_sha256={ARM_RESULT_NAME: artifact_digest},
     )
-    if requires_evaluation and lock["evaluated_population_identity"] != population:
-        raise M2PersistenceError(
-            "The lock's evaluated population identity differs from the result's."
-        )
+    if requires_evaluation:
+        for field in POPULATION_IDENTITY_FIELDS:
+            if lock[field] != populations[field]:
+                raise M2PersistenceError(
+                    f"The lock's {field} differs from the result's."
+                )
     validate_canonical_run_lock(lock, requires_evaluation=requires_evaluation)
     write_json_atomic(claimed.run_dir / EXPERIMENT_LOCK_NAME, lock)
     validate_canonical_run_lock(
