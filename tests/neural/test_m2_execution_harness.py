@@ -46,6 +46,13 @@ IN_FROZEN_SCIENTIFIC_RUNTIME = (
 )
 
 
+def _green_runtime() -> S.RuntimeIntegrityRecord:
+    """A record whose START check has already been taken and matched."""
+    record = S.RuntimeIntegrityRecord()
+    S.require_runtime_identity(S.EnforcementPoint.START, record=record, detail="test")
+    return record
+
+
 # --------------------------------------------------------------------------
 # 1-4. Frozen identities accepted; altered identities rejected
 # --------------------------------------------------------------------------
@@ -316,7 +323,9 @@ def test_simulated_mismatch_at_start_refuses_execution():
 
 
 def test_simulated_mismatch_before_persistence_refuses_promotion(tmp_path):
-    claimed = PS.claim_run_directory(tmp_path, "M2_sim_prepromotion", "M2-G")
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_sim_prepromotion", "M2-G", runtime=_green_runtime()
+    )
     record = S.RuntimeIntegrityRecord(expected_digest="1" * 64)
     check = S.observe_runtime_identity(
         S.EnforcementPoint.PRE_PROMOTION, expected_digest="1" * 64
@@ -364,14 +373,16 @@ def test_no_automatic_environment_repair_occurs():
 
 
 def test_partial_run_cannot_masquerade_as_complete(tmp_path):
-    claimed = PS.claim_run_directory(tmp_path, "M2_partial", "M2-G")
+    claimed = PS.claim_run_directory(
+        tmp_path, "M2_partial", "M2-G", runtime=_green_runtime()
+    )
     status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
     assert status["status"] == PS.STATUS_STARTED
     assert status["claim_bearing_result_promoted"] is False
     assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
     # The claim is never released, so a second attempt is refused.
     with pytest.raises(PS.M2PersistenceError, match="already claimed"):
-        PS.claim_run_directory(tmp_path, "M2_partial", "M2-G")
+        PS.claim_run_directory(tmp_path, "M2_partial", "M2-G", runtime=_green_runtime())
 
 
 def test_forbidden_partition_audit_blocks_promotion():
@@ -884,3 +895,320 @@ def test_no_scientific_m2_result_is_generated_by_this_module():
     assert payload["label_joined_sections_populated"] is False
     assert payload["validation_accessed"] is False
     assert payload["test_accessed"] is False
+
+
+# --------------------------------------------------------------------------
+# Human final persistence/governance review corrections:
+#   1) PRE_PROMOTION check at the arm claim-directory boundary
+#   2) COMPLETION observed BEFORE the canonical artifact is finalized
+#   3) the runtime block must be COMPLETE and GREEN, not merely present
+#   4) evaluated_population_identity is mandatory for claim-bearing evaluation
+#   5) headline metrics refuse a deliberately subsetted bundle
+# --------------------------------------------------------------------------
+
+
+def _execution_identity():
+    return {
+        "partition_accessed": "train",
+        "validation_accessed": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "scorer_identity": {
+            "retained_lock_sha256": SC.RETAINED_M1L_LOCK_SHA256,
+            "classification_threshold": SC.M1L_CLASSIFICATION_THRESHOLD,
+            "memory_admission_threshold": SC.NORMAL_EVIDENCE_THRESHOLD,
+            "classification_threshold_used_for_memory_admission": False,
+        },
+    }
+
+
+def _claim_bearing_result(arm="M2-G", population=None):
+    return {
+        "arm": arm,
+        "scientific_computation_completed": True,
+        "m2_protocol_sha256": G.M2_PROTOCOL_SHA256,
+        "m2_gate_receipt_sha256": G.M2_GATE_RECEIPT_SHA256,
+        "evaluated_population_identity": population,
+        "memory_selection_performed": False,
+        "memory_selected": None,
+        "rollback": False,
+    }
+
+
+# --- 1-3. claim directory sentinel boundary ------------------------------
+
+
+def test_claim_directory_requires_a_successful_start_record(tmp_path):
+    empty = S.RuntimeIntegrityRecord()
+    with pytest.raises(PS.M2PersistenceError, match="START runtime check"):
+        PS.claim_run_directory(tmp_path, "M2_no_start", "M2-G", runtime=empty)
+    assert not (tmp_path / "M2_no_start").exists()
+
+
+def test_claim_directory_performs_a_pre_promotion_check_before_creation(tmp_path):
+    runtime = _green_runtime()
+    PS.claim_run_directory(tmp_path, "M2_claim_check", "M2-G", runtime=runtime)
+    points = [check.enforcement_point for check in runtime.checks]
+    assert points == ["start", "pre_promotion"]
+    details = [check.detail for check in runtime.checks]
+    assert PS.CLAIM_DIRECTORY_PROMOTION_DETAIL in details
+
+
+def test_claim_time_runtime_mismatch_creates_no_canonical_directory(tmp_path):
+    """A mismatch at the claim boundary means the directory never exists."""
+    runtime = S.RuntimeIntegrityRecord(expected_digest="c" * 64)
+    # Force a matching START so only the claim-time check can fail.
+    runtime.record(
+        S.RuntimeCheck(
+            enforcement_point="start",
+            observed_digest="c" * 64,
+            expected_digest="c" * 64,
+            matches=True,
+            package_count=0,
+            observed_at="2026-01-01T00:00:00Z",
+        )
+    )
+    with pytest.raises(S.RuntimeIntegrityError):
+        PS.claim_run_directory(tmp_path, "M2_claim_mismatch", "M2-G", runtime=runtime)
+    assert not (tmp_path / "M2_claim_mismatch").exists()
+
+
+# --- 4-7. completion binding and runtime-block completeness ---------------
+
+
+def test_canonical_complete_result_cannot_carry_a_none_completion_digest():
+    runtime = _green_runtime()
+    runtime.record(
+        S.observe_runtime_identity(S.EnforcementPoint.PRE_PROMOTION, detail="x")
+    )
+    # No COMPLETION observation has been taken yet.
+    assert runtime.digest_at(S.EnforcementPoint.COMPLETION) is None
+    with pytest.raises(PS.M2PersistenceError, match="completion"):
+        PS.validate_complete_runtime_identity(runtime)
+
+
+def test_completion_mismatch_prevents_canonical_complete_promotion(tmp_path):
+    runtime = _green_runtime()
+    claimed = PS.claim_run_directory(tmp_path, "M2_end_bad", "M2-G", runtime=runtime)
+    # Point the record at an impossible digest so COMPLETION cannot match.
+    runtime.expected_digest = "d" * 64
+    with pytest.raises(S.RuntimeIntegrityError, match="COMPLETION"):
+        PS.finalize_and_promote_arm_result(
+            claimed,
+            result=_claim_bearing_result(),
+            execution_identity=_execution_identity(),
+            runtime=runtime,
+            requires_evaluation=False,
+        )
+    # Nothing canonical exists and the run is not COMPLETE.
+    assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
+    status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
+    assert status["status"] == PS.STATUS_FAILED
+    assert status["claim_bearing_result_promoted"] is False
+    failure = json.loads((claimed.run_dir / PS.RUNTIME_FAILURE_NAME).read_text())
+    assert failure["canonical_promotion_invalidated"] is True
+    assert failure["staged_result_retained_as_forensic_material"] is True
+    assert failure["claim_bearing"] is False
+    # Forensic evidence is retained, not deleted.
+    assert (claimed.staging_dir / PS.ARM_RESULT_NAME).exists()
+
+
+def test_all_three_enforcement_points_appear_in_the_finalized_block(tmp_path):
+    runtime = _green_runtime()
+    claimed = PS.claim_run_directory(tmp_path, "M2_full_block", "M2-G", runtime=runtime)
+    population = _paired_bundle().population_identity()
+    status = PS.finalize_and_promote_arm_result(
+        claimed,
+        result=_claim_bearing_result(population=population),
+        execution_identity=_execution_identity(),
+        runtime=runtime,
+        requires_evaluation=True,
+    )
+    assert status["status"] == PS.STATUS_COMPLETE
+    assert status["canonical"] is True
+
+    promoted = json.loads((claimed.run_dir / PS.ARM_RESULT_NAME).read_text())
+    block = promoted["runtime_identity_checks"]
+    points = {check["enforcement_point"] for check in block["checks"]}
+    assert points == {"start", "pre_promotion", "completion"}
+    assert block["all_observations_matched"] is True
+    assert promoted["runtime_dependency_digest_start"] == FROZEN_DIGEST
+    assert promoted["runtime_dependency_digest_pre_promotion"] == FROZEN_DIGEST
+    # The genuine, observed completion digest is inside the promoted artifact.
+    assert promoted["runtime_dependency_digest_end"] == FROZEN_DIGEST
+    # And the recorded hash is the hash of exactly those promoted bytes.
+    from cardiosentinel.data.provenance import sha256_file
+
+    assert status["artifact_sha256"][PS.ARM_RESULT_NAME] == sha256_file(
+        claimed.run_dir / PS.ARM_RESULT_NAME
+    )
+
+
+def test_all_observations_matched_is_required_for_canonical_evidence():
+    runtime = _green_runtime()
+    runtime.record(
+        S.RuntimeCheck(
+            enforcement_point="pre_promotion",
+            observed_digest="e" * 64,
+            expected_digest=FROZEN_DIGEST,
+            matches=False,
+            package_count=0,
+            observed_at="2026-01-01T00:00:00Z",
+        )
+    )
+    runtime.record(
+        S.observe_runtime_identity(S.EnforcementPoint.COMPLETION, detail="x")
+    )
+    with pytest.raises(PS.M2PersistenceError, match="every runtime observation"):
+        PS.validate_complete_runtime_identity(runtime)
+
+
+# --- 8-10. evaluated population identity ---------------------------------
+
+
+def test_none_population_identity_is_rejected_for_claim_bearing_evaluation():
+    for empty in (None, {}):
+        with pytest.raises(
+            PS.M2PersistenceError, match="evaluated_population_identity"
+        ):
+            PS.validate_evaluated_population_identity(empty)
+
+
+def test_malformed_population_identity_is_rejected():
+    valid = _paired_bundle().population_identity()
+    for mutation in (
+        {"evaluated_rows": 0},
+        {"evaluated_rows": -1},
+        {"evaluated_ordered_stable_id_sha256": "short"},
+        {"evaluated_ordered_stable_id_sha256": "z" * 64},
+        {"positional_join_used": True},
+        {"identity_key": ""},
+    ):
+        broken = {**valid, **mutation}
+        with pytest.raises(PS.M2PersistenceError):
+            PS.validate_evaluated_population_identity(broken)
+
+
+def test_valid_full_population_identity_is_accepted():
+    identity = _paired_bundle().population_identity()
+    validated = PS.validate_evaluated_population_identity(identity)
+    assert validated["evaluated_rows"] == 4
+    assert validated["positional_join_used"] is False
+    assert validated["population_scope"] == V.POPULATION_SCOPE_FULL
+
+
+def test_claim_bearing_result_requires_population_identity_when_evaluated(tmp_path):
+    runtime = _green_runtime()
+    claimed = PS.claim_run_directory(tmp_path, "M2_no_pop", "M2-G", runtime=runtime)
+    with pytest.raises(PS.M2PersistenceError, match="evaluated_population_identity"):
+        PS.finalize_and_promote_arm_result(
+            claimed,
+            result=_claim_bearing_result(population=None),
+            execution_identity=_execution_identity(),
+            runtime=runtime,
+            requires_evaluation=True,
+        )
+    assert not (claimed.run_dir / PS.ARM_RESULT_NAME).exists()
+
+
+# --- 11-14. headline metrics require full-population bundles --------------
+
+
+def _subset_bundle():
+    evidence = [_evidence(start_sample=0), _evidence(start_sample=1250)]
+    return V.build_evaluation_bundle(
+        "M2-G", evidence, [_annotation(start_sample=0)], require_full_population=False
+    )
+
+
+@pytest.mark.parametrize(
+    "function",
+    [V.window_evidence, V.false_alarm_evidence, V.cold_start_stratified_evidence],
+)
+def test_headline_metrics_refuse_a_subsetted_bundle(function):
+    subset = _subset_bundle()
+    assert subset.population_scope == V.POPULATION_SCOPE_SUPPORTING_SUBSET
+    assert subset.is_full_population is False
+    with pytest.raises(V.M2EvaluationError, match="full-population"):
+        function(subset)
+
+
+def test_full_population_bundles_continue_to_work():
+    bundle = _paired_bundle()
+    assert bundle.is_full_population is True
+    payload = V.cold_start_stratified_evidence(bundle)
+    assert payload["population_identity"]["population_scope"] == (
+        V.POPULATION_SCOPE_FULL
+    )
+
+
+# --- 15. stress evidence stays separate and stream-bound ------------------
+
+
+def test_stress_interval_evidence_remains_separate_from_population_scope():
+    """Interval selection is supporting evidence, not a headline population."""
+    trajectories = {("s00001", 0): _trajectory([0.0, 10.0, 20.0], [0.0, 0.0, 1.0])}
+    result = V.contamination_evidence(
+        trajectories,
+        stress_intervals=[V.M2StressInterval("s00001", 0, "ischemic", 5.0, 25.0)],
+    )
+    # It needs no evaluation bundle at all and imposes no population scope.
+    assert result["intervals_bound_to_stream_identity"] is True
+    assert "population_scope" not in result
+    assert result["intervals"][0]["record_id"] == "s00001"
+
+
+# --- 18-20. unchanged invariants ------------------------------------------
+
+
+def test_sentinel_digest_recipe_remains_unchanged():
+    from cardiosentinel.neural.provenance import dependency_environment
+
+    assert (
+        S.observe_runtime_identity(S.EnforcementPoint.START).observed_digest
+        == dependency_environment()["installed_packages_sha256"]
+    )
+    assert (
+        S.SENTINEL_DESIGN_SHA256
+        == "cd5c2e6d0b5dbc4ea35b319f98e9b9e678256c391491839d3f1745247eeb4075"
+    )
+
+
+def test_no_m1_scientific_file_changed_by_this_work():
+    """The M1 stack is untouched: its frozen documents still validate."""
+    from cardiosentinel.data.provenance import sha256_file
+
+    assert (
+        sha256_file(REPOSITORY_ROOT / "docs" / "M1_DUAL_MEMORY_PROTOCOL_V2.md")
+        == "31a81358870cd23c2258cf4f307ab8c4dc7bf245bc4bf18a4d1f48fe2aada39c"
+    )
+    assert (
+        sha256_file(REPOSITORY_ROOT / "docs" / "M1_MEMORY_RETENTION_DECISION_V1.md")
+        == "a3685fc0f8ff1fa0dce2bf9954bb28a925787070c021f3e80ca5716a4fa5f0ed"
+    )
+
+
+def test_no_canonical_m2_scientific_execution_occurs(tmp_path):
+    """The validator gates promotion; it computes no metric and selects no arm."""
+    import inspect
+
+    tree = ast.parse(inspect.getsource(PS.validate_claim_bearing_arm_result).lstrip())
+    called = {
+        getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+    }
+    for banned in (
+        "binary_metrics",
+        "p1_validation_evidence",
+        "p1_challenge_evidence",
+        "average_precision_score",
+        "roc_auc_score",
+        "argmax",
+    ):
+        assert banned not in called, banned
+    suite = PS.build_suite_result(
+        suite_id="S", arm_results={"M2-0": {"arm": "M2-0"}, "M2-G": {"arm": "M2-G"}}
+    )
+    assert suite["memory_selection_performed"] is False
+    assert suite["memory_selected"] is None

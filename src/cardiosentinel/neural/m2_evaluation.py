@@ -54,6 +54,15 @@ QUANTITATIVE_CHALLENGE_STATUS: Final = "quantitative_secondary"
 EvaluationKey = tuple[str, int, int]
 """`(record_id, channel_index, start_sample)` -- immutable frozen row identity."""
 
+POPULATION_SCOPE_FULL: Final = "full_population"
+POPULATION_SCOPE_SUPPORTING_SUBSET: Final = "supporting_subset"
+
+HEADLINE_EVIDENCE_FUNCTIONS: Final = (
+    "window_evidence",
+    "false_alarm_evidence",
+    "cold_start_stratified_evidence",
+)
+
 
 class M2EvaluationError(RuntimeError):
     """Raised when post-replay evaluation cannot proceed with integrity."""
@@ -145,6 +154,11 @@ class M2EvaluationBundle:
     keys: tuple[EvaluationKey, ...]
     evidence: tuple[M2RowEvidence, ...]
     annotations: tuple[M2AnnotationRow, ...]
+    population_scope: str = POPULATION_SCOPE_FULL
+
+    @property
+    def is_full_population(self) -> bool:
+        return self.population_scope == POPULATION_SCOPE_FULL
 
     @property
     def scores(self) -> np.ndarray:
@@ -188,6 +202,7 @@ class M2EvaluationBundle:
             "identity_key": "(record_id, channel_index, start_sample)",
             "identity_corresponds_to_frozen_stable_id": True,
             "positional_join_used": False,
+            "population_scope": self.population_scope,
         }
 
 
@@ -261,7 +276,31 @@ def build_evaluation_bundle(
         keys=keys,
         evidence=joined_evidence,
         annotations=tuple(annotation_index[key] for key in keys),
+        population_scope=(
+            POPULATION_SCOPE_FULL
+            if require_full_population
+            else POPULATION_SCOPE_SUPPORTING_SUBSET
+        ),
     )
+
+
+def require_full_population_bundle(bundle: M2EvaluationBundle, purpose: str) -> None:
+    """Headline claim-bearing metrics require full evidence/annotation cover.
+
+    A deliberately subsetted bundle is legitimate supporting evidence, but it
+    must never become the silent input to a headline window, false-alarm or
+    cold-start metric: that would report a claim over an arbitrarily narrowed
+    population. Challenge stratification still happens *inside* the frozen
+    metric functions, from the full joined population.
+    """
+    if not bundle.is_full_population:
+        raise M2EvaluationError(
+            f"{purpose} is a headline claim-bearing metric and requires a "
+            f"full-population evaluation bundle; received a "
+            f"{bundle.population_scope!r} bundle built with "
+            "require_full_population=False. Subsetted bundles remain available "
+            "for supporting evidence only."
+        )
 
 
 # --------------------------------------------------------------------------
@@ -278,6 +317,7 @@ def window_evidence(
     from cardiosentinel.neural.p1_experiment import p1_validation_evidence
 
     frozen = require_frozen_m1l_classification_threshold(threshold)
+    require_full_population_bundle(bundle, "window_evidence")
     payload = p1_validation_evidence(
         bundle.labels, bundle.scores, bundle.subject_ids, frozen
     )
@@ -304,6 +344,7 @@ def false_alarm_evidence(
     from cardiosentinel.neural.p1_experiment import p1_challenge_evidence
 
     frozen = require_frozen_m1l_classification_threshold(threshold)
+    require_full_population_bundle(bundle, "false_alarm_evidence")
     subject_fpr = subject_false_positive_evidence(
         bundle.labels, bundle.scores, bundle.subject_ids, frozen
     )
@@ -334,6 +375,7 @@ def cold_start_stratified_evidence(
     from cardiosentinel.neural.patient_memory import COLD_START_BINS
 
     frozen = require_frozen_m1l_classification_threshold(threshold)
+    require_full_population_bundle(bundle, "cold_start_stratified_evidence")
     labels = bundle.labels
     scores = bundle.scores
     bins = bundle.cold_start_bins
