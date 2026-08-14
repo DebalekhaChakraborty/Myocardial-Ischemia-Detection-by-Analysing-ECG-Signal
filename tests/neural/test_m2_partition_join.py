@@ -644,3 +644,26 @@ def test_a_real_on_disk_store_still_refuses_a_train_only_corpus(tmp_path):
             )
     finally:
         store.close()
+
+
+def test_the_duplicate_diagnostic_is_not_quadratic():
+    """§6/§10.10 -- a corrupted large record must fail promptly.
+
+    `[v for v in values if values.count(v) > 1]` is O(n^2); on a corrupted
+    record that turns a refusal into minutes of error formatting. Timed against
+    a size where the quadratic form would take many seconds.
+    """
+    import time
+
+    values = [f"ltstdb:v00001:0:{index}:2500" for index in range(60_000)]
+    values.append(values[0])
+    started = time.perf_counter()
+    duplicates = J._duplicates(values)
+    elapsed = time.perf_counter() - started
+    assert duplicates == [values[0]]
+    assert elapsed < 1.0, elapsed
+
+
+def test_the_duplicate_diagnostic_reports_every_repeat():
+    assert J._duplicates(["a", "b", "a", "c", "b"]) == ["a", "b"]
+    assert J._duplicates(["a", "b"]) == []

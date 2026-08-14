@@ -23,6 +23,7 @@ is never derived from a label, a score, a prediction or any observed result.
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Any, Final
 
@@ -94,6 +95,18 @@ def combined_record_cache_paths_for_partition(
     return paths
 
 
+def _duplicates(values: list[str]) -> list[str]:
+    """The repeated identities, in one pass.
+
+    `[v for v in values if values.count(v) > 1]` is quadratic, and this runs
+    only on the corrupted-record error path -- exactly where a large record
+    would make the run spend minutes formatting a message instead of failing
+    promptly.
+    """
+    counts = Counter(values)
+    return sorted(value for value, count in counts.items() if count > 1)
+
+
 def _require_exact_stable_id_correspondence(
     record_id: str,
     partition: str,
@@ -122,19 +135,18 @@ def _require_exact_stable_id_correspondence(
     npz_list = npz_ids.tolist()
     npz_set = set(npz_list)
     if len(npz_set) != len(npz_list):
-        duplicates = sorted({v for v in npz_list if npz_list.count(v) > 1})
         raise M2FeatureJoinError(
             f"COMBINED_V1 record {record_id} has duplicate stable IDs "
-            f"(beginning {duplicates[:3]}); the join would be ambiguous."
+            f"(beginning {_duplicates(npz_list)[:3]}); the join would be "
+            "ambiguous."
         )
     stream_list = stream_ids.tolist()
     stream_set = set(stream_list)
     if len(stream_set) != len(stream_list):
-        duplicates = sorted({v for v in stream_list if stream_list.count(v) > 1})
         raise M2FeatureJoinError(
             f"The {partition.upper()} stream cache has duplicate stable IDs for "
-            f"record {record_id} (beginning {duplicates[:3]}); the evaluated "
-            "population would be ambiguous."
+            f"record {record_id} (beginning {_duplicates(stream_list)[:3]}); the "
+            "evaluated population would be ambiguous."
         )
     missing = sorted(stream_set - npz_set)
     extra = sorted(npz_set - stream_set)

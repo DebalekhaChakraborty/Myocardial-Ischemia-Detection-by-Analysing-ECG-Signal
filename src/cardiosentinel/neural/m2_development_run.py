@@ -795,6 +795,11 @@ class _AttemptTracker:
     post_replay_evaluation_started: bool = False
     metrics_completed: dict[str, bool] = field(default_factory=dict)
     runtimes: dict[str, Any] = field(default_factory=dict)
+    # What the RUN believed it promoted. Kept as an observation only: the
+    # failure receipt re-reads the actual artifacts, because the finalizer
+    # permits a window where the arm result is promoted and verified but the
+    # lock promotion then fails -- a tracker set only on full success would
+    # report `false` for a file that demonstrably exists.
     arm_result_promoted: dict[str, bool] = field(default_factory=dict)
     experiment_lock_promoted: dict[str, bool] = field(default_factory=dict)
     suite_result_promoted: bool = False
@@ -855,9 +860,17 @@ class _AttemptTracker:
             validation_opened=self.validation_opened,
             exposure=self.exposure(),
             runtime_records=dict(self.runtimes),
+            # Passed as the tracker's OBSERVATION; the receipt's canonical
+            # promotion values come from the filesystem.
             promotion_state={
-                "arm_result_promoted": dict(self.arm_result_promoted),
-                "experiment_lock_promoted": dict(self.experiment_lock_promoted),
+                "arm_result_promoted": {
+                    arm: bool(self.arm_result_promoted.get(arm, False))
+                    for arm in CANONICAL_ARM_ORDER
+                },
+                "experiment_lock_promoted": {
+                    arm: bool(self.experiment_lock_promoted.get(arm, False))
+                    for arm in CANONICAL_ARM_ORDER
+                },
                 "suite_result_promoted": self.suite_result_promoted,
             },
             decision_sha256=RECOVERY_DECISION_SHA256,

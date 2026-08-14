@@ -1699,13 +1699,26 @@ def claim_run_directory(
 def record_failure(
     claimed: M2RunDirectory, reason: str, *, runtime_check: Any | None = None
 ) -> dict[str, Any]:
-    """Mark an attempt FAILED_OR_INTERRUPTED. The claim is never released."""
+    """Mark an attempt FAILED_OR_INTERRUPTED. The claim is never released.
+
+    `claim_bearing_result_promoted` is read from the ACTUAL artifact, not
+    assumed false. The finalizer deliberately permits a window where the arm
+    result has been promoted and verified but the experiment-lock promotion
+    check then fails: on that path the promoted result is preserved, and a
+    status file claiming nothing was promoted would misdescribe the filesystem.
+
+    A promoted result without a completed lock is preserved forensic evidence,
+    not canonical science -- hence `canonical=false` alongside it. The result is
+    never deleted.
+    """
     provenance = git_provenance(REPOSITORY_ROOT)
     payload = {
         "experiment_id": claimed.experiment_id,
         "arm": claimed.arm,
         "status": STATUS_FAILED,
-        "claim_bearing_result_promoted": False,
+        "claim_bearing_result_promoted": (claimed.run_dir / ARM_RESULT_NAME).is_file(),
+        "experiment_lock_promoted": (claimed.run_dir / EXPERIMENT_LOCK_NAME).is_file(),
+        "promotion_state_source": "filesystem",
         "canonical": False,
         "reason": reason,
         "started_at": claimed.started_at,
@@ -1849,7 +1862,10 @@ def record_attempt_failure(
         "staged_evidence_preserved": True,
         "human_review_required": True,
         "recovery_decision_sha256": decision_sha256,
-        "promotion_state": _per_arm_promotion_state(promotion_state),
+        "promotion_state": _reconcile_promotion_state(
+            observed_promotion_state(run_root, suite_id, claimed_arms),
+            promotion_state,
+        ),
     }
     receipt["runtime_identity_checks"] = {
         arm: record.as_dict() for arm, record in sorted((runtime_records or {}).items())
@@ -1867,6 +1883,9 @@ def record_attempt_failure(
         if status_path.is_file():
             started_at = read_json_result(status_path).get("started_at")
         promoted = receipt["promotion_state"]["arm_result_promoted"].get(arm, False)
+        lock_promoted = receipt["promotion_state"]["experiment_lock_promoted"].get(
+            arm, False
+        )
         write_json_atomic(
             status_path,
             {
@@ -1874,6 +1893,8 @@ def record_attempt_failure(
                 "arm": arm,
                 "status": STATUS_FAILED,
                 "claim_bearing_result_promoted": bool(promoted),
+                "experiment_lock_promoted": bool(lock_promoted),
+                "promotion_state_source": "filesystem",
                 "canonical": False,
                 "reason": f"{stage}: {type(exception).__name__}: {exception}",
                 "started_at": started_at or receipt["recorded_at"],
@@ -1886,27 +1907,83 @@ def record_attempt_failure(
     return receipt
 
 
-def _per_arm_promotion_state(state: dict[str, Any] | None) -> dict[str, Any]:
-    """Promotion accounting PER ARM, never one boolean for both.
+def observed_promotion_state(
+    run_root: Path, suite_id: str, claimed_arms: Sequence[str]
+) -> dict[str, Any]:
+    """Promotion state read from the ACTUAL immutable artifacts.
 
-    If M2-0 completes and M2-G fails, the receipt has to preserve exactly that:
-    a single `arm_result_promoted: true` would imply both arms promoted because
-    one did.
+    The filesystem is the forensic authority. The finalizer permits a window in
+    which an arm result is promoted and verified but the experiment-lock
+    promotion check then fails; a tracker that only records success after the
+    whole finalizer returns would report `false` for a file that demonstrably
+    exists.
     """
-    supplied = dict(state or {})
-    result = supplied.get("arm_result_promoted")
-    lock = supplied.get("experiment_lock_promoted")
-    if not isinstance(result, dict):
-        result = dict.fromkeys(M2_ARMS, bool(result))
-    if not isinstance(lock, dict):
-        lock = dict.fromkeys(M2_ARMS, bool(lock))
+    root = Path(run_root)
+    arms = {str(arm) for arm in claimed_arms}
+    results: dict[str, bool] = {}
+    locks: dict[str, bool] = {}
+    for arm in M2_ARMS:
+        run_dir = root / arm_experiment_id(suite_id, arm)
+        # An unclaimed arm has no directory, so nothing of its own is promoted.
+        results[arm] = arm in arms and (run_dir / ARM_RESULT_NAME).is_file()
+        locks[arm] = arm in arms and (run_dir / EXPERIMENT_LOCK_NAME).is_file()
+    suite = (suite_directory(root, suite_id) / SUITE_RESULT_NAME).is_file()
     return {
-        "arm_result_promoted": {arm: bool(result.get(arm, False)) for arm in M2_ARMS},
-        "experiment_lock_promoted": {
-            arm: bool(lock.get(arm, False)) for arm in M2_ARMS
-        },
-        "suite_result_promoted": bool(supplied.get("suite_result_promoted", False)),
+        "arm_result_promoted": results,
+        "experiment_lock_promoted": locks,
+        "suite_result_promoted": suite,
     }
+
+
+def _require_per_arm_map(value: Any, field: str) -> dict[str, bool]:
+    """Forensic promotion evidence is per arm; one boolean names no arm.
+
+    A scalar `true` cannot say WHICH arm promoted, so it is refused rather than
+    expanded to both -- silently turning one arm's success into two would be
+    exactly the misreport this accounting exists to prevent.
+    """
+    if not isinstance(value, dict):
+        raise M2PersistenceError(
+            f"{field} must be a per-arm map; received {value!r}. A scalar cannot "
+            "identify which arm promoted."
+        )
+    unknown = sorted(set(value) - set(M2_ARMS))
+    if unknown:
+        raise M2PersistenceError(f"{field} names unknown arms {unknown}.")
+    return {arm: bool(value.get(arm, False)) for arm in M2_ARMS}
+
+
+def _reconcile_promotion_state(
+    observed: dict[str, Any], tracker: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Filesystem truth, with the tracker's observation kept alongside it.
+
+    The tracker stays useful as a record of what the run believed, but it can
+    never contradict the artifacts: `observed_from_filesystem` is the canonical
+    forensic value and `coherent` says whether the two agreed.
+    """
+    payload: dict[str, Any] = {
+        "observed_from_filesystem": observed,
+        "authority": "filesystem",
+    }
+    if tracker is None:
+        payload["tracker_observation"] = None
+        payload["coherent"] = True
+    else:
+        normalised = {
+            "arm_result_promoted": _require_per_arm_map(
+                tracker.get("arm_result_promoted"), "arm_result_promoted"
+            ),
+            "experiment_lock_promoted": _require_per_arm_map(
+                tracker.get("experiment_lock_promoted"), "experiment_lock_promoted"
+            ),
+            "suite_result_promoted": bool(tracker.get("suite_result_promoted", False)),
+        }
+        payload["tracker_observation"] = normalised
+        payload["coherent"] = normalised == observed
+    # The canonical fields ARE the filesystem's.
+    payload.update(observed)
+    return payload
 
 
 def audit_forbidden_partitions(execution_identity: dict[str, Any]) -> None:

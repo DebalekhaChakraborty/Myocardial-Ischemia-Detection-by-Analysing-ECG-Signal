@@ -546,8 +546,78 @@ def test_attempt_one_style_optimism_is_not_hard_coded():
 # --------------------------------------------------------------------------
 
 
-def test_promotion_state_is_arm_specific(tmp_path):
-    """§13.11."""
+def _promote(run_root, arm, *, result=True, lock=False):
+    """Place the ACTUAL immutable artifacts a promotion would have left."""
+    run_dir = run_root / PS.arm_experiment_id(SUITE, arm)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if result:
+        (run_dir / PS.ARM_RESULT_NAME).write_text("{}")
+    if lock:
+        (run_dir / PS.EXPERIMENT_LOCK_NAME).write_text("{}")
+
+
+def test_promotion_state_is_read_from_the_actual_artifacts(tmp_path):
+    """§10.1 -- the filesystem is the forensic authority."""
+    run_root = tmp_path / "runs"
+    for arm in R.CANONICAL_ARM_ORDER:
+        _claim(run_root, arm)
+    _promote(run_root, "M2-0", result=True, lock=True)
+    _promote(run_root, "M2-G", result=True, lock=False)
+
+    receipt = PS.record_attempt_failure(
+        run_root,
+        SUITE,
+        exception=RuntimeError("lock promotion failed"),
+        stage="persist_and_promote_per_arm:M2-G",
+        claimed_arms=list(R.CANONICAL_ARM_ORDER),
+        validation_opened=True,
+    )
+    state = receipt["promotion_state"]
+    assert state["authority"] == "filesystem"
+    assert state["arm_result_promoted"] == {"M2-0": True, "M2-G": True}
+    assert state["experiment_lock_promoted"] == {"M2-0": True, "M2-G": False}
+    assert state["suite_result_promoted"] is False
+
+
+def test_the_tracker_cannot_overwrite_a_true_filesystem_promotion(tmp_path):
+    """§10.3 -- a stale tracker never contradicts an artifact that exists."""
+    run_root = tmp_path / "runs"
+    for arm in R.CANONICAL_ARM_ORDER:
+        _claim(run_root, arm)
+    _promote(run_root, "M2-0", result=True, lock=False)
+
+    receipt = PS.record_attempt_failure(
+        run_root,
+        SUITE,
+        exception=RuntimeError("boom"),
+        stage="persist_and_promote_per_arm:M2-0",
+        claimed_arms=list(R.CANONICAL_ARM_ORDER),
+        validation_opened=True,
+        # The tracker believed nothing was promoted -- the finalizer raised
+        # before it could record success.
+        promotion_state={
+            "arm_result_promoted": dict.fromkeys(R.CANONICAL_ARM_ORDER, False),
+            "experiment_lock_promoted": dict.fromkeys(R.CANONICAL_ARM_ORDER, False),
+            "suite_result_promoted": False,
+        },
+    )
+    state = receipt["promotion_state"]
+    assert state["arm_result_promoted"]["M2-0"] is True
+    assert state["tracker_observation"]["arm_result_promoted"]["M2-0"] is False
+    assert state["coherent"] is False
+    # And the arm's own status agrees with the filesystem.
+    status = json.loads(
+        (
+            run_root / PS.arm_experiment_id(SUITE, "M2-0") / PS.RUN_STATUS_NAME
+        ).read_text()
+    )
+    assert status["claim_bearing_result_promoted"] is True
+    assert status["experiment_lock_promoted"] is False
+    assert status["canonical"] is False
+
+
+def test_a_failure_before_any_promotion_stays_false(tmp_path):
+    """§10.4."""
     run_root = tmp_path / "runs"
     for arm in R.CANONICAL_ARM_ORDER:
         _claim(run_root, arm)
@@ -555,39 +625,37 @@ def test_promotion_state_is_arm_specific(tmp_path):
         run_root,
         SUITE,
         exception=RuntimeError("x"),
-        stage="persist_and_promote_per_arm:M2-G",
+        stage="full_label_blind_replay_both_arms",
         claimed_arms=list(R.CANONICAL_ARM_ORDER),
         validation_opened=True,
-        promotion_state={
-            "arm_result_promoted": {"M2-0": True, "M2-G": False},
-            "experiment_lock_promoted": {"M2-0": True, "M2-G": False},
-            "suite_result_promoted": False,
-        },
     )
     state = receipt["promotion_state"]
-    assert state["arm_result_promoted"] == {"M2-0": True, "M2-G": False}
-    assert state["experiment_lock_promoted"] == {"M2-0": True, "M2-G": False}
+    assert state["arm_result_promoted"] == dict.fromkeys(R.CANONICAL_ARM_ORDER, False)
+    assert state["experiment_lock_promoted"] == dict.fromkeys(
+        R.CANONICAL_ARM_ORDER, False
+    )
     assert state["suite_result_promoted"] is False
+    assert state["coherent"] is True
 
 
-def test_m2_0_promoted_and_m2_g_failed_is_represented_exactly(tmp_path):
-    """§13.12 -- one arm promoting never implies the other did."""
+def test_m2_0_complete_and_m2_g_partial_is_represented_per_arm(tmp_path):
+    """§10.5 -- one arm's completion never implies the other's."""
     run_root = tmp_path / "runs"
     for arm in R.CANONICAL_ARM_ORDER:
         _claim(run_root, arm)
+    _promote(run_root, "M2-0", result=True, lock=True)
+
     tracker = R._AttemptTracker(run_root=run_root, suite_id=SUITE)
     tracker.claimed_arms = list(R.CANONICAL_ARM_ORDER)
     tracker.arm_result_promoted["M2-0"] = True
     tracker.experiment_lock_promoted["M2-0"] = True
     tracker.stage = "persist_and_promote_per_arm:M2-G"
-
     receipt = tracker.record_failure(RuntimeError("M2-G failed"))
-    state = receipt["promotion_state"]
-    assert state["arm_result_promoted"]["M2-0"] is True
-    assert state["arm_result_promoted"]["M2-G"] is False
-    assert state["suite_result_promoted"] is False
 
-    # The per-arm status files agree.
+    state = receipt["promotion_state"]
+    assert state["arm_result_promoted"] == {"M2-0": True, "M2-G": False}
+    assert state["experiment_lock_promoted"] == {"M2-0": True, "M2-G": False}
+    assert state["coherent"] is True
     statuses = {
         arm: json.loads(
             (
@@ -603,23 +671,57 @@ def test_m2_0_promoted_and_m2_g_failed_is_represented_exactly(tmp_path):
         assert status["canonical"] is False
 
 
-def test_a_scalar_promotion_flag_is_normalised_per_arm(tmp_path):
-    """A single boolean must never silently mean 'both arms'."""
+def test_suite_promotion_state_comes_from_the_actual_suite_artifact(tmp_path):
+    """§10.6."""
     run_root = tmp_path / "runs"
-    _claim(run_root, "M2-0")
+    for arm in R.CANONICAL_ARM_ORDER:
+        _claim(run_root, arm)
+        _promote(run_root, arm, result=True, lock=True)
+    suite_dir = PS.suite_directory(run_root, SUITE)
+    suite_dir.mkdir(parents=True, exist_ok=True)
+    (suite_dir / PS.SUITE_RESULT_NAME).write_text("{}")
+
     receipt = PS.record_attempt_failure(
         run_root,
         SUITE,
-        exception=RuntimeError("x"),
+        exception=RuntimeError("bookkeeping after the suite landed"),
         stage="two_arm_suite_without_selection",
-        claimed_arms=["M2-0"],
+        claimed_arms=list(R.CANONICAL_ARM_ORDER),
         validation_opened=True,
-        promotion_state={"arm_result_promoted": False},
+        promotion_state={
+            "arm_result_promoted": dict.fromkeys(R.CANONICAL_ARM_ORDER, True),
+            "experiment_lock_promoted": dict.fromkeys(R.CANONICAL_ARM_ORDER, True),
+            "suite_result_promoted": False,
+        },
     )
-    assert receipt["promotion_state"]["arm_result_promoted"] == {
-        "M2-0": False,
-        "M2-G": False,
-    }
+    assert receipt["promotion_state"]["suite_result_promoted"] is True
+    assert receipt["promotion_state"]["coherent"] is False
+
+
+def test_a_scalar_promotion_flag_is_refused(tmp_path):
+    """§5/§10.7 -- one boolean cannot say WHICH arm promoted."""
+    run_root = tmp_path / "runs"
+    _claim(run_root, "M2-0")
+    with pytest.raises(PS.M2PersistenceError, match="cannot identify which arm"):
+        PS.record_attempt_failure(
+            run_root,
+            SUITE,
+            exception=RuntimeError("x"),
+            stage="two_arm_suite_without_selection",
+            claimed_arms=["M2-0"],
+            validation_opened=True,
+            promotion_state={"arm_result_promoted": True},
+        )
+    with pytest.raises(PS.M2PersistenceError, match="unknown arms"):
+        PS._require_per_arm_map({"M2-X": True}, "arm_result_promoted")
+
+
+def test_observed_promotion_state_ignores_unclaimed_arms(tmp_path):
+    run_root = tmp_path / "runs"
+    _claim(run_root, "M2-0")
+    _promote(run_root, "M2-0", result=True, lock=True)
+    state = PS.observed_promotion_state(run_root, SUITE, ["M2-0"])
+    assert state["arm_result_promoted"] == {"M2-0": True, "M2-G": False}
 
 
 def test_the_run_marks_metrics_and_promotion_per_arm():

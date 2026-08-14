@@ -1463,3 +1463,141 @@ def test_no_assertion_in_this_module_is_vacuous():
                 if isinstance(value, ast.Constant) and bool(value.value):
                     offenders.append(node.lineno)
     assert offenders == [], offenders
+
+
+# --------------------------------------------------------------------------
+# §4 -- the exact real failure window: result promoted, lock promotion fails
+# --------------------------------------------------------------------------
+
+
+def _minimal_execution_identity():
+    """Just enough execution identity for the lock builder."""
+    return {
+        "partition_accessed": "validation",
+        "validation_accessed": True,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "input_identity": {
+            "partition": "validation",
+            "distance_standardizer_sha256": "a" * 64,
+            "split_sha256": "a" * 64,
+            "feature_corpus_sha256": "a" * 64,
+            "ordered_chronology_sha256": "a" * 64,
+            "stream_cache_sha256": "a" * 64,
+        },
+        "scorer_identity": {
+            "retained_lock_sha256": SC.RETAINED_M1L_LOCK_SHA256,
+            "retained_checkpoint_sha256": SC.RETAINED_M1L_CHECKPOINT_SHA256,
+            "p1b_lock_sha256": SC.FROZEN_P1B_LOCK_SHA256,
+            "b4b_checkpoint_sha256": SC.FROZEN_B4B_CHECKPOINT_SHA256,
+        },
+    }
+
+
+def test_result_promoted_then_lock_promotion_fails(
+    tmp_path, frozen_runtime, synthetic_frozen_populations, monkeypatch
+):
+    """§4 -- the finalizer's own permitted window, against the REAL finalizer.
+
+    The result is atomically promoted and hash-verified, then the experiment
+    lock's PRE_PROMOTION observation fails. The promoted result is preserved as
+    forensic evidence, and every record must say exactly that.
+    """
+    run_root = _roots(tmp_path)["run_root"]
+    runtime = S.RuntimeIntegrityRecord()
+    runtime.record(_frozen_check(S.EnforcementPoint.START.value))
+    claimed = PS.claim_run_directory(
+        run_root, PS.arm_experiment_id(SUITE, "M2-0"), "M2-0", runtime=runtime
+    )
+
+    # Green until the LOCK's promotion observation, which fails.
+    def selective_observe(point, *, expected_digest=FROZEN_DIGEST, detail=None):
+        check = _frozen_check(point, detail or "test")
+        if detail == f"promote:{PS.EXPERIMENT_LOCK_NAME}":
+            return S.RuntimeCheck(
+                enforcement_point=check.enforcement_point,
+                observed_digest="9" * 64,
+                expected_digest=FROZEN_DIGEST,
+                matches=False,
+                package_count=1,
+                observed_at=check.observed_at,
+                detail=check.detail,
+            )
+        return check
+
+    monkeypatch.setattr(PS, "observe_runtime_identity", selective_observe)
+
+    with pytest.raises(S.RuntimeIntegrityError, match="experiment-lock promotion"):
+        # `requires_evaluation=False` skips the full result-payload contract
+        # (proved elsewhere) while exercising the exact promotion sequence
+        # under test: promote the result, verify its bytes, then fail the
+        # lock's own PRE_PROMOTION observation.
+        PS.finalize_and_promote_arm_result(
+            claimed,
+            result={"arm": "M2-0"},
+            execution_identity=_minimal_execution_identity(),
+            runtime=runtime,
+            requires_evaluation=False,
+        )
+    monkeypatch.undo()
+
+    # 2/3 -- the result exists, the lock does not.
+    assert (claimed.run_dir / PS.ARM_RESULT_NAME).is_file()
+    assert not (claimed.run_dir / PS.EXPERIMENT_LOCK_NAME).exists()
+
+    # 4/5/6 -- the arm status describes the filesystem, and is not canonical.
+    status = json.loads((claimed.run_dir / PS.RUN_STATUS_NAME).read_text())
+    assert status["status"] == PS.STATUS_FAILED
+    assert status["claim_bearing_result_promoted"] is True
+    assert status["experiment_lock_promoted"] is False
+    assert status["canonical"] is False
+    assert status["automatic_retry_performed"] is False
+    assert status["repeat_attempt_permitted"] is False
+
+    # 7 -- the outer attempt receipt reports the true per-arm state, even
+    # though the tracker never saw the promotion succeed.
+    tracker = R._AttemptTracker(run_root=run_root, suite_id=SUITE)
+    tracker.claimed_arms = ["M2-0"]
+    tracker.stage = "persist_and_promote_per_arm:M2-0"
+    receipt = tracker.record_failure(RuntimeError("lock promotion failed"))
+    state = receipt["promotion_state"]
+    assert state["arm_result_promoted"]["M2-0"] is True
+    assert state["experiment_lock_promoted"]["M2-0"] is False
+    assert state["tracker_observation"]["arm_result_promoted"]["M2-0"] is False
+    assert state["coherent"] is False
+
+    # 8/9/10 -- nothing retried, the result preserved, no suite.
+    assert receipt["automatic_retry_performed"] is False
+    assert receipt["automatic_cleanup_performed"] is False
+    assert (claimed.run_dir / PS.ARM_RESULT_NAME).is_file()
+    assert not (PS.suite_directory(run_root, SUITE) / PS.SUITE_RESULT_NAME).exists()
+    assert state["suite_result_promoted"] is False
+
+
+def test_a_promoted_but_unlocked_result_is_never_canonical(
+    tmp_path, frozen_runtime, synthetic_frozen_populations, monkeypatch
+):
+    """§10.8 -- preserved forensic evidence, not canonical science."""
+    run_root = _roots(tmp_path)["run_root"]
+    arm_dir = run_root / PS.arm_experiment_id(SUITE, "M2-0")
+    arm_dir.mkdir(parents=True)
+    (arm_dir / PS.ARM_RESULT_NAME).write_text("{}")
+    (arm_dir / PS.RUN_STATUS_NAME).write_text(json.dumps({"status": "STARTED"}))
+
+    receipt = PS.record_attempt_failure(
+        run_root,
+        SUITE,
+        exception=RuntimeError("lock failed"),
+        stage="persist_and_promote_per_arm:M2-0",
+        claimed_arms=["M2-0"],
+        validation_opened=True,
+    )
+    assert receipt["canonical"] is False
+    assert receipt["claim_bearing"] is False
+    assert receipt["promotion_state"]["arm_result_promoted"]["M2-0"] is True
+    assert receipt["promotion_state"]["experiment_lock_promoted"]["M2-0"] is False
+    # The result is still there; nothing deleted it.
+    assert (arm_dir / PS.ARM_RESULT_NAME).is_file()
+    # And history does not call the suite complete.
+    history = R.canonical_execution_history(run_root, SUITE)
+    assert history["recovery_attempt"]["state"] == R.STATE_FAILED
