@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
@@ -80,6 +81,9 @@ RUNTIME_FAILURE_NAME: Final = "M2_RUNTIME_INTEGRITY_FAILURE.json"
 STAGING_PREFIX: Final = ".staging-"
 
 CLAIM_DIRECTORY_PROMOTION_DETAIL: Final = "arm_claim_directory"
+
+ATTEMPT_FAILURE_RECEIPT_NAME: Final = "M2_ATTEMPT_FAILURE_RECEIPT.json"
+FAILURE_REVIEW_SUFFIX: Final = "__failure_review"
 
 _SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
@@ -148,6 +152,221 @@ def require_frozen_runtime_record(runtime: RuntimeIntegrityRecord) -> None:
 # Canonical run lock -- the ONE provenance construction path
 # --------------------------------------------------------------------------
 
+RECOVERY_LINEAGE_FIELDS: Final = (
+    "recovery_decision_sha256",
+    "recovery_from_suite_id",
+    "recovery_suite_id",
+    "recovery_reason_class",
+    "prior_attempt_scoring_started",
+    "prior_attempt_metrics_computed",
+    "prior_attempt_test_accessed",
+)
+
+
+def validate_original_attempt1_failure_lineage(run_root: Path) -> dict[str, Any]:
+    """Prove attempt #1 from its ARTIFACTS, not from a directory existing.
+
+    A claim directory shows that something was claimed. It does not show that
+    THIS attempt failed, that it failed before any row was scored, that no
+    metric was produced, or that the sealed test stayed shut. Every one of those
+    is a scientific claim, so each is verified against the frozen preserved
+    evidence before a recovery may be authorized.
+
+    Nothing here writes, repairs or normalises anything: if an original artifact
+    is absent or mutated, the recovery stops for human review.
+    """
+    from cardiosentinel.neural.m2_development_run import (
+        ORIGINAL_EXCEPTION_SUBSTRING,
+        ORIGINAL_EXCEPTION_TYPE,
+        ORIGINAL_EXECUTION_GIT_SHA,
+        ORIGINAL_FAILED_STAGE,
+        ORIGINAL_FAILURE_RECEIPT_FILE_SHA256,
+        ORIGINAL_FAILURE_RECEIPT_SHA256,
+        ORIGINAL_STATUS_SHA256,
+        ORIGINAL_SUITE_ID,
+        RECOVERY_DECISION_SHA256,
+    )
+
+    root = Path(run_root)
+
+    def refuse(detail: str) -> None:
+        raise M2PersistenceError(
+            f"The frozen attempt #1 forensic lineage could not be proven: "
+            f"{detail} STOP FOR HUMAN REVIEW. The recovery is not authorized, "
+            "and no original artifact is repaired, replaced or inferred."
+        )
+
+    # 1-3. Both original arm directories and status files, at their frozen bytes.
+    for arm in M2_ARMS:
+        run_dir = root / arm_experiment_id(ORIGINAL_SUITE_ID, arm)
+        if not run_dir.is_dir():
+            refuse(f"the original {arm} claim directory {run_dir} is absent.")
+        status_path = run_dir / RUN_STATUS_NAME
+        if not status_path.is_file():
+            refuse(f"the original {arm} {RUN_STATUS_NAME} is absent.")
+        observed = sha256_file(status_path)
+        if observed != ORIGINAL_STATUS_SHA256[arm]:
+            refuse(
+                f"the original {arm} {RUN_STATUS_NAME} digests to {observed}, not "
+                f"the frozen {ORIGINAL_STATUS_SHA256[arm]}."
+            )
+
+        # 4-5. No original arm ever produced claim-bearing science.
+        for name in (ARM_RESULT_NAME, EXPERIMENT_LOCK_NAME):
+            if (run_dir / name).exists():
+                refuse(
+                    f"the original {arm} directory contains {name}; attempt #1 is "
+                    "recorded as having promoted nothing."
+                )
+
+    # 6. Nor did the original suite.
+    original_suite = suite_directory(root, ORIGINAL_SUITE_ID) / SUITE_RESULT_NAME
+    if original_suite.exists():
+        refuse(
+            f"the original suite contains {SUITE_RESULT_NAME}; attempt #1 is "
+            "recorded as never having completed."
+        )
+
+    # 7-9. The additive receipt, at its frozen file digest and self-digest.
+    receipt_path = (
+        failure_review_directory(root, ORIGINAL_SUITE_ID) / ATTEMPT_FAILURE_RECEIPT_NAME
+    )
+    if not receipt_path.is_file():
+        refuse(f"the additive failure receipt {receipt_path} is absent.")
+    file_digest = sha256_file(receipt_path)
+    if file_digest != ORIGINAL_FAILURE_RECEIPT_FILE_SHA256:
+        refuse(
+            f"the failure receipt file digests to {file_digest}, not the frozen "
+            f"{ORIGINAL_FAILURE_RECEIPT_FILE_SHA256}."
+        )
+    receipt = read_json_result(receipt_path)
+    body = {k: v for k, v in receipt.items() if k != "receipt_sha256"}
+    recomputed = canonical_sha256(body)
+    if receipt.get("receipt_sha256") != recomputed:
+        refuse("the failure receipt's own canonical digest does not validate.")
+    if receipt["receipt_sha256"] != ORIGINAL_FAILURE_RECEIPT_SHA256:
+        refuse(
+            f"the failure receipt digest is {receipt['receipt_sha256']}, not the "
+            f"frozen {ORIGINAL_FAILURE_RECEIPT_SHA256}."
+        )
+
+    # 10-11. It describes the original suite, and claims no canonical standing.
+    if receipt.get("suite_id") != ORIGINAL_SUITE_ID:
+        refuse(
+            f"the failure receipt names suite {receipt.get('suite_id')!r}, not "
+            f"{ORIGINAL_SUITE_ID!r}."
+        )
+    for flag, expected in (("claim_bearing", False), ("canonical", False)):
+        if receipt.get(flag) is not expected:
+            refuse(f"the failure receipt records {flag}={receipt.get(flag)!r}.")
+    if receipt.get("execution_git_sha") != ORIGINAL_EXECUTION_GIT_SHA:
+        refuse(
+            f"the failure receipt names execution SHA "
+            f"{receipt.get('execution_git_sha')!r}, not "
+            f"{ORIGINAL_EXECUTION_GIT_SHA!r}."
+        )
+
+    # 12-13. The exact frozen pre-scoring failure, not some other failure.
+    if receipt.get("failed_stage") != ORIGINAL_FAILED_STAGE:
+        refuse(
+            f"the failure receipt records stage {receipt.get('failed_stage')!r}, "
+            f"not the frozen {ORIGINAL_FAILED_STAGE!r}."
+        )
+    if receipt.get("exception_type") != ORIGINAL_EXCEPTION_TYPE:
+        refuse(
+            f"the failure receipt records exception "
+            f"{receipt.get('exception_type')!r}, not the frozen "
+            f"{ORIGINAL_EXCEPTION_TYPE!r}."
+        )
+    if ORIGINAL_EXCEPTION_SUBSTRING not in str(receipt.get("exception_message", "")):
+        refuse(
+            "the failure receipt's exception message is not the frozen "
+            "partition-alignment defect."
+        )
+
+    # 14-18. The exposure the recovery lineage will assert downstream.
+    for flag, expected in (
+        ("validation_opened", True),
+        ("scoring_started", False),
+        ("metrics_computed", False),
+        ("test_accessed", False),
+    ):
+        if receipt.get(flag) is not expected:
+            refuse(
+                f"the failure receipt records {flag}={receipt.get(flag)!r}, not "
+                f"the frozen {expected!r}."
+            )
+    if receipt.get("sealed_test_state") != "unopened":
+        refuse("the failure receipt does not record the sealed test as unopened.")
+
+    # 19. It binds the preserved status hashes it claims to describe.
+    preserved = receipt.get("preserved_status_sha256") or {}
+    if preserved != dict(ORIGINAL_STATUS_SHA256):
+        refuse(
+            "the failure receipt does not bind the frozen preserved status "
+            f"digests; it binds {preserved!r}."
+        )
+
+    # 20. And the recovery decision that authorised exactly one recovery.
+    if receipt.get("recovery_decision_sha256") != RECOVERY_DECISION_SHA256:
+        refuse("the failure receipt does not bind the frozen recovery decision digest.")
+
+    return {
+        "lineage_class": "m2_attempt1_verified_failure_lineage",
+        "original_suite_id": ORIGINAL_SUITE_ID,
+        "original_execution_git_sha": ORIGINAL_EXECUTION_GIT_SHA,
+        "original_status_sha256": dict(ORIGINAL_STATUS_SHA256),
+        "failure_receipt_sha256": ORIGINAL_FAILURE_RECEIPT_SHA256,
+        "failure_receipt_file_sha256": ORIGINAL_FAILURE_RECEIPT_FILE_SHA256,
+        "recovery_decision_sha256": RECOVERY_DECISION_SHA256,
+        "failed_stage": ORIGINAL_FAILED_STAGE,
+        "validation_opened": True,
+        "scoring_started": False,
+        "metrics_computed": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "promoted_any_claim_bearing_artifact": False,
+        "verified_from_artifacts": True,
+    }
+
+
+def validate_recovery_lineage(payload: dict[str, Any]) -> dict[str, Any]:
+    """Every recovery artifact must state what attempt #1 was, by value.
+
+    The recovery never conceals the consumed first attempt: it names it, names
+    why it failed, and states that no row was scored, no metric computed and no
+    TEST opened before it did.
+    """
+    from cardiosentinel.neural.m2_development_run import (
+        CANONICAL_SUITE_ID,
+        ORIGINAL_SUITE_ID,
+        RECOVERY_DECISION_SHA256,
+        RECOVERY_REASON_CLASS,
+    )
+
+    missing = [field for field in RECOVERY_LINEAGE_FIELDS if field not in payload]
+    if missing:
+        raise M2PersistenceError(
+            f"A recovery artifact must bind its lineage; missing {missing}."
+        )
+    expectations = {
+        "recovery_decision_sha256": RECOVERY_DECISION_SHA256,
+        "recovery_from_suite_id": ORIGINAL_SUITE_ID,
+        "recovery_suite_id": CANONICAL_SUITE_ID,
+        "recovery_reason_class": RECOVERY_REASON_CLASS,
+        "prior_attempt_scoring_started": False,
+        "prior_attempt_metrics_computed": False,
+        "prior_attempt_test_accessed": False,
+    }
+    for field, expected in expectations.items():
+        if payload[field] != expected:
+            raise M2PersistenceError(
+                f"Recovery lineage {field} is {payload[field]!r}, expected "
+                f"{expected!r}."
+            )
+    return {field: payload[field] for field in RECOVERY_LINEAGE_FIELDS}
+
+
 POPULATION_IDENTITY_FIELDS: Final = (
     "replay_population_identity",
     "primary_evaluation_population_identity",
@@ -183,6 +402,7 @@ REQUIRED_PROVENANCE_FIELDS: Final = (
     "combined_v1_schema_sha256",
     *POPULATION_IDENTITY_FIELDS,
     "development_source_identity",
+    *RECOVERY_LINEAGE_FIELDS,
     "m1l_classification_threshold",
     "normal_evidence_threshold",
     "runtime_dependency_digest_start",
@@ -255,6 +475,7 @@ REQUIRED_RESULT_FIELDS: Final = (
     "partition_accessed",
     *POPULATION_IDENTITY_FIELDS,
     "development_source_identity",
+    *RECOVERY_LINEAGE_FIELDS,
     "validation_accessed",
     "test_accessed",
     "sealed_test_state",
@@ -382,6 +603,7 @@ def validate_claim_bearing_arm_result_payload(
     # The raw `.stb` provenance must be ONE identity, not several that happen
     # to look alike: the arm result and the stress selection it authorised must
     # name the same verified source.
+    validate_recovery_lineage(result)
     source = validate_development_source_identity(result["development_source_identity"])
     if stress.get("development_source_identity") != source:
         raise M2PersistenceError(
@@ -421,6 +643,7 @@ def build_canonical_run_lock(
     runtime: RuntimeIntegrityRecord,
     population_identities: dict[str, Any],
     development_source_identity: dict[str, Any] | None,
+    recovery_lineage: dict[str, Any] | None,
     started_at: str,
     completed_at: str,
     artifact_sha256: dict[str, str],
@@ -470,6 +693,7 @@ def build_canonical_run_lock(
         # raw .stb the stress intervals came from is provenance for the whole
         # arm, not a detail of one evidence section.
         "development_source_identity": development_source_identity,
+        **dict(recovery_lineage or {}),
         "m1l_classification_threshold": M1L_CLASSIFICATION_THRESHOLD,
         "normal_evidence_threshold": NORMAL_EVIDENCE_THRESHOLD,
         "classification_threshold_used_for_admission": False,
@@ -520,6 +744,7 @@ def validate_canonical_run_lock(
         "memory_selected",
         "development_source_identity",
         *POPULATION_IDENTITY_FIELDS,
+        *RECOVERY_LINEAGE_FIELDS,
     }
     empty = [
         field
@@ -602,6 +827,7 @@ def validate_canonical_run_lock(
         )
         validate_stress_selection_identity(lock["stress_interval_selection_identity"])
         validate_development_source_identity(lock["development_source_identity"])
+        validate_recovery_lineage(lock)
 
     artifacts = dict(lock["artifact_sha256"])
     if not artifacts:
@@ -931,6 +1157,7 @@ def build_suite_body(
     arm_lock_sha256: dict[str, str],
     population_identities: dict[str, Any],
     development_source_identity: dict[str, Any] | None,
+    recovery_lineage: dict[str, Any] | None,
     git_sha: str | None,
 ) -> dict[str, Any]:
     """The suite aggregation WITHOUT its self-digest.
@@ -956,6 +1183,7 @@ def build_suite_body(
         "arm_experiment_lock_sha256": dict(arm_lock_sha256),
         "git_sha": git_sha,
         "development_source_identity": development_source_identity,
+        **dict(recovery_lineage or {}),
         "memory_selection_performed": False,
         "memory_selected": None,
         "automatic_arm_preference_applied": False,
@@ -978,6 +1206,7 @@ def build_suite_result(
     arm_lock_sha256: dict[str, str] | None = None,
     population_identities: dict[str, Any] | None = None,
     development_source_identity: dict[str, Any] | None = None,
+    recovery_lineage: dict[str, Any] | None = None,
     git_sha: str | None = None,
     runtime_identity_checks: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -994,6 +1223,7 @@ def build_suite_result(
         arm_lock_sha256=dict(arm_lock_sha256 or {}),
         population_identities=dict(population_identities or {}),
         development_source_identity=development_source_identity,
+        recovery_lineage=recovery_lineage,
         git_sha=git_sha,
     )
     payload["runtime_identity_checks"] = runtime_identity_checks
@@ -1111,6 +1341,7 @@ def validate_suite_result(
     source_identity = validate_development_source_identity(
         suite.get("development_source_identity")
     )
+    validate_recovery_lineage(suite)
     _validate_suite_runtime_block(suite)
 
     results = suite.get("arm_results") or {}
@@ -1184,7 +1415,7 @@ def _verify_suite_against_arm_artifacts(
                 f"suite binds {suite['git_sha']!r}. Both arms and the suite are "
                 "one execution."
             )
-        for field in POPULATION_IDENTITY_FIELDS:
+        for field in (*POPULATION_IDENTITY_FIELDS, *RECOVERY_LINEAGE_FIELDS):
             if lock.get(field) != suite.get(field):
                 raise M2PersistenceError(
                     f"Arm {arm} lock's {field} differs from the suite's."
@@ -1468,13 +1699,26 @@ def claim_run_directory(
 def record_failure(
     claimed: M2RunDirectory, reason: str, *, runtime_check: Any | None = None
 ) -> dict[str, Any]:
-    """Mark an attempt FAILED_OR_INTERRUPTED. The claim is never released."""
+    """Mark an attempt FAILED_OR_INTERRUPTED. The claim is never released.
+
+    `claim_bearing_result_promoted` is read from the ACTUAL artifact, not
+    assumed false. The finalizer deliberately permits a window where the arm
+    result has been promoted and verified but the experiment-lock promotion
+    check then fails: on that path the promoted result is preserved, and a
+    status file claiming nothing was promoted would misdescribe the filesystem.
+
+    A promoted result without a completed lock is preserved forensic evidence,
+    not canonical science -- hence `canonical=false` alongside it. The result is
+    never deleted.
+    """
     provenance = git_provenance(REPOSITORY_ROOT)
     payload = {
         "experiment_id": claimed.experiment_id,
         "arm": claimed.arm,
         "status": STATUS_FAILED,
-        "claim_bearing_result_promoted": False,
+        "claim_bearing_result_promoted": (claimed.run_dir / ARM_RESULT_NAME).is_file(),
+        "experiment_lock_promoted": (claimed.run_dir / EXPERIMENT_LOCK_NAME).is_file(),
+        "promotion_state_source": "filesystem",
         "canonical": False,
         "reason": reason,
         "started_at": claimed.started_at,
@@ -1494,6 +1738,251 @@ def record_failure(
                 experiment_id=claimed.experiment_id,
             ),
         )
+    return payload
+
+
+def failure_review_directory(run_root: Path, suite_id: str) -> Path:
+    """Where a suite's ADDITIVE forensic receipt lives.
+
+    Outside every immutable arm directory on purpose: the original claim files
+    are historical evidence and are never rewritten to make a failed state look
+    cleaner.
+    """
+    return Path(run_root) / f"{suite_id}{FAILURE_REVIEW_SUFFIX}"
+
+
+def write_forensic_failure_receipt(
+    run_root: Path, suite_id: str, receipt: dict[str, Any]
+) -> dict[str, Any]:
+    """Write ONE additive non-claim-bearing receipt outside the arm directories.
+
+    The original `M2_RUN_STATUS.json` files are historical evidence. They are
+    never rewritten by this function -- a failed attempt is classified beside
+    the claim, not by editing it.
+    """
+    payload = dict(receipt)
+    payload["receipt_sha256"] = canonical_sha256(payload)
+    directory = failure_review_directory(run_root, suite_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(directory / ATTEMPT_FAILURE_RECEIPT_NAME, payload)
+    return payload
+
+
+def preserved_status_digests(run_root: Path, suite_id: str) -> dict[str, str]:
+    """SHA-256 of each preserved claim status file, for forensic binding."""
+    digests: dict[str, str] = {}
+    for arm in M2_ARMS:
+        path = Path(run_root) / arm_experiment_id(suite_id, arm) / RUN_STATUS_NAME
+        if path.is_file():
+            digests[arm] = sha256_file(path)
+    return digests
+
+
+INDETERMINATE: Final = "indeterminate"
+"""Recorded when an abrupt failure leaves a fact genuinely unknowable.
+
+Preferred over a confident `false`: after an uncaught exception, claiming that
+scoring never started -- when it may well have -- would understate scientific
+exposure in exactly the direction that flatters the run.
+"""
+
+
+def record_attempt_failure(
+    run_root: Path,
+    suite_id: str,
+    *,
+    exception: BaseException,
+    stage: str,
+    claimed_arms: Sequence[str],
+    validation_opened: bool,
+    exposure: dict[str, Any] | None = None,
+    runtime_records: dict[str, RuntimeIntegrityRecord] | None = None,
+    promotion_state: dict[str, Any] | None = None,
+    decision_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Deterministic NON-CLAIM-BEARING accounting for a failed attempt.
+
+    M2 development attempt #1 ended with both `M2_RUN_STATUS.json` files still
+    reading STARTED, because the exception escaped outside a promotion gate and
+    nothing recorded it. Once any arm claim exists, an uncaught canonical-run
+    exception must leave deterministic evidence instead.
+
+    **The exposure it records is the REAL execution state**, supplied by the
+    caller's tracker. Attempt #1's `scoring_started=false` /
+    `metrics_computed=false` are a frozen determination about THAT attempt and
+    belong only to its lineage; a future failure after the scorer has been
+    invoked must never claim scoring never started. Where a fact cannot be
+    proven after an abrupt exception it is recorded as `indeterminate` rather
+    than as a confident `false`.
+
+    This deletes nothing, cleans nothing, retries nothing and renames nothing.
+    Staged and evidence files are preserved exactly as the failure left them,
+    and a partially failed attempt is never made to look COMPLETE.
+    """
+    provenance = git_provenance(REPOSITORY_ROOT)
+    observed = dict(exposure or {})
+    arms = sorted(str(arm) for arm in claimed_arms)
+    receipt: dict[str, Any] = {
+        "artifact_class": "m2_attempt_failure_receipt",
+        "claim_bearing": False,
+        "scientific_evidence": False,
+        "canonical": False,
+        "suite_id": suite_id,
+        "failed_stage": stage,
+        "exception_type": type(exception).__name__,
+        "exception_message": str(exception),
+        "claimed_arms": arms,
+        "any_arm_claimed": bool(arms),
+        # --- real scientific exposure, not a hard-coded optimism ------------
+        "validation_opened": bool(validation_opened),
+        "scoring_started": observed.get("scoring_started", INDETERMINATE),
+        "replay_completed": observed.get("replay_completed", INDETERMINATE),
+        "post_replay_evaluation_started": observed.get(
+            "post_replay_evaluation_started", INDETERMINATE
+        ),
+        "metrics_computed_or_completed": observed.get(
+            "metrics_computed_or_completed", INDETERMINATE
+        ),
+        "metrics_completed_per_arm": dict(
+            observed.get("metrics_completed_per_arm", {})
+        ),
+        "exposure_source": "runtime execution tracker",
+        # --- governance --------------------------------------------------
+        "memory_selection_performed": False,
+        "memory_selected": None,
+        "rollback": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "git_sha": provenance["git_sha"],
+        "git_dirty": provenance["git_dirty"],
+        "recorded_at": _now(),
+        "automatic_retry_performed": False,
+        "automatic_cleanup_performed": False,
+        "alternate_suite_id_used": False,
+        "staged_evidence_preserved": True,
+        "human_review_required": True,
+        "recovery_decision_sha256": decision_sha256,
+        "promotion_state": _reconcile_promotion_state(
+            observed_promotion_state(run_root, suite_id, claimed_arms),
+            promotion_state,
+        ),
+    }
+    receipt["runtime_identity_checks"] = {
+        arm: record.as_dict() for arm, record in sorted((runtime_records or {}).items())
+    }
+    receipt["preserved_status_sha256"] = preserved_status_digests(run_root, suite_id)
+    receipt = write_forensic_failure_receipt(run_root, suite_id, receipt)
+
+    # The established FAILED_OR_INTERRUPTED mechanism, applied to each claim
+    for arm in claimed_arms:
+        run_dir = Path(run_root) / arm_experiment_id(suite_id, arm)
+        if not run_dir.is_dir():
+            continue
+        status_path = run_dir / RUN_STATUS_NAME
+        started_at = None
+        if status_path.is_file():
+            started_at = read_json_result(status_path).get("started_at")
+        promoted = receipt["promotion_state"]["arm_result_promoted"].get(arm, False)
+        lock_promoted = receipt["promotion_state"]["experiment_lock_promoted"].get(
+            arm, False
+        )
+        write_json_atomic(
+            status_path,
+            {
+                "experiment_id": arm_experiment_id(suite_id, arm),
+                "arm": arm,
+                "status": STATUS_FAILED,
+                "claim_bearing_result_promoted": bool(promoted),
+                "experiment_lock_promoted": bool(lock_promoted),
+                "promotion_state_source": "filesystem",
+                "canonical": False,
+                "reason": f"{stage}: {type(exception).__name__}: {exception}",
+                "started_at": started_at or receipt["recorded_at"],
+                "updated_at": receipt["recorded_at"],
+                "human_review_required": True,
+                "repeat_attempt_permitted": False,
+                "automatic_retry_performed": False,
+            },
+        )
+    return receipt
+
+
+def observed_promotion_state(
+    run_root: Path, suite_id: str, claimed_arms: Sequence[str]
+) -> dict[str, Any]:
+    """Promotion state read from the ACTUAL immutable artifacts.
+
+    The filesystem is the forensic authority. The finalizer permits a window in
+    which an arm result is promoted and verified but the experiment-lock
+    promotion check then fails; a tracker that only records success after the
+    whole finalizer returns would report `false` for a file that demonstrably
+    exists.
+    """
+    root = Path(run_root)
+    arms = {str(arm) for arm in claimed_arms}
+    results: dict[str, bool] = {}
+    locks: dict[str, bool] = {}
+    for arm in M2_ARMS:
+        run_dir = root / arm_experiment_id(suite_id, arm)
+        # An unclaimed arm has no directory, so nothing of its own is promoted.
+        results[arm] = arm in arms and (run_dir / ARM_RESULT_NAME).is_file()
+        locks[arm] = arm in arms and (run_dir / EXPERIMENT_LOCK_NAME).is_file()
+    suite = (suite_directory(root, suite_id) / SUITE_RESULT_NAME).is_file()
+    return {
+        "arm_result_promoted": results,
+        "experiment_lock_promoted": locks,
+        "suite_result_promoted": suite,
+    }
+
+
+def _require_per_arm_map(value: Any, field: str) -> dict[str, bool]:
+    """Forensic promotion evidence is per arm; one boolean names no arm.
+
+    A scalar `true` cannot say WHICH arm promoted, so it is refused rather than
+    expanded to both -- silently turning one arm's success into two would be
+    exactly the misreport this accounting exists to prevent.
+    """
+    if not isinstance(value, dict):
+        raise M2PersistenceError(
+            f"{field} must be a per-arm map; received {value!r}. A scalar cannot "
+            "identify which arm promoted."
+        )
+    unknown = sorted(set(value) - set(M2_ARMS))
+    if unknown:
+        raise M2PersistenceError(f"{field} names unknown arms {unknown}.")
+    return {arm: bool(value.get(arm, False)) for arm in M2_ARMS}
+
+
+def _reconcile_promotion_state(
+    observed: dict[str, Any], tracker: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Filesystem truth, with the tracker's observation kept alongside it.
+
+    The tracker stays useful as a record of what the run believed, but it can
+    never contradict the artifacts: `observed_from_filesystem` is the canonical
+    forensic value and `coherent` says whether the two agreed.
+    """
+    payload: dict[str, Any] = {
+        "observed_from_filesystem": observed,
+        "authority": "filesystem",
+    }
+    if tracker is None:
+        payload["tracker_observation"] = None
+        payload["coherent"] = True
+    else:
+        normalised = {
+            "arm_result_promoted": _require_per_arm_map(
+                tracker.get("arm_result_promoted"), "arm_result_promoted"
+            ),
+            "experiment_lock_promoted": _require_per_arm_map(
+                tracker.get("experiment_lock_promoted"), "experiment_lock_promoted"
+            ),
+            "suite_result_promoted": bool(tracker.get("suite_result_promoted", False)),
+        }
+        payload["tracker_observation"] = normalised
+        payload["coherent"] = normalised == observed
+    # The canonical fields ARE the filesystem's.
+    payload.update(observed)
     return payload
 
 
@@ -1647,6 +2136,9 @@ def finalize_and_promote_arm_result(
         runtime=runtime,
         population_identities=populations,
         development_source_identity=source_identity,
+        recovery_lineage={
+            field: result.get(field) for field in RECOVERY_LINEAGE_FIELDS
+        },
         started_at=claimed.started_at,
         completed_at=_now(),
         artifact_sha256={ARM_RESULT_NAME: artifact_digest},
@@ -1661,6 +2153,11 @@ def finalize_and_promote_arm_result(
             raise M2PersistenceError(
                 "The lock's development_source_identity differs from the result's."
             )
+        for field in RECOVERY_LINEAGE_FIELDS:
+            if lock[field] != result.get(field):
+                raise M2PersistenceError(
+                    f"The lock's {field} differs from the result's."
+                )
     validate_canonical_run_lock(lock, requires_evaluation=requires_evaluation)
     write_json_atomic(claimed.run_dir / EXPERIMENT_LOCK_NAME, lock)
     validate_canonical_run_lock(

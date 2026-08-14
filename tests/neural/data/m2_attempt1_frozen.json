@@ -1,0 +1,79 @@
+{
+  "receipt": {
+    "alternate_suite_id_used": false,
+    "annotations_loaded": false,
+    "any_arm_claimed": true,
+    "arm_comparison_performed": false,
+    "artifact_class": "m2_attempt_failure_receipt",
+    "attempt_classification": "CONSUMED_FAILED_INFRASTRUCTURE_ATTEMPT",
+    "automatic_cleanup_performed": false,
+    "automatic_retry_performed": false,
+    "canonical": false,
+    "claim_bearing": false,
+    "claimed_arms": [
+      "M2-0",
+      "M2-G"
+    ],
+    "exception_message": "The COMBINED_V1 feature corpus's TRAIN record set does not match the M1 stream cache's record list.",
+    "exception_type": "M2GateDerivationError",
+    "execution_git_sha": "3c1ba4ce87ade6a2d17386b3a9d2b579ded442e7",
+    "failed_at": "2026-08-13T22:00:09Z",
+    "failed_stage": "full_label_blind_replay_both_arms",
+    "git_dirty": true,
+    "git_sha": "3c1ba4ce87ade6a2d17386b3a9d2b579ded442e7",
+    "human_review_required": true,
+    "memory_selected": null,
+    "memory_selection_performed": false,
+    "metrics_computed": false,
+    "original_claim_files_modified": false,
+    "preserved_status_sha256": {
+      "M2-0": "3699e656ee5ab6c6d3fba90dd7dd726cbb06233d478e53b81327f394e9f6365d",
+      "M2-G": "7908130758cfffa171fe47f3958ee4ef7961bfe3d352486e1f2558862251a751"
+    },
+    "promotion_state": {
+      "arm_result_promoted": false,
+      "experiment_lock_promoted": false,
+      "suite_result_promoted": false
+    },
+    "prototype_updated": false,
+    "receipt_sha256": "31345512e42578c1bac8ad611689501a49c40e5d7ab2d70f6c41508d9c4492eb",
+    "recorded_at": "2026-08-13T22:00:09Z",
+    "recovery_decision_document": "docs/M2_DEVELOPMENT_ATTEMPT1_FAILURE_AND_RECOVERY_DECISION_V1.md",
+    "recovery_decision_sha256": "e9d55d7a047e9610c6e156afc9e1a98aafbca86a3131c02a8e56624da7ad57d6",
+    "recovery_reason_class": "pre_scoring_partition_alignment_execution_defect",
+    "recovery_suite_id": "m2-v1-development-two-arm-recovery1",
+    "rollback": false,
+    "scientific_evidence": false,
+    "scoring_started": false,
+    "sealed_test_state": "unopened",
+    "staged_evidence_preserved": true,
+    "started_at": "2026-08-13T21:58:44Z",
+    "suite_id": "m2-v1-development-two-arm",
+    "test_accessed": false,
+    "validation_access_scope": [
+      "development source/feature integrity verification",
+      "validation stream-cache opening",
+      "frozen full-replay stable-ID / manifest verification",
+      "attempted COMBINED_V1 feature-column alignment"
+    ],
+    "validation_opened": true
+  },
+  "status": {
+    "M2-0": {
+      "arm": "M2-0",
+      "claim_bearing_result_promoted": false,
+      "experiment_id": "m2-v1-development-two-arm__M2-0",
+      "started_at": "2026-08-13T21:58:49Z",
+      "status": "STARTED",
+      "updated_at": "2026-08-13T21:58:49Z"
+    },
+    "M2-G": {
+      "arm": "M2-G",
+      "claim_bearing_result_promoted": false,
+      "experiment_id": "m2-v1-development-two-arm__M2-G",
+      "started_at": "2026-08-13T21:58:50Z",
+      "status": "STARTED",
+      "updated_at": "2026-08-13T21:58:50Z"
+    }
+  }
+}

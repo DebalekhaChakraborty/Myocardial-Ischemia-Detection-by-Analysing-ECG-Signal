@@ -101,8 +101,22 @@ imported by the canonical route, and no `TEST_ATTEMPT` is ever created.
 
 ## 4. One suite, two independent canonical attempts
 
+> **Attempt #1 is consumed.** The first canonical execution, suite
+> `m2-v1-development-two-arm` at master `3c1ba4c`, claimed both arms and then
+> failed during full label-blind replay, before a single row was scored, on a
+> TRAIN-vs-VALIDATION feature-join defect. It is permanently preserved and never
+> re-run. Exactly one recovery is permitted:
+> `m2-v1-development-two-arm-recovery1`. See
+> `docs/M2_DEVELOPMENT_ATTEMPT1_FAILURE_AND_RECOVERY_DECISION_V1.md`
+> (SHA-256 `e9d55d7a047e9610c6e156afc9e1a98aafbca86a3131c02a8e56624da7ad57d6`),
+> whose digest every recovery artifact binds along with the lineage fields
+> `recovery_from_suite_id`, `recovery_suite_id`, `recovery_reason_class`,
+> `prior_attempt_scoring_started=false`,
+> `prior_attempt_metrics_computed=false` and
+> `prior_attempt_test_accessed=false`.
+
 The production suite identity is **immutable**:
-`CANONICAL_SUITE_ID = "m2-v1-development-two-arm"`. There is no public
+`CANONICAL_SUITE_ID = "m2-v1-development-two-arm-recovery1"`. There is no public
 `suite_id` parameter and no CLI option that selects one, because a
 caller-chosen suite name would let a second "canonical" suite run under a
 different directory after the first was consumed. A non-canonical id is refused
@@ -236,6 +250,86 @@ There is no partition option, no arm option, no threshold option, no retry
 option, no seed option and no alternative data-source option. A private
 `_roots`/`_loaders` dependency-injection seam exists for synthetic tests only;
 it is absent from the CLI and from the public scientific contract.
+
+## 6a. Partition-aware feature assembly
+
+Scientific timeline assembly joins COMBINED_V1 columns through
+`m2_feature_join.join_sqi_and_morphology_for_partition`, which takes the
+partition explicitly and names it in every refusal. The frozen M2 **TRAIN**
+gate derivation keeps its own TRAIN-only helper unchanged, so the frozen
+receipt continues to mean exactly what it meant.
+
+The join requires exact record-set equality between the COMBINED_V1 corpus and
+the M1 stream-cache manifest **for the same partition**, refuses duplicate
+record ids and escaping cache paths, and treats a missing, unmatched or extra
+row as fatal rather than inner-joining it away. TEST is refused before the
+feature manifest is opened.
+
+Per record it additionally requires **exact stable-ID set equality in both
+directions**: the NPZ's stable-ID count matches its feature-row count, neither
+the NPZ nor the stream cache repeats an identity, every stream row has a
+feature row, and every feature row has a stream row. Requiring only the first
+direction would silently accept a feature cache holding extra rows — a corpus
+that is not the one the stream cache was built from, quietly reduced to a
+subset at join time. Order is not asserted, because the join realigns by stable
+identity and the frozen contract fixes the *stream* chronology.
+
+## 6a-bis. Attempt #1 is proven from artifacts, never inferred
+
+`consumed_failed_pre_scoring` is a scientific claim — that *this* attempt
+failed, that it failed before any row was scored, that no metric was produced
+and that the sealed test stayed shut. A claim directory proves none of that, so
+`validate_original_attempt1_failure_lineage()` verifies the preserved artifacts
+against frozen digests before a recovery may be claimed:
+
+* both original arm directories and their `M2_RUN_STATUS.json` files exist and
+  hash to `3699e656…6365d` (M2-0) and `7908130758…251` (M2-G);
+* neither original arm holds `M2_ARM_RESULT.json` or `M2_EXPERIMENT_LOCK.json`,
+  and the original suite holds no `M2_SUITE_RESULT.json`;
+* the additive receipt exists at the frozen failure-review path, its file
+  digest is `8c3a0734…b278`, its canonical `receipt_sha256` recomputes and
+  equals `31345512…92eb`;
+* the receipt names the original suite and execution SHA, is
+  `claim_bearing=false` / `canonical=false`, records the frozen pre-scoring
+  replay stage and the partition-alignment exception, and records
+  `validation_opened=true`, `scoring_started=false`, `metrics_computed=false`,
+  `test_accessed=false`, `sealed_test_state="unopened"`;
+* it binds the frozen preserved status digests and the recovery decision digest.
+
+Any absent or mutated artifact **stops for human review**. Verification is
+read-only: nothing is repaired, replaced, normalised or inferred.
+
+## 6b. Post-claim failure accounting
+
+Once any arm claim exists, an uncaught canonical-run exception writes
+deterministic non-claim-bearing accounting: one additive
+`M2_ATTEMPT_FAILURE_RECEIPT.json` in `<suite_id>__failure_review/`, plus the
+established `FAILED_OR_INTERRUPTED` status on each existing claim. The receipt
+records the exact stage and exception, whether VALIDATION had been opened, the
+promotion state, the runtime observations so far, and `canonical=false`.
+
+Nothing is deleted, cleaned, renamed, reseeded or retried; staged and evidence
+files are preserved exactly as the failure left them; and a partially failed
+attempt is never made to look COMPLETE. A failure *before* any claim writes
+nothing, because no attempt was consumed.
+
+**The receipt reports REAL exposure.** Attempt #1's `scoring_started=false` is
+a frozen determination about that attempt, not a template: a future failure
+after the scorer has been invoked must say so. A transparent wrapper flags
+scoring the moment the frozen scorer is called and returns its output
+unchanged; `post_replay_evaluation_started` and per-arm `metrics_completed` are
+set at the corresponding points. Where an abrupt exception leaves a fact
+genuinely unknowable it is recorded as `indeterminate` rather than as a
+flattering `false`.
+
+**Promotion accounting is per arm.** `arm_result_promoted` and
+`experiment_lock_promoted` are maps keyed by arm, so M2-0 completing while
+M2-G fails is preserved exactly and one arm's promotion never implies the
+other's.
+
+Historical claim files from a previous attempt are never rewritten to make a
+failed state look cleaner: the forensic classification lives beside the claim,
+in its own additive receipt.
 
 ## 7. Bounded memory
 

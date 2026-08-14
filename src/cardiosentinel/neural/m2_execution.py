@@ -45,6 +45,9 @@ from cardiosentinel.neural.m1_store import (
     STABLE_ID_FILE,
     START_SAMPLE_FILE,
 )
+from cardiosentinel.neural.m2_feature_join import (
+    join_sqi_and_morphology_for_partition,
+)
 from cardiosentinel.neural.m2_gate_derivation import (
     DEFAULT_FEATURE_ROOT,
     DEFAULT_M1_RUN_ROOT,
@@ -599,7 +602,13 @@ def iter_timeline_streams(
         state_column = np.asarray(store.array(OBSERVATION_STATE_FILE))
         representation = store.array(REPRESENTATION_FILE)
 
-        columns = join_sqi_and_morphology(store, manifest, Path(feature_root))
+        # PARTITION-AWARE join. The TRAIN-only helper the frozen gate
+        # derivation uses can never match a VALIDATION stream cache, which is
+        # what consumed M2 development attempt #1 before a single row was
+        # scored. The frozen TRAIN derivation is left exactly as it was.
+        columns = join_sqi_and_morphology_for_partition(
+            store, manifest, Path(feature_root), evaluated
+        )
         for name, values in columns.items():
             if values.shape[0] != record_column.shape[0]:
                 raise M2ExecutionError(
