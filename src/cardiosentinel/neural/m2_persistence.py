@@ -153,13 +153,20 @@ def require_frozen_runtime_record(runtime: RuntimeIntegrityRecord) -> None:
 # --------------------------------------------------------------------------
 
 RECOVERY_LINEAGE_FIELDS: Final = (
-    "recovery_decision_sha256",
-    "recovery_from_suite_id",
-    "recovery_suite_id",
-    "recovery_reason_class",
-    "prior_attempt_scoring_started",
-    "prior_attempt_metrics_computed",
-    "prior_attempt_test_accessed",
+    "recovery2_decision_sha256",
+    "recovery_from_original_suite_id",
+    "recovery1_suite_id",
+    "recovery2_suite_id",
+    "attempt1_reason_class",
+    "recovery1_reason_class",
+    "attempt1_scoring_started",
+    "attempt1_metrics_computed",
+    "attempt1_test_accessed",
+    "recovery1_receipt_scoring_started",
+    "recovery1_human_forensic_scorer_invocation_observed",
+    "recovery1_replay_completed",
+    "recovery1_metrics_computed",
+    "recovery1_test_accessed",
 )
 
 
@@ -330,6 +337,171 @@ def validate_original_attempt1_failure_lineage(run_root: Path) -> dict[str, Any]
     }
 
 
+def _require_recovery1_receipt_fields(receipt: dict[str, Any], *, refuse=None) -> None:
+    """The exposure recovery1's receipt must record, checked by value.
+
+    Separated so it is testable on its own: in the full validator the frozen
+    FILE digest already refuses any altered receipt, so these checks would
+    otherwise be unreachable.
+    """
+    if refuse is None:
+
+        def refuse(detail: str) -> None:
+            raise M2PersistenceError(
+                f"The frozen recovery1 forensic lineage could not be proven: {detail}"
+            )
+
+    # The conservative receipt value is preserved as-is and never rewritten.
+    if receipt.get("scoring_started") != "indeterminate":
+        refuse(
+            f"the recovery1 receipt records scoring_started="
+            f"{receipt.get('scoring_started')!r}, not the frozen 'indeterminate'."
+        )
+    for flag, expected in (
+        ("validation_opened", True),
+        ("replay_completed", False),
+        ("post_replay_evaluation_started", False),
+        ("metrics_computed_or_completed", False),
+        ("test_accessed", False),
+    ):
+        if receipt.get(flag) is not expected:
+            refuse(
+                f"the recovery1 receipt records {flag}={receipt.get(flag)!r}, "
+                f"not the frozen {expected!r}."
+            )
+    if receipt.get("metrics_completed_per_arm") != {}:
+        refuse("the recovery1 receipt records completed per-arm metrics.")
+    if receipt.get("sealed_test_state") != "unopened":
+        refuse("the recovery1 receipt does not record the sealed test unopened.")
+
+
+def validate_recovery1_failure_lineage(run_root: Path) -> dict[str, Any]:
+    """Prove RECOVERY1 from its artifacts, exactly as attempt #1 is proven.
+
+    Recovery1 is a second consumed pre-scoring failure with its own frozen
+    identity. Recovery2 may not be claimed until BOTH prior lineages verify.
+    """
+    from cardiosentinel.neural.m2_development_run import (
+        RECOVERY1_EXCEPTION_SUBSTRING,
+        RECOVERY1_EXCEPTION_TYPE,
+        RECOVERY1_EXECUTION_GIT_SHA,
+        RECOVERY1_FAILED_STAGE,
+        RECOVERY1_FAILURE_RECEIPT_FILE_SHA256,
+        RECOVERY1_FAILURE_RECEIPT_SHA256,
+        RECOVERY1_STATUS_SHA256,
+        RECOVERY1_SUITE_ID,
+        RECOVERY2_DECISION_SHA256,
+    )
+
+    root = Path(run_root)
+
+    def refuse(detail: str) -> None:
+        raise M2PersistenceError(
+            f"The frozen recovery1 forensic lineage could not be proven: "
+            f"{detail} STOP FOR HUMAN REVIEW. Recovery2 is not authorized, and "
+            "no preserved artifact is repaired, replaced or inferred."
+        )
+
+    for arm in M2_ARMS:
+        run_dir = root / arm_experiment_id(RECOVERY1_SUITE_ID, arm)
+        if not run_dir.is_dir():
+            refuse(f"the recovery1 {arm} claim directory {run_dir} is absent.")
+        status_path = run_dir / RUN_STATUS_NAME
+        if not status_path.is_file():
+            refuse(f"the recovery1 {arm} {RUN_STATUS_NAME} is absent.")
+        observed = sha256_file(status_path)
+        if observed != RECOVERY1_STATUS_SHA256[arm]:
+            refuse(
+                f"the recovery1 {arm} {RUN_STATUS_NAME} digests to {observed}, "
+                f"not the frozen {RECOVERY1_STATUS_SHA256[arm]}."
+            )
+        for name in (ARM_RESULT_NAME, EXPERIMENT_LOCK_NAME):
+            if (run_dir / name).exists():
+                refuse(
+                    f"the recovery1 {arm} directory contains {name}; recovery1 "
+                    "is recorded as having promoted nothing."
+                )
+    if (suite_directory(root, RECOVERY1_SUITE_ID) / SUITE_RESULT_NAME).exists():
+        refuse(
+            f"the recovery1 suite contains {SUITE_RESULT_NAME}; recovery1 is "
+            "recorded as never having completed."
+        )
+
+    receipt_path = (
+        failure_review_directory(root, RECOVERY1_SUITE_ID)
+        / ATTEMPT_FAILURE_RECEIPT_NAME
+    )
+    if not receipt_path.is_file():
+        refuse(f"the recovery1 failure receipt {receipt_path} is absent.")
+    file_digest = sha256_file(receipt_path)
+    if file_digest != RECOVERY1_FAILURE_RECEIPT_FILE_SHA256:
+        refuse(
+            f"the recovery1 failure receipt file digests to {file_digest}, not "
+            f"the frozen {RECOVERY1_FAILURE_RECEIPT_FILE_SHA256}."
+        )
+    receipt = read_json_result(receipt_path)
+    body = {k: v for k, v in receipt.items() if k != "receipt_sha256"}
+    if receipt.get("receipt_sha256") != canonical_sha256(body):
+        refuse("the recovery1 receipt's own canonical digest does not validate.")
+    if receipt["receipt_sha256"] != RECOVERY1_FAILURE_RECEIPT_SHA256:
+        refuse(
+            f"the recovery1 receipt digest is {receipt['receipt_sha256']}, not "
+            f"the frozen {RECOVERY1_FAILURE_RECEIPT_SHA256}."
+        )
+    _require_recovery1_receipt_fields(receipt, refuse=refuse)
+    if receipt.get("suite_id") != RECOVERY1_SUITE_ID:
+        refuse(f"the recovery1 receipt names suite {receipt.get('suite_id')!r}.")
+    if receipt.get("git_sha") != RECOVERY1_EXECUTION_GIT_SHA:
+        refuse(f"the recovery1 receipt names execution SHA {receipt.get('git_sha')!r}.")
+    for flag, expected in (("claim_bearing", False), ("canonical", False)):
+        if receipt.get(flag) is not expected:
+            refuse(f"the recovery1 receipt records {flag}={receipt.get(flag)!r}.")
+    if receipt.get("failed_stage") != RECOVERY1_FAILED_STAGE:
+        refuse(f"the recovery1 receipt records stage {receipt.get('failed_stage')!r}.")
+    if receipt.get("exception_type") != RECOVERY1_EXCEPTION_TYPE:
+        refuse(
+            f"the recovery1 receipt records exception "
+            f"{receipt.get('exception_type')!r}."
+        )
+    if RECOVERY1_EXCEPTION_SUBSTRING not in str(receipt.get("exception_message", "")):
+        refuse(
+            "the recovery1 receipt's exception message is not the frozen "
+            "source-null join-sentinel defect."
+        )
+    promotion = receipt.get("promotion_state") or {}
+    for field in ("arm_result_promoted", "experiment_lock_promoted"):
+        values = promotion.get(field) or {}
+        if any(values.get(arm) for arm in M2_ARMS):
+            refuse(f"the recovery1 receipt records {field} true for some arm.")
+    if promotion.get("suite_result_promoted") is not False:
+        refuse("the recovery1 receipt records a promoted suite.")
+    if receipt.get("preserved_status_sha256"):
+        # Recorded at failure time from the STARTED files, before they were
+        # rewritten to FAILED; kept as-is and not re-derived here.
+        pass
+
+    return {
+        "lineage_class": "m2_recovery1_verified_failure_lineage",
+        "recovery1_suite_id": RECOVERY1_SUITE_ID,
+        "recovery1_execution_git_sha": RECOVERY1_EXECUTION_GIT_SHA,
+        "recovery1_status_sha256": dict(RECOVERY1_STATUS_SHA256),
+        "recovery1_failure_receipt_sha256": RECOVERY1_FAILURE_RECEIPT_SHA256,
+        "recovery1_failure_receipt_file_sha256": (
+            RECOVERY1_FAILURE_RECEIPT_FILE_SHA256
+        ),
+        "recovery2_decision_sha256": RECOVERY2_DECISION_SHA256,
+        "recovery1_failed_stage": RECOVERY1_FAILED_STAGE,
+        "recovery1_receipt_scoring_started": "indeterminate",
+        "recovery1_human_forensic_scorer_invocation_observed": False,
+        "recovery1_validation_opened": True,
+        "recovery1_replay_completed": False,
+        "recovery1_metrics_computed": False,
+        "recovery1_test_accessed": False,
+        "recovery1_promoted_any_claim_bearing_artifact": False,
+        "verified_from_artifacts": True,
+    }
+
+
 def validate_recovery_lineage(payload: dict[str, Any]) -> dict[str, Any]:
     """Every recovery artifact must state what attempt #1 was, by value.
 
@@ -338,10 +510,12 @@ def validate_recovery_lineage(payload: dict[str, Any]) -> dict[str, Any]:
     TEST opened before it did.
     """
     from cardiosentinel.neural.m2_development_run import (
+        ATTEMPT1_REASON_CLASS,
         CANONICAL_SUITE_ID,
         ORIGINAL_SUITE_ID,
-        RECOVERY_DECISION_SHA256,
-        RECOVERY_REASON_CLASS,
+        RECOVERY1_REASON_CLASS,
+        RECOVERY1_SUITE_ID,
+        RECOVERY2_DECISION_SHA256,
     )
 
     missing = [field for field in RECOVERY_LINEAGE_FIELDS if field not in payload]
@@ -350,13 +524,22 @@ def validate_recovery_lineage(payload: dict[str, Any]) -> dict[str, Any]:
             f"A recovery artifact must bind its lineage; missing {missing}."
         )
     expectations = {
-        "recovery_decision_sha256": RECOVERY_DECISION_SHA256,
-        "recovery_from_suite_id": ORIGINAL_SUITE_ID,
-        "recovery_suite_id": CANONICAL_SUITE_ID,
-        "recovery_reason_class": RECOVERY_REASON_CLASS,
-        "prior_attempt_scoring_started": False,
-        "prior_attempt_metrics_computed": False,
-        "prior_attempt_test_accessed": False,
+        "recovery2_decision_sha256": RECOVERY2_DECISION_SHA256,
+        "recovery_from_original_suite_id": ORIGINAL_SUITE_ID,
+        "recovery1_suite_id": RECOVERY1_SUITE_ID,
+        "recovery2_suite_id": CANONICAL_SUITE_ID,
+        "attempt1_reason_class": ATTEMPT1_REASON_CLASS,
+        "recovery1_reason_class": RECOVERY1_REASON_CLASS,
+        "attempt1_scoring_started": False,
+        "attempt1_metrics_computed": False,
+        "attempt1_test_accessed": False,
+        # Two distinct facts, both preserved: the immutable receipt's
+        # conservative value, and the human control-flow determination.
+        "recovery1_receipt_scoring_started": "indeterminate",
+        "recovery1_human_forensic_scorer_invocation_observed": False,
+        "recovery1_replay_completed": False,
+        "recovery1_metrics_computed": False,
+        "recovery1_test_accessed": False,
     }
     for field, expected in expectations.items():
         if payload[field] != expected:

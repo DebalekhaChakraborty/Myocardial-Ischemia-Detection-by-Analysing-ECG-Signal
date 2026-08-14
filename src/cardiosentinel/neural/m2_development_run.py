@@ -81,11 +81,18 @@ ORIGINAL_SUITE_ID: Final = "m2-v1-development-two-arm"
 never re-run, re-cleaned or reused. See
 `docs/M2_DEVELOPMENT_ATTEMPT1_FAILURE_AND_RECOVERY_DECISION_V1.md`."""
 
-CANONICAL_SUITE_ID: Final = "m2-v1-development-two-arm-recovery1"
-"""The ONE permitted recovery suite identity, frozen prospectively before any
-further development access. Deterministic, not a seed. There is no `recovery2`,
-`attempt3`, timestamp or random suffix: if this suite is ever claimed and
-fails, execution STOPS FOR HUMAN REVIEW."""
+RECOVERY1_SUITE_ID: Final = "m2-v1-development-two-arm-recovery1"
+"""Recovery1. ALSO consumed and failed before scoring, on a distinct defect:
+the feature join treated a legitimate source null as an unwritten row. Preserved
+permanently and never reused."""
+
+CANONICAL_SUITE_ID: Final = "m2-v1-development-two-arm-recovery2"
+"""The ONE permitted recovery2 identity, frozen prospectively before any further
+development access. The earlier recovery decision prohibited an *implicit*
+recovery2; this one was separately and explicitly authorized after human review
+of a second, distinct pre-scoring execution defect. There is no recovery3,
+attempt4, timestamp or random suffix: if this suite is ever claimed and fails,
+execution STOPS FOR HUMAN REVIEW."""
 
 RECOVERY_DECISION_DOCUMENT: Final = (
     "docs/M2_DEVELOPMENT_ATTEMPT1_FAILURE_AND_RECOVERY_DECISION_V1.md"
@@ -93,7 +100,32 @@ RECOVERY_DECISION_DOCUMENT: Final = (
 RECOVERY_DECISION_SHA256: Final = (
     "e9d55d7a047e9610c6e156afc9e1a98aafbca86a3131c02a8e56624da7ad57d6"
 )
-RECOVERY_REASON_CLASS: Final = "pre_scoring_partition_alignment_execution_defect"
+ATTEMPT1_REASON_CLASS: Final = "pre_scoring_partition_alignment_execution_defect"
+RECOVERY1_REASON_CLASS: Final = "pre_scoring_source_null_join_sentinel_defect"
+
+RECOVERY2_DECISION_DOCUMENT: Final = (
+    "docs/M2_DEVELOPMENT_RECOVERY1_FAILURE_AND_RECOVERY2_DECISION_V1.md"
+)
+RECOVERY2_DECISION_SHA256: Final = (
+    "93e53d3c8281d922823d48b73712a2a1ede1c5b0f5bc9f41694af563e1a2fca4"
+)
+
+# Recovery1's frozen forensic identity, captured read-only from its preserved
+# artifacts before any code changed.
+RECOVERY1_EXECUTION_GIT_SHA: Final = "d77fbdc37415c43728dbe3173ce58a85cfe2e71d"
+RECOVERY1_STATUS_SHA256: Final = {
+    "M2-0": "642cc8376c87826a5d7fdbd5d0730ca44b20f3429c26ea44c58974b45244d054",
+    "M2-G": "8ba15ca25b70c7686b2e39fe3e073607511835ff42fa19b5ee4d9138f4a0170d",
+}
+RECOVERY1_FAILURE_RECEIPT_SHA256: Final = (
+    "5b05873d48f1355292113a07d6025258e071cb9b13a35caaff1a10132cbb0408"
+)
+RECOVERY1_FAILURE_RECEIPT_FILE_SHA256: Final = (
+    "7773c6135a22e7ba64699511e1db1e92c8aac1ec9b90727d7805f540d5156446"
+)
+RECOVERY1_FAILED_STAGE: Final = "full_label_blind_replay_both_arms"
+RECOVERY1_EXCEPTION_TYPE: Final = "M2FeatureJoinError"
+RECOVERY1_EXCEPTION_SUBSTRING: Final = "left unmatched rows for"
 
 # --------------------------------------------------------------------------
 # Frozen forensic identity of attempt #1
@@ -126,21 +158,31 @@ ORIGINAL_EXCEPTION_SUBSTRING: Final = (
 
 
 def recovery_lineage() -> dict[str, Any]:
-    """The lineage every recovery arm result, lock and suite must bind.
+    """The lineage every recovery2 artifact must bind. It conceals neither.
 
-    The recovery never conceals attempt #1. It states what that attempt was and
-    what it demonstrably did not do: no row was scored, no metric was computed
-    and TEST was never opened.
+    Both prior attempts are named with their own reason class and their own
+    exposure. Recovery1's conservative receipt value and the human forensic
+    control-flow determination are carried as SEPARATE facts: the receipt said
+    `indeterminate` because the tracker could not prove otherwise, while the
+    traceback shows the failure occurred inside stream assembly before any
+    stream reached replay. Neither replaces the other.
     """
     return {
-        "recovery_decision_document": RECOVERY_DECISION_DOCUMENT,
-        "recovery_decision_sha256": RECOVERY_DECISION_SHA256,
-        "recovery_from_suite_id": ORIGINAL_SUITE_ID,
-        "recovery_suite_id": CANONICAL_SUITE_ID,
-        "recovery_reason_class": RECOVERY_REASON_CLASS,
-        "prior_attempt_scoring_started": False,
-        "prior_attempt_metrics_computed": False,
-        "prior_attempt_test_accessed": False,
+        "recovery2_decision_document": RECOVERY2_DECISION_DOCUMENT,
+        "recovery2_decision_sha256": RECOVERY2_DECISION_SHA256,
+        "recovery_from_original_suite_id": ORIGINAL_SUITE_ID,
+        "recovery1_suite_id": RECOVERY1_SUITE_ID,
+        "recovery2_suite_id": CANONICAL_SUITE_ID,
+        "attempt1_reason_class": ATTEMPT1_REASON_CLASS,
+        "recovery1_reason_class": RECOVERY1_REASON_CLASS,
+        "attempt1_scoring_started": False,
+        "attempt1_metrics_computed": False,
+        "attempt1_test_accessed": False,
+        "recovery1_receipt_scoring_started": "indeterminate",
+        "recovery1_human_forensic_scorer_invocation_observed": False,
+        "recovery1_replay_completed": False,
+        "recovery1_metrics_computed": False,
+        "recovery1_test_accessed": False,
     }
 
 
@@ -218,6 +260,9 @@ STATE_CLAIMED: Final = "claimed"
 STATE_COMPLETE: Final = "complete"
 STATE_FAILED: Final = "failed"
 STATE_CONSUMED_FAILED_PRE_SCORING: Final = "consumed_failed_pre_scoring"
+STATE_CONSUMED_FAILED_STREAM_ASSEMBLY: Final = (
+    "consumed_failed_pre_scoring_stream_assembly"
+)
 
 
 def _suite_state(root: Path, suite_id: str) -> dict[str, Any]:
@@ -292,6 +337,11 @@ def canonical_execution_history(
     Read from the filesystem, never from a source constant: code cannot rewrite
     itself, so a hard-coded claim about run history could only become a lie.
     """
+    from cardiosentinel.neural.m2_persistence import (
+        M2PersistenceError,
+        validate_recovery1_failure_lineage,
+    )
+
     root = Path(run_root or canonical_roots()["run_root"])
     original = _suite_state(root, ORIGINAL_SUITE_ID)
     # `consumed_failed_pre_scoring` is a SCIENTIFIC claim about what attempt #1
@@ -316,11 +366,35 @@ def canonical_execution_history(
             original["scoring_started"] = lineage["scoring_started"]
             original["metrics_computed"] = lineage["metrics_computed"]
             original["test_accessed"] = lineage["test_accessed"]
+    # Recovery1 is a SECOND consumed pre-scoring failure with its own frozen
+    # identity, and is likewise proven rather than inferred.
+    recovery1 = _suite_state(root, RECOVERY1_SUITE_ID)
+    recovery1["lineage_verified"] = False
+    if recovery1["any_attempt_claimed"]:
+        try:
+            proof = validate_recovery1_failure_lineage(root)
+        except M2PersistenceError as error:
+            recovery1["state"] = STATE_CLAIMED
+            recovery1["lineage_error"] = str(error)
+        else:
+            recovery1["state"] = STATE_CONSUMED_FAILED_STREAM_ASSEMBLY
+            recovery1["lineage_verified"] = True
+            recovery1["receipt_scoring_started"] = proof[
+                "recovery1_receipt_scoring_started"
+            ]
+            recovery1["human_forensic_scorer_invocation_observed"] = proof[
+                "recovery1_human_forensic_scorer_invocation_observed"
+            ]
+            recovery1["replay_completed"] = proof["recovery1_replay_completed"]
+            recovery1["metrics_computed"] = proof["recovery1_metrics_computed"]
+            recovery1["test_accessed"] = proof["recovery1_test_accessed"]
+
     recovery = _suite_state(root, suite_id)
     return {
         "run_root": str(root),
         "suite_id": suite_id,
         "original_attempt": original,
+        "recovery1_attempt": recovery1,
         "recovery_attempt": recovery,
         # Back-compatible view of the suite this runner would execute.
         "arms": recovery["arms"],
@@ -451,9 +525,11 @@ def require_recovery_preconditions(run_root: Path, suite_id: str) -> dict[str, A
     """
     from cardiosentinel.neural.m2_persistence import (
         validate_original_attempt1_failure_lineage,
+        validate_recovery1_failure_lineage,
     )
 
     lineage = validate_original_attempt1_failure_lineage(run_root)
+    recovery1_lineage = validate_recovery1_failure_lineage(run_root)
     history = canonical_execution_history(run_root, suite_id)
     original = history["original_attempt"]
     if original["state"] != STATE_CONSUMED_FAILED_PRE_SCORING:
@@ -461,6 +537,12 @@ def require_recovery_preconditions(run_root: Path, suite_id: str) -> dict[str, A
             f"The original attempt {ORIGINAL_SUITE_ID!r} is in state "
             f"{original['state']!r}; the recovery route runs only after a "
             "verified consumed pre-scoring failure."
+        )
+    if history["recovery1_attempt"]["state"] != STATE_CONSUMED_FAILED_STREAM_ASSEMBLY:
+        raise M2DevelopmentRunError(
+            f"Recovery1 {RECOVERY1_SUITE_ID!r} is in state "
+            f"{history['recovery1_attempt']['state']!r}; recovery2 runs only "
+            "after a verified consumed recovery1 stream-assembly failure."
         )
     recovery = history["recovery_attempt"]
     if recovery["state"] != STATE_UNCLAIMED:
@@ -470,6 +552,7 @@ def require_recovery_preconditions(run_root: Path, suite_id: str) -> dict[str, A
             "retried, and no further recovery is implicitly authorized."
         )
     history["original_attempt_lineage"] = lineage
+    history["recovery1_attempt_lineage"] = recovery1_lineage
     return history
 
 

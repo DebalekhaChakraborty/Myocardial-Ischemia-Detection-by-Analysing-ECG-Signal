@@ -58,6 +58,182 @@
     ],
     "validation_opened": true
   },
+  "recovery1_receipt": {
+    "alternate_suite_id_used": false,
+    "any_arm_claimed": true,
+    "artifact_class": "m2_attempt_failure_receipt",
+    "automatic_cleanup_performed": false,
+    "automatic_retry_performed": false,
+    "canonical": false,
+    "claim_bearing": false,
+    "claimed_arms": [
+      "M2-0",
+      "M2-G"
+    ],
+    "exception_message": "COMBINED_V1 validation join left unmatched rows for 'high_frequency_power_ratio'.",
+    "exception_type": "M2FeatureJoinError",
+    "exposure_source": "runtime execution tracker",
+    "failed_stage": "full_label_blind_replay_both_arms",
+    "git_dirty": false,
+    "git_sha": "d77fbdc37415c43728dbe3173ce58a85cfe2e71d",
+    "human_review_required": true,
+    "memory_selected": null,
+    "memory_selection_performed": false,
+    "metrics_completed_per_arm": {},
+    "metrics_computed_or_completed": false,
+    "post_replay_evaluation_started": false,
+    "preserved_status_sha256": {
+      "M2-0": "0be20649361cf6c213a47d31c36873d83531b1c90e87be92881f74abdd0ac810",
+      "M2-G": "7a478fcafd704381b9b8826ca1554e75b616501c718af432a47e5f20811e0adf"
+    },
+    "promotion_state": {
+      "arm_result_promoted": {
+        "M2-0": false,
+        "M2-G": false
+      },
+      "authority": "filesystem",
+      "coherent": true,
+      "experiment_lock_promoted": {
+        "M2-0": false,
+        "M2-G": false
+      },
+      "observed_from_filesystem": {
+        "arm_result_promoted": {
+          "M2-0": false,
+          "M2-G": false
+        },
+        "experiment_lock_promoted": {
+          "M2-0": false,
+          "M2-G": false
+        },
+        "suite_result_promoted": false
+      },
+      "suite_result_promoted": false,
+      "tracker_observation": {
+        "arm_result_promoted": {
+          "M2-0": false,
+          "M2-G": false
+        },
+        "experiment_lock_promoted": {
+          "M2-0": false,
+          "M2-G": false
+        },
+        "suite_result_promoted": false
+      }
+    },
+    "receipt_sha256": "5b05873d48f1355292113a07d6025258e071cb9b13a35caaff1a10132cbb0408",
+    "recorded_at": "2026-08-14T12:53:31Z",
+    "recovery_decision_sha256": "e9d55d7a047e9610c6e156afc9e1a98aafbca86a3131c02a8e56624da7ad57d6",
+    "replay_completed": false,
+    "rollback": false,
+    "runtime_identity_checks": {
+      "M2-0": {
+        "all_observations_matched": true,
+        "automatic_environment_repair_performed": false,
+        "automatic_retry_performed": false,
+        "check_count": 2,
+        "checks": [
+          {
+            "detail": "m2_replay:M2-0",
+            "enforcement_point": "start",
+            "expected_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "matches": true,
+            "observed_at": "2026-08-14T12:52:15Z",
+            "observed_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "package_count": 335
+          },
+          {
+            "detail": "arm_claim_directory",
+            "enforcement_point": "pre_promotion",
+            "expected_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "matches": true,
+            "observed_at": "2026-08-14T12:52:16Z",
+            "observed_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "package_count": 335
+          }
+        ],
+        "completion_digest": null,
+        "control": "runtime_integrity_sentinel_v1",
+        "design_document": "docs/RUNTIME_INTEGRITY_SENTINEL_V1.md",
+        "design_document_sha256": "cd5c2e6d0b5dbc4ea35b319f98e9b9e678256c391491839d3f1745247eeb4075",
+        "digest_recipe": "installed_package_snapshot/installed_packages_sha256",
+        "expected_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+        "start_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
+      },
+      "M2-G": {
+        "all_observations_matched": true,
+        "automatic_environment_repair_performed": false,
+        "automatic_retry_performed": false,
+        "check_count": 2,
+        "checks": [
+          {
+            "detail": "m2_replay:M2-G",
+            "enforcement_point": "start",
+            "expected_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "matches": true,
+            "observed_at": "2026-08-14T12:52:16Z",
+            "observed_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "package_count": 335
+          },
+          {
+            "detail": "arm_claim_directory",
+            "enforcement_point": "pre_promotion",
+            "expected_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "matches": true,
+            "observed_at": "2026-08-14T12:52:16Z",
+            "observed_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+            "package_count": 335
+          }
+        ],
+        "completion_digest": null,
+        "control": "runtime_integrity_sentinel_v1",
+        "design_document": "docs/RUNTIME_INTEGRITY_SENTINEL_V1.md",
+        "design_document_sha256": "cd5c2e6d0b5dbc4ea35b319f98e9b9e678256c391491839d3f1745247eeb4075",
+        "digest_recipe": "installed_package_snapshot/installed_packages_sha256",
+        "expected_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+        "start_digest": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
+      }
+    },
+    "scientific_evidence": false,
+    "scoring_started": "indeterminate",
+    "sealed_test_state": "unopened",
+    "staged_evidence_preserved": true,
+    "suite_id": "m2-v1-development-two-arm-recovery1",
+    "test_accessed": false,
+    "validation_opened": true
+  },
+  "recovery1_status": {
+    "M2-0": {
+      "arm": "M2-0",
+      "automatic_retry_performed": false,
+      "canonical": false,
+      "claim_bearing_result_promoted": false,
+      "experiment_id": "m2-v1-development-two-arm-recovery1__M2-0",
+      "experiment_lock_promoted": false,
+      "human_review_required": true,
+      "promotion_state_source": "filesystem",
+      "reason": "full_label_blind_replay_both_arms: M2FeatureJoinError: COMBINED_V1 validation join left unmatched rows for 'high_frequency_power_ratio'.",
+      "repeat_attempt_permitted": false,
+      "started_at": "2026-08-14T12:52:16Z",
+      "status": "FAILED_OR_INTERRUPTED",
+      "updated_at": "2026-08-14T12:53:31Z"
+    },
+    "M2-G": {
+      "arm": "M2-G",
+      "automatic_retry_performed": false,
+      "canonical": false,
+      "claim_bearing_result_promoted": false,
+      "experiment_id": "m2-v1-development-two-arm-recovery1__M2-G",
+      "experiment_lock_promoted": false,
+      "human_review_required": true,
+      "promotion_state_source": "filesystem",
+      "reason": "full_label_blind_replay_both_arms: M2FeatureJoinError: COMBINED_V1 validation join left unmatched rows for 'high_frequency_power_ratio'.",
+      "repeat_attempt_permitted": false,
+      "started_at": "2026-08-14T12:52:16Z",
+      "status": "FAILED_OR_INTERRUPTED",
+      "updated_at": "2026-08-14T12:53:31Z"
+    }
+  },
   "status": {
     "M2-0": {
       "arm": "M2-0",
