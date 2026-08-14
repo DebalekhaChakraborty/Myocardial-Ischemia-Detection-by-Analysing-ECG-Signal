@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from pathlib import Path
-from typing import Any, Final, NamedTuple
+from typing import Any, Final, NamedTuple, Sequence
 
 REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[3]
 
 U1_PROTOCOL_NAME: Final = "U1_CALIBRATION_SELECTIVE_ROUTING_PROTOCOL_V1"
 U1_PROTOCOL_PATH: Final = REPOSITORY_ROOT / "docs" / f"{U1_PROTOCOL_NAME}.md"
 U1_PROTOCOL_SHA256: Final = (
-    "2a0ed8a787835fda613b802930e2ccd658d6308fa38387c7aba73ae6eee66158"
+    "d6235b477af278fe051822bdcccb54f985e4eceb0c6e92c1424f5e9d7d79b33b"
 )
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,34 @@ U1_CLAMP_DELTA: Final = 1e-7
 U1_SATURATED_FRACTION_REVIEW_BOUND: Final = 0.01
 U1_TRUE_LOGITS_PERSISTED: Final = False
 U1_NEURAL_UNCERTAINTY_MODEL: Final = False
+# Family selection is out-of-fold only; the final all-subject fit may not
+# reopen it, and a failed final fit stops rather than falling back.
+U1_FAMILY_SELECTION_EVIDENCE: Final = "out_of_fold_only"
+U1_FINAL_FIT_MAY_RESELECT_FAMILY: Final = False
+U1_FINAL_FIT_FALLBACK_PERMITTED: Final = False
+
+# ---------------------------------------------------------------------------
+# Two distinct calibration artifacts (§7)
+#   OOF evidence             = DEVELOPMENT evaluation
+#   final all-validation fit = deployable configuration
+# ---------------------------------------------------------------------------
+U1_OOF_ARTIFACT: Final = "u1_oof_development_calibration"
+U1_DEPLOY_ARTIFACT: Final = "u1_final_deployment_calibrator"
+U1_CALIBRATION_ARTIFACTS: Final = (U1_OOF_ARTIFACT, U1_DEPLOY_ARTIFACT)
+
+U1_OOF_CALIBRATOR_COUNT: Final = 12
+U1_DEPLOY_CALIBRATOR_COUNT: Final = 1
+U1_DEPLOY_FIT_SUBJECTS: Final = U1_CALIBRATION_SUBJECTS
+
+# Every U1 DEVELOPMENT performance number comes from the OOF artifact.
+U1_DEVELOPMENT_EVIDENCE_SOURCE: Final = U1_OOF_ARTIFACT
+U1_DEPLOY_FIT_IS_EVALUATION: Final = False
+U1_DEPLOY_IN_SAMPLE_PERFORMANCE_CLAIM_AUTHORISED: Final = False
+U1_DEPLOY_ARTIFACT_PURPOSE: Final = (
+    "unseen_subjects_and_separately_authorised_test_or_deployment_only"
+)
+# Later T1/T2 DEVELOPMENT work on VALIDATION subjects must use OOF (§14.1).
+U1_DOWNSTREAM_DEVELOPMENT_CALIBRATION_SOURCE: Final = U1_OOF_ARTIFACT
 
 # ---------------------------------------------------------------------------
 # Uncertainty, risk and routing
@@ -125,8 +154,26 @@ U1_COVERAGE_GRID: Final = (
     1.00,
 )
 U1_RETAINED_COVERAGE: Final = 0.90
-U1_RETAINED_COVERAGE_BASIS: Final = "a_priori_deployment_capacity_not_curve_read"
-U1_QUANTILE_CONVENTION: Final = "lower"
+# c_star is an a-priori operational design assumption / reference operating
+# point, NOT measured deployment capacity. Real cost is measured later in E1.
+U1_RETAINED_COVERAGE_BASIS: Final = (
+    "a_priori_operational_design_assumption_reference_operating_point"
+)
+U1_RETAINED_COVERAGE_IS_MEASURED_CAPACITY: Final = False
+
+# The threshold is an explicit empirical order statistic, never a library
+# quantile convention: k = ceil(c_star * N) guarantees achieved >= target.
+U1_THRESHOLD_RULE: Final = "empirical_order_statistic_ceil_1_based"
+U1_THRESHOLD_SORT_KEY: Final = ("uncertainty", "stable_id")
+U1_THRESHOLD_ACCEPTANCE: Final = "u <= u_star"
+U1_DEV_THRESHOLD_NAME: Final = "u_star_dev"
+U1_DEPLOY_THRESHOLD_NAME: Final = "u_star_deploy"
+U1_THRESHOLD_REPORT_FIELDS: Final = (
+    "target_coverage",
+    "achieved_coverage",
+    "accepted_count",
+    "threshold_tie_count",
+)
 U1_ASYMMETRIC_ABSTENTION_RATIO: Final = 3.0
 U1_ACCEPTED_RISK_AGREEMENT_TOLERANCE: Final = 0.02
 U1_ROUTING_THRESHOLD_CHOSEN_HERE: Final = False
@@ -137,9 +184,33 @@ U1_EPISODE_PERSISTENCE_IMPLEMENTED: Final = False
 # ---------------------------------------------------------------------------
 U1_ECE_BIN_COUNT: Final = 15
 U1_ECE_BINNINGS: Final = ("equal_width", "equal_mass")
+# Equal-width: [b/15, (b+1)/15) with the FINAL bin closed so p == 1.0 is binned.
+U1_ECE_EQUAL_WIDTH_FINAL_BIN_CLOSED: Final = True
+# Equal-mass: contiguous groups from a stable (p, stable_id) sort, sizes
+# differing by at most one. Never a library-default quantile.
+U1_ECE_EQUAL_MASS_SORT_KEY: Final = ("calibrated_probability", "stable_id")
+U1_ECE_LIBRARY_QUANTILE_PERMITTED: Final = False
+U1_ECE_BIN_REPORT_FIELDS: Final = (
+    "count",
+    "minimum_probability",
+    "maximum_probability",
+    "mean_probability",
+    "empirical_positive_fraction",
+)
+
 U1_BOOTSTRAP_REPLICATES: Final = 1000
 U1_BOOTSTRAP_SEED: Final = 2026
 U1_BOOTSTRAP_UNIT: Final = "subject"
+# Intervals are conditional on the fitted OOF procedure unless a future
+# protocol re-fits folds inside each replicate. Windows are not independent.
+U1_BOOTSTRAP_CLAIM: Final = (
+    "between_subject_variation_conditional_on_fitted_oof_calibration"
+)
+U1_BOOTSTRAP_REFITS_FOLDS_PER_REPLICATE: Final = False
+U1_WINDOWS_ARE_INDEPENDENT_EVIDENCE: Final = False
+U1_INFERENTIAL_UNIT: Final = "subject"
+U1_INFERENTIAL_UNIT_COUNT: Final = 12
+
 U1_COLD_START_STRATA: Final = ("0_5_minutes", "5_60_minutes", "over_60_minutes")
 
 # ---------------------------------------------------------------------------
@@ -325,6 +396,141 @@ def validate_against_frozen_split(split_path: Path) -> dict[str, Any]:
     }
 
 
+class U1RoutingThreshold(NamedTuple):
+    """A routing threshold derived by the frozen empirical order statistic."""
+
+    name: str
+    u_star: float
+    target_coverage: float
+    achieved_coverage: float
+    accepted_count: int
+    threshold_tie_count: int
+    eligible_count: int
+
+
+def routing_threshold_rank(eligible_count: int, target_coverage: float) -> int:
+    """The 1-based order-statistic rank `k = ceil(c_star * N)`.
+
+    A `numpy`-style `'lower'` quantile can land one row short of the target --
+    at the frozen PRIMARY size it yields 426507/473897 = 0.8999993669..., below
+    0.90. Taking the ceiling makes achieved coverage `>= c_star` by
+    construction.
+    """
+    if eligible_count <= 0:
+        raise U1ProtocolError("A routing threshold needs at least one row.")
+    if not 0.0 < target_coverage <= 1.0:
+        raise U1ProtocolError(
+            f"Target coverage {target_coverage!r} must lie in (0, 1]."
+        )
+    return max(1, math.ceil(target_coverage * eligible_count))
+
+
+def select_routing_threshold(
+    uncertainties: Sequence[float],
+    stable_ids: Sequence[str],
+    target_coverage: float,
+    name: str = U1_DEV_THRESHOLD_NAME,
+) -> U1RoutingThreshold:
+    """Derive `u_star` by the frozen rule; acceptance is `u <= u_star`.
+
+    Ties at `u_star` are all accepted, so achieved coverage may exceed the
+    target -- never fall below it.
+    """
+    if name not in (U1_DEV_THRESHOLD_NAME, U1_DEPLOY_THRESHOLD_NAME):
+        raise U1ProtocolError(f"Unknown routing threshold name {name!r}.")
+    values = [float(value) for value in uncertainties]
+    identities = [str(identity) for identity in stable_ids]
+    if len(values) != len(identities):
+        raise U1ProtocolError(
+            "Every uncertainty needs its stable_id; the tie-break is not optional."
+        )
+    total = len(values)
+    rank = routing_threshold_rank(total, target_coverage)
+
+    ordered = sorted(zip(values, identities), key=lambda row: (row[0], row[1]))
+    u_star = ordered[rank - 1][0]
+    accepted = sum(1 for value in values if value <= u_star)
+    ties = sum(1 for value in values if value == u_star)
+    achieved = accepted / total
+    if achieved < target_coverage:
+        raise U1ProtocolError(
+            f"Achieved coverage {achieved!r} fell below target "
+            f"{target_coverage!r}; the order statistic is wrong."
+        )
+    return U1RoutingThreshold(
+        name=name,
+        u_star=u_star,
+        target_coverage=float(target_coverage),
+        achieved_coverage=achieved,
+        accepted_count=accepted,
+        threshold_tie_count=ties,
+        eligible_count=total,
+    )
+
+
+def equal_width_bin_edges(
+    bins: int = U1_ECE_BIN_COUNT,
+) -> tuple[tuple[float, float], ...]:
+    """Frozen equal-width ECE intervals over [0, 1].
+
+    Lower edge inclusive, upper exclusive, except the final bin whose upper
+    edge is inclusive so `p == 1.0` is always binned.
+    """
+    if bins <= 0:
+        raise U1ProtocolError("ECE bin count must be positive.")
+    return tuple((index / bins, (index + 1) / bins) for index in range(bins))
+
+
+def equal_width_bin_index(probability: float, bins: int = U1_ECE_BIN_COUNT) -> int:
+    """Frozen equal-width bin membership for one calibrated probability."""
+    value = float(probability)
+    if not 0.0 <= value <= 1.0:
+        raise U1ProtocolError(f"Calibrated probability {value!r} is outside [0, 1].")
+    if value == 1.0:
+        return bins - 1
+    return min(bins - 1, int(value * bins))
+
+
+def equal_mass_group_sizes(
+    eligible_count: int, bins: int = U1_ECE_BIN_COUNT
+) -> tuple[int, ...]:
+    """Contiguous equal-mass group sizes differing by at most one.
+
+    With `N = bins * q + r`, the first `r` groups hold `q + 1` rows and the
+    rest hold `q`. Library quantile defaults are never used.
+    """
+    if bins <= 0:
+        raise U1ProtocolError("ECE bin count must be positive.")
+    if eligible_count < bins:
+        raise U1ProtocolError(
+            f"{eligible_count} rows cannot fill {bins} equal-mass groups."
+        )
+    quotient, remainder = divmod(eligible_count, bins)
+    return tuple(
+        quotient + 1 if index < remainder else quotient for index in range(bins)
+    )
+
+
+def equal_mass_group_boundaries(
+    probabilities: Sequence[float],
+    stable_ids: Sequence[str],
+    bins: int = U1_ECE_BIN_COUNT,
+) -> tuple[tuple[int, int], ...]:
+    """Half-open [start, stop) index ranges over the stable (p, id) order."""
+    if len(probabilities) != len(stable_ids):
+        raise U1ProtocolError(
+            "Every probability needs its stable_id; ties spanning a group "
+            "boundary are resolved by stable_id."
+        )
+    sizes = equal_mass_group_sizes(len(probabilities), bins)
+    boundaries: list[tuple[int, int]] = []
+    start = 0
+    for size in sizes:
+        boundaries.append((start, start + size))
+        start += size
+    return tuple(boundaries)
+
+
 def u1_protocol_identity() -> dict[str, Any]:
     """The frozen U1 design, as a machine-readable record."""
     folds = assign_calibration_folds()
@@ -353,7 +559,28 @@ def u1_protocol_identity() -> dict[str, Any]:
         "coverage_grid": list(U1_COVERAGE_GRID),
         "retained_coverage": U1_RETAINED_COVERAGE,
         "retained_coverage_basis": U1_RETAINED_COVERAGE_BASIS,
+        "retained_coverage_is_measured_capacity": (
+            U1_RETAINED_COVERAGE_IS_MEASURED_CAPACITY
+        ),
+        "threshold_rule": U1_THRESHOLD_RULE,
+        "threshold_names": [U1_DEV_THRESHOLD_NAME, U1_DEPLOY_THRESHOLD_NAME],
         "routing_threshold_chosen_here": U1_ROUTING_THRESHOLD_CHOSEN_HERE,
+        "calibration_artifacts": list(U1_CALIBRATION_ARTIFACTS),
+        "development_evidence_source": U1_DEVELOPMENT_EVIDENCE_SOURCE,
+        "downstream_development_calibration_source": (
+            U1_DOWNSTREAM_DEVELOPMENT_CALIBRATION_SOURCE
+        ),
+        "deploy_fit_is_evaluation": U1_DEPLOY_FIT_IS_EVALUATION,
+        "deploy_in_sample_performance_claim_authorised": (
+            U1_DEPLOY_IN_SAMPLE_PERFORMANCE_CLAIM_AUTHORISED
+        ),
+        "family_selection_evidence": U1_FAMILY_SELECTION_EVIDENCE,
+        "final_fit_may_reselect_family": U1_FINAL_FIT_MAY_RESELECT_FAMILY,
+        "final_fit_fallback_permitted": U1_FINAL_FIT_FALLBACK_PERMITTED,
+        "bootstrap_claim": U1_BOOTSTRAP_CLAIM,
+        "windows_are_independent_evidence": U1_WINDOWS_ARE_INDEPENDENT_EVIDENCE,
+        "inferential_unit": U1_INFERENTIAL_UNIT,
+        "inferential_unit_count": U1_INFERENTIAL_UNIT_COUNT,
         "fold_assignment": validate_fold_assignment(folds),
         "test_accessed": U1_TEST_ACCESSED,
         "sealed_test_state": U1_SEALED_TEST_STATE,

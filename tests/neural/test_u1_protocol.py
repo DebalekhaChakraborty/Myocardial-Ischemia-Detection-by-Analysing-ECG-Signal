@@ -16,8 +16,14 @@ from cardiosentinel.neural import u1_protocol as U
 from cardiosentinel.neural.u1_protocol import (
     U1ProtocolError,
     assign_calibration_folds,
+    equal_mass_group_boundaries,
+    equal_mass_group_sizes,
+    equal_width_bin_edges,
+    equal_width_bin_index,
     fold_assignment_digest,
     require_calibration_subjects,
+    routing_threshold_rank,
+    select_routing_threshold,
     u1_protocol_identity,
     validate_against_frozen_split,
     validate_fold_assignment,
@@ -319,8 +325,16 @@ def test_protocol_module_imports_only_the_standard_library():
             modules.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules.add(node.module.split(".")[0])
-    assert modules <= {"hashlib", "json", "pathlib", "typing", "__future__"}, modules
+    assert modules <= {
+        "hashlib",
+        "json",
+        "math",
+        "pathlib",
+        "typing",
+        "__future__",
+    }, modules
     assert "torch" not in modules
+    assert "numpy" not in modules
     assert "cardiosentinel" not in modules
 
 
@@ -376,3 +390,266 @@ def test_coverage_grid_is_frozen_sorted_and_includes_the_no_routing_reference():
     assert grid[-1] == 1.00
     assert U.U1_RETAINED_COVERAGE in grid
     assert len(set(grid)) == len(grid)
+
+
+# ---------------------------------------------------------------------------
+# Two calibration artifacts: OOF development vs deployable configuration
+# ---------------------------------------------------------------------------
+
+
+def test_oof_and_deployment_calibrators_are_distinct_roles():
+    assert U.U1_OOF_ARTIFACT != U.U1_DEPLOY_ARTIFACT
+    assert U.U1_CALIBRATION_ARTIFACTS == (
+        U.U1_OOF_ARTIFACT,
+        U.U1_DEPLOY_ARTIFACT,
+    )
+    assert U.U1_OOF_CALIBRATOR_COUNT == 12
+    assert U.U1_DEPLOY_CALIBRATOR_COUNT == 1
+
+
+def test_development_evaluation_is_out_of_fold_only():
+    assert U.U1_DEVELOPMENT_EVIDENCE_SOURCE == U.U1_OOF_ARTIFACT
+    assert U.U1_DEVELOPMENT_EVIDENCE_SOURCE != U.U1_DEPLOY_ARTIFACT
+    assert U.U1_DEPLOY_FIT_IS_EVALUATION is False
+
+
+def test_downstream_t1_t2_development_use_is_out_of_fold_only():
+    assert U.U1_DOWNSTREAM_DEVELOPMENT_CALIBRATION_SOURCE == U.U1_OOF_ARTIFACT
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "must be the OOF" in text
+    assert (
+        "never be given a probability produced by a\ncalibrator that was "
+        "fitted using that subject" in text
+    )
+
+
+def test_final_calibrator_fit_population_is_all_twelve_validation_subjects():
+    assert U.U1_DEPLOY_FIT_SUBJECTS == U.U1_CALIBRATION_SUBJECTS
+    assert len(U.U1_DEPLOY_FIT_SUBJECTS) == 12
+    # and never a TEST subject
+    for subject in _frozen_test_subjects():
+        assert subject not in U.U1_DEPLOY_FIT_SUBJECTS
+
+
+def test_final_family_cannot_differ_from_the_oof_selected_family():
+    assert U.U1_FAMILY_SELECTION_EVIDENCE == "out_of_fold_only"
+    assert U.U1_FINAL_FIT_MAY_RESELECT_FAMILY is False
+    assert U.U1_FINAL_FIT_FALLBACK_PERMITTED is False
+
+
+def test_no_in_sample_final_fit_performance_claim_is_authorised():
+    assert U.U1_DEPLOY_IN_SAMPLE_PERFORMANCE_CLAIM_AUTHORISED is False
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "parameterisation, not evaluation" in text
+
+
+def test_u_star_dev_and_u_star_deploy_are_different_artifact_concepts():
+    assert U.U1_DEV_THRESHOLD_NAME != U.U1_DEPLOY_THRESHOLD_NAME
+    assert U.U1_DEV_THRESHOLD_NAME == "u_star_dev"
+    assert U.U1_DEPLOY_THRESHOLD_NAME == "u_star_deploy"
+    dev = select_routing_threshold([0.1, 0.2, 0.3], ["a", "b", "c"], 0.60)
+    deploy = select_routing_threshold(
+        [0.1, 0.2, 0.3], ["a", "b", "c"], 0.60, name=U.U1_DEPLOY_THRESHOLD_NAME
+    )
+    assert dev.name == "u_star_dev"
+    assert deploy.name == "u_star_deploy"
+
+
+def test_unknown_threshold_name_is_refused():
+    with pytest.raises(U1ProtocolError, match="Unknown routing threshold"):
+        select_routing_threshold([0.1], ["a"], 1.0, name="u_star_test")
+
+
+# ---------------------------------------------------------------------------
+# The frozen empirical order statistic
+# ---------------------------------------------------------------------------
+
+
+def test_frozen_primary_size_shows_why_lower_quantile_was_insufficient():
+    """N = 473,897 at c* = 0.90 is exactly the case that failed."""
+    n = U.U1_PRIMARY_ROW_COUNT
+    assert n == 473_897
+    target = U.U1_RETAINED_COVERAGE
+
+    lower_like = int(target * n)  # 426,507
+    assert lower_like == 426_507
+    assert lower_like / n < target  # 0.8999993669... -- below target
+
+    k = routing_threshold_rank(n, target)
+    assert k == 426_508
+    assert k / n >= target  # 0.9000014771... -- at or above target
+
+
+def test_order_statistic_guarantees_achieved_coverage_at_or_above_target():
+    for n in (1, 2, 7, 10, 13, 100, 999, 473_897):
+        for target in U.U1_COVERAGE_GRID:
+            k = routing_threshold_rank(n, target)
+            assert 1 <= k <= n
+            assert k / n >= target
+
+
+def test_achieved_coverage_never_falls_below_target_on_synthetic_data():
+    values = [i / 1000 for i in range(1000)]
+    ids = [f"w{i:04d}" for i in range(1000)]
+    for target in U.U1_COVERAGE_GRID:
+        result = select_routing_threshold(values, ids, target)
+        assert result.achieved_coverage >= target
+        assert result.accepted_count == sum(1 for v in values if v <= result.u_star)
+
+
+def test_ties_can_only_increase_achieved_coverage():
+    # 10 rows, half of them tied at 0.5, target 0.60 -> k = 6 lands on a tie
+    values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.5, 0.5, 0.9, 1.0]
+    ids = [f"w{i}" for i in range(10)]
+    result = select_routing_threshold(values, ids, 0.60)
+    assert result.u_star == 0.5
+    assert result.threshold_tie_count == 4
+    # inclusive acceptance sweeps every tied row in
+    assert result.accepted_count == 8
+    assert result.achieved_coverage == 0.8
+    assert result.achieved_coverage > 0.60
+
+
+def test_threshold_tie_handling_is_deterministic():
+    values = [0.5] * 20
+    ids = [f"w{i:02d}" for i in range(20)]
+    first = select_routing_threshold(values, ids, 0.90)
+    second = select_routing_threshold(list(reversed(values)), list(reversed(ids)), 0.90)
+    assert first.u_star == second.u_star
+    assert first.accepted_count == second.accepted_count == 20
+    assert first.achieved_coverage == 1.0
+
+
+def test_threshold_requires_a_stable_id_for_every_value():
+    with pytest.raises(U1ProtocolError, match="tie-break is not"):
+        select_routing_threshold([0.1, 0.2], ["only-one"], 0.5)
+
+
+def test_threshold_refuses_empty_and_out_of_range_targets():
+    with pytest.raises(U1ProtocolError, match="at least one row"):
+        routing_threshold_rank(0, 0.9)
+    for bad in (0.0, -0.1, 1.5):
+        with pytest.raises(U1ProtocolError, match="must lie in"):
+            routing_threshold_rank(10, bad)
+
+
+def test_threshold_report_fields_are_frozen():
+    assert U.U1_THRESHOLD_REPORT_FIELDS == (
+        "target_coverage",
+        "achieved_coverage",
+        "accepted_count",
+        "threshold_tie_count",
+    )
+    result = select_routing_threshold([0.1, 0.2, 0.3], ["a", "b", "c"], 0.90)
+    for field in U.U1_THRESHOLD_REPORT_FIELDS:
+        assert hasattr(result, field)
+
+
+def test_no_library_quantile_convention_governs_the_threshold():
+    assert not hasattr(U, "U1_QUANTILE_CONVENTION")
+    assert U.U1_THRESHOLD_RULE == "empirical_order_statistic_ceil_1_based"
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "has been **removed**" in text
+
+
+# ---------------------------------------------------------------------------
+# Deterministic ECE binning
+# ---------------------------------------------------------------------------
+
+
+def test_equal_width_bins_are_deterministic_and_close_the_final_interval():
+    edges = equal_width_bin_edges()
+    assert len(edges) == 15
+    assert edges[0][0] == 0.0
+    assert edges[-1][1] == 1.0
+    # p == 1.0 must land in the final bin, not fall off the end
+    assert equal_width_bin_index(1.0) == 14
+    assert equal_width_bin_index(0.0) == 0
+    # lower edge inclusive, upper exclusive except the last
+    assert equal_width_bin_index(1 / 15) == 1
+    assert equal_width_bin_index(1 / 15 - 1e-12) == 0
+    assert U.U1_ECE_EQUAL_WIDTH_FINAL_BIN_CLOSED is True
+
+
+def test_equal_width_bin_index_refuses_out_of_range_probability():
+    for bad in (-1e-9, 1.0000001):
+        with pytest.raises(U1ProtocolError, match="outside"):
+            equal_width_bin_index(bad)
+
+
+def test_equal_mass_group_sizes_differ_by_at_most_one_and_sum_exactly():
+    for n in (15, 16, 29, 100, 473_897):
+        sizes = equal_mass_group_sizes(n)
+        assert len(sizes) == 15
+        assert sum(sizes) == n
+        assert max(sizes) - min(sizes) <= 1
+
+
+def test_equal_mass_groups_are_contiguous_and_cover_every_row():
+    n = 100
+    boundaries = equal_mass_group_boundaries(
+        [i / n for i in range(n)], [f"w{i:03d}" for i in range(n)]
+    )
+    assert boundaries[0][0] == 0
+    assert boundaries[-1][1] == n
+    for (_, stop), (start, _) in zip(boundaries, boundaries[1:]):
+        assert stop == start
+
+
+def test_equal_mass_refuses_too_few_rows_and_mismatched_ids():
+    with pytest.raises(U1ProtocolError, match="cannot fill"):
+        equal_mass_group_sizes(14)
+    with pytest.raises(U1ProtocolError, match="resolved by stable_id"):
+        equal_mass_group_boundaries([0.1, 0.2], ["a"])
+
+
+def test_equal_mass_semantics_are_not_library_delegated():
+    assert U.U1_ECE_LIBRARY_QUANTILE_PERMITTED is False
+    assert U.U1_ECE_EQUAL_MASS_SORT_KEY == ("calibrated_probability", "stable_id")
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "never delegated to a library-default quantile" in text
+
+
+# ---------------------------------------------------------------------------
+# Dependence and bootstrap claim boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_windows_are_not_claimed_to_be_independent_evidence():
+    assert U.U1_WINDOWS_ARE_INDEPENDENT_EVIDENCE is False
+    assert U.U1_INFERENTIAL_UNIT == "subject"
+    assert U.U1_INFERENTIAL_UNIT_COUNT == 12
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "effective independent support\nremains subject-level" in text
+    assert "does **not** remove within-subject dependence" in text
+    # the discarded claims must be gone, in any of their earlier phrasings
+    for banned in (
+        "fit variance is negligible",
+        "high-variance objection does not apply",
+        "usual objection to LOSO does not apply",
+    ):
+        assert banned not in text, banned
+
+
+def test_bootstrap_claim_boundary_is_frozen():
+    assert U.U1_BOOTSTRAP_REPLICATES == 1000
+    assert U.U1_BOOTSTRAP_SEED == 2026
+    assert U.U1_BOOTSTRAP_UNIT == "subject"
+    assert U.U1_BOOTSTRAP_REFITS_FOLDS_PER_REPLICATE is False
+    assert U.U1_BOOTSTRAP_CLAIM == (
+        "between_subject_variation_conditional_on_fitted_oof_calibration"
+    )
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "not** a complete bootstrap of calibrator re-fitting" in text
+
+
+def test_c_star_is_a_design_assumption_not_measured_capacity():
+    assert U.U1_RETAINED_COVERAGE == 0.90
+    assert U.U1_RETAINED_COVERAGE_IS_MEASURED_CAPACITY is False
+    assert U.U1_RETAINED_COVERAGE_BASIS == (
+        "a_priori_operational_design_assumption_reference_operating_point"
+    )
+    text = U.U1_PROTOCOL_PATH.read_text()
+    assert "a-priori operational design assumption" in text
+    assert "not** as measured deployment capacity" in text
+    assert "measured later in E1" in text
