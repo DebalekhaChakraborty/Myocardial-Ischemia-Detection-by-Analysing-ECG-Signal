@@ -36,7 +36,7 @@ from cardiosentinel.neural.patient_memory import (
     REPRESENTATION_DIM,
     M1DistanceStandardizer,
 )
-from tests.neural.m2_attempt1_fixtures import _plant_frozen_attempt1
+from tests.neural.m2_attempt1_fixtures import _plant_both_prior_attempts
 
 FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
 SUITE = R.CANONICAL_SUITE_ID
@@ -369,9 +369,9 @@ def _loaders(**overrides):
 
 
 def _roots(tmp_path):
-    # The recovery route verifies attempt #1 from artifacts before it runs, so
-    # a synthetic run stands up a byte-identical original attempt first.
-    _plant_frozen_attempt1(tmp_path / "runs")
+    # The recovery2 route verifies BOTH prior consumed attempts from artifacts
+    # before it runs, so a synthetic run stands up byte-identical copies first.
+    _plant_both_prior_attempts(tmp_path / "runs")
     return {
         "source_root": tmp_path / "source",
         "feature_root": tmp_path / "features",
@@ -1132,11 +1132,16 @@ def test_a_consumed_recovery_cannot_be_rerun_under_a_second_name(
             loaders=_loaders(),
         )
     # There is no public route that would let a caller pick another name, and
-    # every alternate name is refused outright.
+    # every alternate name -- including both consumed suites -- is refused.
     assert (
         "suite_id" not in inspect.signature(R.execute_canonical_development).parameters
     )
-    for name in ("m2-v1-development-two-arm-recovery2", "attempt3"):
+    for name in (
+        R.ORIGINAL_SUITE_ID,
+        R.RECOVERY1_SUITE_ID,
+        "m2-v1-development-two-arm-recovery3",
+        "attempt4",
+    ):
         with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
             R.require_canonical_suite_id(name)
 

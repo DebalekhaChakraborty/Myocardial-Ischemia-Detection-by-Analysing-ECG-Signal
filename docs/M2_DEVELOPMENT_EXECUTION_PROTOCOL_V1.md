@@ -101,6 +101,17 @@ imported by the canonical route, and no `TEST_ATTEMPT` is ever created.
 
 ## 4. One suite, two independent canonical attempts
 
+> **Two attempts are consumed.** Recovery1
+> (`m2-v1-development-two-arm-recovery1`, master `d77fbdc`) also claimed both
+> arms and failed before scoring, on a *different* defect: the feature join used
+> `isnan(output)` as proof that a row was never written, but NaN is also the
+> legitimate representation of an upstream source null, so a valid corpus raised
+> a structural error. Exactly one further recovery is permitted:
+> `m2-v1-development-two-arm-recovery2`. See
+> `docs/M2_DEVELOPMENT_RECOVERY1_FAILURE_AND_RECOVERY2_DECISION_V1.md`
+> (SHA-256 `93e53d3c8281d922823d48b73712a2a1ede1c5b0f5bc9f41694af563e1a2fca4`).
+> Every recovery2 artifact binds **both** prior lineages.
+>
 > **Attempt #1 is consumed.** The first canonical execution, suite
 > `m2-v1-development-two-arm` at master `3c1ba4c`, claimed both arms and then
 > failed during full label-blind replay, before a single row was scored, on a
@@ -116,7 +127,7 @@ imported by the canonical route, and no `TEST_ATTEMPT` is ever created.
 > `prior_attempt_test_accessed=false`.
 
 The production suite identity is **immutable**:
-`CANONICAL_SUITE_ID = "m2-v1-development-two-arm-recovery1"`. There is no public
+`CANONICAL_SUITE_ID = "m2-v1-development-two-arm-recovery2"`. There is no public
 `suite_id` parameter and no CLI option that selects one, because a
 caller-chosen suite name would let a second "canonical" suite run under a
 different directory after the first was consumed. A non-canonical id is refused
@@ -298,6 +309,29 @@ against frozen digests before a recovery may be claimed:
 
 Any absent or mutated artifact **stops for human review**. Verification is
 read-only: nothing is repaired, replaced, normalised or inferred.
+
+## 6a-ter. Structural missingness is not a source null
+
+The join tracks **structural assignment** separately from feature **values**. An
+explicit `written` mask records every row a block assigns, and
+`require_all_rows_written()` refuses any row the join never wrote, naming its
+stream position and stable id.
+
+A legitimate source null survives the join **unchanged** as NaN. It is never
+replaced by zero, a TRAIN median, a bound or an infinity; its row is never
+dropped; its observation is never marked physically unavailable; no SQI
+threshold is created; and neither SIGNAL_V1 nor COMBINED_V1 is regenerated.
+
+The join's responsibility is identity alignment. The **existing frozen policy**
+owns what such a value means, and is unchanged:
+
+* `UNAVAILABLE_EXACT_FLAT` → `G1 = false`, G2–G6 **not applicable**; a
+  physically unavailable row is *not* counted as a G3 refusal.
+* `AVAILABLE` with a non-finite G3 feature → that feature fails the frozen
+  `np.isfinite(value) and value <= bound` rule, so `G3 = false` and the memory
+  update is refused. No imputation.
+* **M2-0** does not operate G3–G6, so an M2-G-only null changes nothing for the
+  naive control; an unavailable row remains unavailable to it too.
 
 ## 6b. Post-claim failure accounting
 

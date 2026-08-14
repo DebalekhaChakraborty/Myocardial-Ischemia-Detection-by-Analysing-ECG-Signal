@@ -211,10 +211,11 @@ def test_the_run_wraps_failures_in_the_tracker():
 # --------------------------------------------------------------------------
 
 
-def test_the_original_suite_is_permanently_consumed():
+def test_both_prior_suites_are_permanently_consumed():
     assert R.ORIGINAL_SUITE_ID == "m2-v1-development-two-arm"
-    assert R.CANONICAL_SUITE_ID == "m2-v1-development-two-arm-recovery1"
-    assert R.CANONICAL_SUITE_ID != R.ORIGINAL_SUITE_ID
+    assert R.RECOVERY1_SUITE_ID == "m2-v1-development-two-arm-recovery1"
+    assert R.CANONICAL_SUITE_ID == "m2-v1-development-two-arm-recovery2"
+    assert len({R.ORIGINAL_SUITE_ID, R.RECOVERY1_SUITE_ID, R.CANONICAL_SUITE_ID}) == 3
 
 
 def test_no_public_suite_id_override_and_no_alternate_names():
@@ -222,7 +223,10 @@ def test_no_public_suite_id_override_and_no_alternate_names():
     assert "suite_id" not in parameters
     with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
         R.require_canonical_suite_id(R.ORIGINAL_SUITE_ID)
-    for name in ("m2-v1-development-two-arm-recovery2", "attempt3", "recovery1-2"):
+    # Recovery1 is consumed and can never be reused.
+    with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
+        R.require_canonical_suite_id(R.RECOVERY1_SUITE_ID)
+    for name in ("m2-v1-development-two-arm-recovery3", "attempt4", "recovery2-2"):
         with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
             R.require_canonical_suite_id(name)
     assert R.require_canonical_suite_id(R.CANONICAL_SUITE_ID) == R.CANONICAL_SUITE_ID
@@ -240,38 +244,59 @@ def test_the_cli_still_exposes_only_the_two_authorization_flags():
 # --------------------------------------------------------------------------
 
 
-def test_the_recovery_lineage_states_what_attempt_one_was():
+def test_the_recovery_lineage_states_what_BOTH_prior_attempts_were():
     lineage = R.recovery_lineage()
-    assert lineage["recovery_from_suite_id"] == R.ORIGINAL_SUITE_ID
-    assert lineage["recovery_suite_id"] == R.CANONICAL_SUITE_ID
-    assert lineage["recovery_reason_class"] == (
+    assert lineage["recovery_from_original_suite_id"] == R.ORIGINAL_SUITE_ID
+    assert lineage["recovery1_suite_id"] == R.RECOVERY1_SUITE_ID
+    assert lineage["recovery2_suite_id"] == R.CANONICAL_SUITE_ID
+    assert lineage["attempt1_reason_class"] == (
         "pre_scoring_partition_alignment_execution_defect"
     )
-    assert lineage["prior_attempt_scoring_started"] is False
-    assert lineage["prior_attempt_metrics_computed"] is False
-    assert lineage["prior_attempt_test_accessed"] is False
+    assert lineage["recovery1_reason_class"] == (
+        "pre_scoring_source_null_join_sentinel_defect"
+    )
+    assert lineage["attempt1_scoring_started"] is False
+    assert lineage["attempt1_metrics_computed"] is False
+    assert lineage["attempt1_test_accessed"] is False
+    # BOTH recovery1 scoring facts are preserved, neither replacing the other.
+    assert lineage["recovery1_receipt_scoring_started"] == "indeterminate"
+    assert lineage["recovery1_human_forensic_scorer_invocation_observed"] is False
+    assert lineage["recovery1_replay_completed"] is False
+    assert lineage["recovery1_metrics_computed"] is False
+    assert lineage["recovery1_test_accessed"] is False
     assert PS.validate_recovery_lineage(lineage)
 
 
-def test_the_recovery_decision_digest_matches_the_committed_document():
+def test_both_recovery_decision_digests_match_their_committed_documents():
     import hashlib
 
     from cardiosentinel.neural.patient_memory import REPOSITORY_ROOT
 
-    path = REPOSITORY_ROOT / R.RECOVERY_DECISION_DOCUMENT
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == R.RECOVERY_DECISION_SHA256
+    for document, digest in (
+        (R.RECOVERY_DECISION_DOCUMENT, R.RECOVERY_DECISION_SHA256),
+        (R.RECOVERY2_DECISION_DOCUMENT, R.RECOVERY2_DECISION_SHA256),
+    ):
+        path = REPOSITORY_ROOT / document
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == digest, document
 
 
 @pytest.mark.parametrize(
     "mutation",
     [
-        {"recovery_decision_sha256": "z" * 64},
-        {"recovery_from_suite_id": "something-else"},
-        {"recovery_suite_id": "m2-v1-development-two-arm"},
-        {"recovery_reason_class": "scientific_redesign"},
-        {"prior_attempt_scoring_started": True},
-        {"prior_attempt_metrics_computed": True},
-        {"prior_attempt_test_accessed": True},
+        {"recovery2_decision_sha256": "z" * 64},
+        {"recovery_from_original_suite_id": "something-else"},
+        {"recovery1_suite_id": "m2-v1-development-two-arm"},
+        {"recovery2_suite_id": "m2-v1-development-two-arm-recovery1"},
+        {"attempt1_reason_class": "scientific_redesign"},
+        {"recovery1_reason_class": "scientific_redesign"},
+        {"attempt1_scoring_started": True},
+        {"attempt1_metrics_computed": True},
+        {"attempt1_test_accessed": True},
+        {"recovery1_receipt_scoring_started": False},
+        {"recovery1_human_forensic_scorer_invocation_observed": True},
+        {"recovery1_replay_completed": True},
+        {"recovery1_metrics_computed": True},
+        {"recovery1_test_accessed": True},
     ],
 )
 def test_a_wrong_lineage_value_is_rejected(mutation):
@@ -296,13 +321,91 @@ def test_every_claim_bearing_artifact_requires_the_lineage():
 # --------------------------------------------------------------------------
 
 
-def test_execution_history_reports_both_attempts(tmp_path):
+def test_execution_history_reports_all_three_attempts(tmp_path):
     run_root = tmp_path / "runs"
     history = R.canonical_execution_history(run_root)
     assert history["original_attempt"]["suite_id"] == R.ORIGINAL_SUITE_ID
-    assert history["original_attempt"]["state"] == R.STATE_UNCLAIMED
+    assert history["recovery1_attempt"]["suite_id"] == R.RECOVERY1_SUITE_ID
     assert history["recovery_attempt"]["suite_id"] == R.CANONICAL_SUITE_ID
+    for key in ("original_attempt", "recovery1_attempt", "recovery_attempt"):
+        assert history[key]["state"] == R.STATE_UNCLAIMED, key
+
+
+def test_recovery2_requires_BOTH_prior_lineages(tmp_path):
+    """§17.16 -- attempt #1 alone is not enough."""
+    from tests.neural.m2_attempt1_fixtures import (
+        _plant_both_prior_attempts,
+        _plant_frozen_attempt1,
+        _plant_frozen_recovery1,
+    )
+
+    only_attempt1 = _plant_frozen_attempt1(tmp_path / "a" / "runs")
+    with pytest.raises(PS.M2PersistenceError, match="recovery1"):
+        R.require_recovery_preconditions(only_attempt1, SUITE)
+
+    only_recovery1 = _plant_frozen_recovery1(tmp_path / "b" / "runs")
+    with pytest.raises(PS.M2PersistenceError, match="attempt #1"):
+        R.require_recovery_preconditions(only_recovery1, SUITE)
+
+    both = _plant_both_prior_attempts(tmp_path / "c" / "runs")
+    history = R.require_recovery_preconditions(both, SUITE)
+    assert history["original_attempt_lineage"]["verified_from_artifacts"] is True
+    assert history["recovery1_attempt_lineage"]["verified_from_artifacts"] is True
     assert history["recovery_attempt"]["state"] == R.STATE_UNCLAIMED
+
+
+def test_a_mutated_recovery1_artifact_blocks_recovery2(tmp_path):
+    """§17.15 -- recovery1's lineage is proven, not assumed."""
+    from tests.neural.m2_attempt1_fixtures import (
+        FROZEN_RECOVERY1_STATUS,
+        _plant_frozen_attempt1,
+        _plant_frozen_recovery1,
+        _resigned_recovery1,
+    )
+
+    root = _plant_frozen_attempt1(tmp_path / "runs")
+    _plant_frozen_recovery1(
+        root, status={"M2-0": {**FROZEN_RECOVERY1_STATUS["M2-0"], "status": "COMPLETE"}}
+    )
+    with pytest.raises(PS.M2PersistenceError, match="digests to"):
+        R.require_recovery_preconditions(root, SUITE)
+
+    # A receipt claiming greater exposure is refused. Re-signing it keeps the
+    # canonical digest internally valid, so the FROZEN file digest is what
+    # catches it -- the outer guard fires before any field is inspected.
+    root2 = _plant_frozen_attempt1(tmp_path / "b" / "runs")
+    _plant_frozen_recovery1(root2, receipt=_resigned_recovery1(scoring_started=True))
+    with pytest.raises(PS.M2PersistenceError, match="receipt file digests to"):
+        R.require_recovery_preconditions(root2, SUITE)
+
+
+def test_a_recovery1_receipt_claiming_exposure_is_refused_on_its_fields(tmp_path):
+    """With the file digest relaxed, the field checks still refuse it."""
+    from tests.neural.m2_attempt1_fixtures import FROZEN_RECOVERY1_RECEIPT
+
+    for field, value, clause in (
+        ("scoring_started", True, "scoring_started"),
+        ("replay_completed", True, "replay_completed"),
+        ("test_accessed", True, "test_accessed"),
+        ("sealed_test_state", "opened", "sealed test"),
+    ):
+        payload = {**FROZEN_RECOVERY1_RECEIPT, field: value}
+        with pytest.raises(PS.M2PersistenceError, match=clause):
+            PS._require_recovery1_receipt_fields(payload)
+
+
+def test_the_recovery1_receipt_conservative_value_is_never_rewritten(tmp_path):
+    """§3 -- `indeterminate` is preserved, alongside the forensic finding."""
+    from tests.neural.m2_attempt1_fixtures import (
+        FROZEN_RECOVERY1_RECEIPT,
+        _plant_both_prior_attempts,
+    )
+
+    root = _plant_both_prior_attempts(tmp_path / "runs")
+    assert FROZEN_RECOVERY1_RECEIPT["scoring_started"] == "indeterminate"
+    proof = PS.validate_recovery1_failure_lineage(root)
+    assert proof["recovery1_receipt_scoring_started"] == "indeterminate"
+    assert proof["recovery1_human_forensic_scorer_invocation_observed"] is False
 
 
 def test_a_claimed_original_is_not_assumed_to_be_the_frozen_failure(tmp_path):
@@ -730,3 +833,86 @@ def test_the_run_marks_metrics_and_promotion_per_arm():
     assert "track.arm_result_promoted[arm] = True" in source
     assert "track.experiment_lock_promoted[arm] = True" in source
     assert "track.tracking_scorer(scorer)" in source
+
+
+# --------------------------------------------------------------------------
+# §17.17-19 -- recovery2 is the only permitted new suite
+# --------------------------------------------------------------------------
+
+
+def test_recovery2_is_the_only_permitted_new_suite():
+    """§17.17."""
+    assert R.CANONICAL_SUITE_ID == "m2-v1-development-two-arm-recovery2"
+    assert R.require_canonical_suite_id(R.CANONICAL_SUITE_ID) == R.CANONICAL_SUITE_ID
+
+
+def test_recovery1_cannot_be_reused(tmp_path):
+    """§17.18 -- the consumed recovery1 id is refused outright."""
+    with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
+        R.require_canonical_suite_id(R.RECOVERY1_SUITE_ID)
+    # And nothing was created by the refusal.
+    assert not (tmp_path / "runs").exists()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "m2-v1-development-two-arm-recovery3",
+        "m2-v1-development-two-arm-attempt4",
+        "m2-v1-development-two-arm-recovery2-2026-08-14",
+        "m2-v1-development-two-arm-recovery2-b7f1",
+        "recovery2",
+    ],
+)
+def test_recovery3_and_every_alternate_name_are_refused(name):
+    """§17.19 -- no recovery3, timestamp, random suffix or bare alias."""
+    with pytest.raises(R.M2DevelopmentRunError, match="is refused"):
+        R.require_canonical_suite_id(name)
+
+
+def test_a_claimed_recovery2_stops_rather_than_escalating(tmp_path):
+    """Nothing authorizes a further attempt after recovery2 is claimed."""
+    from tests.neural.m2_attempt1_fixtures import _plant_both_prior_attempts
+
+    run_root = _plant_both_prior_attempts(tmp_path / "runs")
+    _claim(run_root, "M2-0")
+    with pytest.raises(R.M2DevelopmentRunError, match="already"):
+        R.require_recovery_preconditions(run_root, SUITE)
+
+
+def test_the_three_attempt_history_states_are_distinct(tmp_path):
+    """§12 -- attempt #1, recovery1 and recovery2 each report their own state."""
+    from tests.neural.m2_attempt1_fixtures import _plant_both_prior_attempts
+
+    run_root = _plant_both_prior_attempts(tmp_path / "runs")
+    history = R.canonical_execution_history(run_root)
+    assert history["original_attempt"]["state"] == R.STATE_CONSUMED_FAILED_PRE_SCORING
+    assert (
+        history["recovery1_attempt"]["state"] == R.STATE_CONSUMED_FAILED_STREAM_ASSEMBLY
+    )
+    assert history["recovery_attempt"]["state"] == R.STATE_UNCLAIMED
+    assert history["original_attempt"]["lineage_verified"] is True
+    assert history["recovery1_attempt"]["lineage_verified"] is True
+    # Recovery1's two scoring facts are both surfaced.
+    assert history["recovery1_attempt"]["receipt_scoring_started"] == "indeterminate"
+    assert (
+        history["recovery1_attempt"]["human_forensic_scorer_invocation_observed"]
+        is False
+    )
+
+
+def test_a_claimed_but_unproven_recovery1_is_not_called_consumed(tmp_path):
+    """Recovery1's classification is proven from artifacts, never inferred."""
+    run_root = tmp_path / "runs"
+    for arm in R.CANONICAL_ARM_ORDER:
+        path = (
+            run_root
+            / PS.arm_experiment_id(R.RECOVERY1_SUITE_ID, arm)
+            / PS.RUN_STATUS_NAME
+        )
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"status": "FAILED_OR_INTERRUPTED"}))
+    entry = R.canonical_execution_history(run_root)["recovery1_attempt"]
+    assert entry["state"] == R.STATE_CLAIMED
+    assert entry["lineage_verified"] is False
+    assert "lineage_error" in entry

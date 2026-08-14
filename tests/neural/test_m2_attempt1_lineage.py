@@ -46,8 +46,10 @@ def test_the_fixture_reproduces_the_frozen_digests(tmp_path):
 
 
 def test_only_a_fully_verified_original_authorizes_recovery(tmp_path):
-    """§2.J -- the one positive case."""
-    run_root = _plant_frozen_attempt1(tmp_path / "runs")
+    """§2.J -- the one positive case, now needing BOTH prior lineages."""
+    from tests.neural.m2_attempt1_fixtures import _plant_both_prior_attempts
+
+    run_root = _plant_both_prior_attempts(tmp_path / "runs")
     history = R.require_recovery_preconditions(run_root, R.CANONICAL_SUITE_ID)
     assert history["original_attempt"]["state"] == R.STATE_CONSUMED_FAILED_PRE_SCORING
     assert history["original_attempt"]["lineage_verified"] is True

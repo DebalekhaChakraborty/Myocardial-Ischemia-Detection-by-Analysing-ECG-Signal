@@ -160,6 +160,31 @@ def _require_exact_stable_id_correspondence(
         )
 
 
+def require_all_rows_written(
+    written: np.ndarray, partition: str, stable_ids: np.ndarray
+) -> None:
+    """Prove every row was STRUCTURALLY assigned by the join.
+
+    Separate from the feature values on purpose. The previous implementation
+    initialised the destination with NaN and treated any remaining NaN as an
+    unwritten row -- but NaN is also the legitimate representation of an
+    upstream source null, so a valid corpus raised a structural error and
+    consumed M2 development recovery1.
+    """
+    unwritten = int(np.count_nonzero(~written))
+    if not unwritten:
+        return
+    missing = np.flatnonzero(~written)
+    raise M2FeatureJoinError(
+        f"The COMBINED_V1 {partition} join structurally assigned only "
+        f"{int(np.count_nonzero(written))} of {written.shape[0]} rows; "
+        f"{unwritten} were never written, beginning at stream positions "
+        f"{missing[:3].tolist()} "
+        f"({[str(v) for v in stable_ids[missing[:3]]]}). No row is dropped to "
+        "make the join succeed."
+    )
+
+
 def join_sqi_and_morphology_for_partition(
     store, manifest: dict[str, Any], feature_root: Path, partition: str
 ) -> dict[str, np.ndarray]:
@@ -189,6 +214,13 @@ def join_sqi_and_morphology_for_partition(
         name: np.full(rows, np.nan, dtype=np.float64)
         for name in COMBINED_NEEDED_COLUMNS
     }
+    # STRUCTURAL assignment is tracked separately from feature VALUES. Using
+    # `isnan(output)` as proof that a row was never written conflates the two,
+    # because NaN is also the legitimate representation of an upstream source
+    # null -- a spectral ratio the frozen signal contract permits to be
+    # uncomputable. That conflation consumed M2 development recovery1; see
+    # `docs/M2_DEVELOPMENT_RECOVERY1_FAILURE_AND_RECOVERY2_DECISION_V1.md`.
+    written = np.zeros(rows, dtype=bool)
 
     record_paths = combined_record_cache_paths_for_partition(feature_root, evaluated)
     expected = {str(value) for value in manifest["record_ids"]}
@@ -222,11 +254,14 @@ def join_sqi_and_morphology_for_partition(
         lookup = {value: index for index, value in enumerate(npz_ids)}
         positions = np.asarray([lookup[sid] for sid in block_ids], dtype=np.int64)
         for name, column in column_indices.items():
+            # Source values are carried through EXACTLY. A legitimate null
+            # survives as NaN; it is never replaced by zero, a TRAIN median, a
+            # bound or an infinity, and its row is never dropped. The M2 policy
+            # owns what such a value means -- for an AVAILABLE row a non-finite
+            # G3 feature already fails G3, and an unavailable row already makes
+            # G2-G6 not applicable.
             columns[name][start:end] = npz_features[positions, column]
+        written[start:end] = True
 
-    for name, values in columns.items():
-        if np.any(np.isnan(values)):
-            raise M2FeatureJoinError(
-                f"COMBINED_V1 {evaluated} join left unmatched rows for {name!r}."
-            )
+    require_all_rows_written(written, evaluated, stable_ids)
     return columns
