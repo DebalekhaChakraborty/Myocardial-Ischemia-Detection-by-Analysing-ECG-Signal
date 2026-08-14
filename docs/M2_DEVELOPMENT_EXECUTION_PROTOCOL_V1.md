@@ -261,9 +261,43 @@ receipt continues to mean exactly what it meant.
 
 The join requires exact record-set equality between the COMBINED_V1 corpus and
 the M1 stream-cache manifest **for the same partition**, refuses duplicate
-record ids and escaping cache paths, aligns strictly by frozen stable identity,
-and treats a missing, unmatched or extra row as fatal rather than inner-joining
-it away. TEST is refused before the feature manifest is opened.
+record ids and escaping cache paths, and treats a missing, unmatched or extra
+row as fatal rather than inner-joining it away. TEST is refused before the
+feature manifest is opened.
+
+Per record it additionally requires **exact stable-ID set equality in both
+directions**: the NPZ's stable-ID count matches its feature-row count, neither
+the NPZ nor the stream cache repeats an identity, every stream row has a
+feature row, and every feature row has a stream row. Requiring only the first
+direction would silently accept a feature cache holding extra rows — a corpus
+that is not the one the stream cache was built from, quietly reduced to a
+subset at join time. Order is not asserted, because the join realigns by stable
+identity and the frozen contract fixes the *stream* chronology.
+
+## 6a-bis. Attempt #1 is proven from artifacts, never inferred
+
+`consumed_failed_pre_scoring` is a scientific claim — that *this* attempt
+failed, that it failed before any row was scored, that no metric was produced
+and that the sealed test stayed shut. A claim directory proves none of that, so
+`validate_original_attempt1_failure_lineage()` verifies the preserved artifacts
+against frozen digests before a recovery may be claimed:
+
+* both original arm directories and their `M2_RUN_STATUS.json` files exist and
+  hash to `3699e656…6365d` (M2-0) and `7908130758…251` (M2-G);
+* neither original arm holds `M2_ARM_RESULT.json` or `M2_EXPERIMENT_LOCK.json`,
+  and the original suite holds no `M2_SUITE_RESULT.json`;
+* the additive receipt exists at the frozen failure-review path, its file
+  digest is `8c3a0734…b278`, its canonical `receipt_sha256` recomputes and
+  equals `31345512…92eb`;
+* the receipt names the original suite and execution SHA, is
+  `claim_bearing=false` / `canonical=false`, records the frozen pre-scoring
+  replay stage and the partition-alignment exception, and records
+  `validation_opened=true`, `scoring_started=false`, `metrics_computed=false`,
+  `test_accessed=false`, `sealed_test_state="unopened"`;
+* it binds the frozen preserved status digests and the recovery decision digest.
+
+Any absent or mutated artifact **stops for human review**. Verification is
+read-only: nothing is repaired, replaced, normalised or inferred.
 
 ## 6b. Post-claim failure accounting
 
@@ -278,6 +312,20 @@ Nothing is deleted, cleaned, renamed, reseeded or retried; staged and evidence
 files are preserved exactly as the failure left them; and a partially failed
 attempt is never made to look COMPLETE. A failure *before* any claim writes
 nothing, because no attempt was consumed.
+
+**The receipt reports REAL exposure.** Attempt #1's `scoring_started=false` is
+a frozen determination about that attempt, not a template: a future failure
+after the scorer has been invoked must say so. A transparent wrapper flags
+scoring the moment the frozen scorer is called and returns its output
+unchanged; `post_replay_evaluation_started` and per-arm `metrics_completed` are
+set at the corresponding points. Where an abrupt exception leaves a fact
+genuinely unknowable it is recorded as `indeterminate` rather than as a
+flattering `false`.
+
+**Promotion accounting is per arm.** `arm_result_promoted` and
+`experiment_lock_promoted` are maps keyed by arm, so M2-0 completing while
+M2-G fails is preserved exactly and one arm's promotion never implies the
+other's.
 
 Historical claim files from a previous attempt are never rewritten to make a
 failed state look cleaner: the forensic classification lives beside the claim,

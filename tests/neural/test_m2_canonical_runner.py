@@ -36,6 +36,7 @@ from cardiosentinel.neural.patient_memory import (
     REPRESENTATION_DIM,
     M1DistanceStandardizer,
 )
+from tests.neural.m2_attempt1_fixtures import _plant_frozen_attempt1
 
 FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
 SUITE = R.CANONICAL_SUITE_ID
@@ -368,6 +369,9 @@ def _loaders(**overrides):
 
 
 def _roots(tmp_path):
+    # The recovery route verifies attempt #1 from artifacts before it runs, so
+    # a synthetic run stands up a byte-identical original attempt first.
+    _plant_frozen_attempt1(tmp_path / "runs")
     return {
         "source_root": tmp_path / "source",
         "feature_root": tmp_path / "features",
@@ -718,8 +722,11 @@ def test_scorer_and_locks_are_verified_before_any_validation_loader(
             canonical_replay_population=forbidden,
         )
     assert opened == []
-    # And no arm was claimed.
-    assert not roots["run_root"].exists() or list(roots["run_root"].iterdir()) == []
+    # And no RECOVERY arm was claimed. (The run root also holds the planted
+    # original attempt, which must remain untouched.)
+    for arm in R.CANONICAL_ARM_ORDER:
+        assert not (roots["run_root"] / PS.arm_experiment_id(SUITE, arm)).exists()
+    assert not PS.evidence_workspace(roots["run_root"], SUITE).exists()
 
 
 def test_protocol_receipt_and_decision_digests_are_verified_before_validation():

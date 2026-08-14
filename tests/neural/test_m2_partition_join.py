@@ -279,7 +279,7 @@ def test_a_missing_stable_id_is_fatal_not_inner_joined(tmp_path):
         features = np.asarray(cached["features"])[1:]
     np.savez(path, stable_ids=ids, features=features)
     store = _FakeStore(_store_arrays())
-    with pytest.raises(J.M2FeatureJoinError, match="no COMBINED_V1 match"):
+    with pytest.raises(J.M2FeatureJoinError, match="no feature match"):
         J.join_sqi_and_morphology_for_partition(store, _manifest(), root, "validation")
 
 
@@ -502,3 +502,145 @@ def test_replay_falls_through_to_the_real_iterator_by_default():
     assert signature.parameters["stream_source"].default is None
     source = inspect.getsource(R.replay_both_arms)
     assert "iter_timeline_streams" in source
+
+
+# --------------------------------------------------------------------------
+# §7 -- EXACT stable-ID correspondence, both directions
+# --------------------------------------------------------------------------
+
+
+def _corrupt_record_npz(root: Path, record_id: str, mutate):
+    path = root / f"{record_id}.npz"
+    with np.load(path, allow_pickle=False) as cached:
+        ids = np.asarray(cached["stable_ids"])
+        features = np.asarray(cached["features"])
+    ids, features = mutate(ids, features)
+    np.savez(path, stable_ids=ids, features=features)
+
+
+def test_an_extra_feature_stable_id_is_refused(tmp_path):
+    """A corpus holding rows the stream cache does not list is not that corpus."""
+    root = _write_feature_corpus(tmp_path / "features")
+    _corrupt_record_npz(
+        root,
+        "v00002",
+        lambda ids, features: (
+            np.concatenate(
+                [ids, np.asarray(["ltstdb:v00002:9:0:2500"], dtype=ids.dtype)]
+            ),
+            np.vstack([features, features[:1]]),
+        ),
+    )
+    store = _FakeStore(_store_arrays())
+    with pytest.raises(J.M2FeatureJoinError, match="absent from the stream cache"):
+        J.join_sqi_and_morphology_for_partition(store, _manifest(), root, "validation")
+
+
+def test_a_duplicate_feature_stable_id_is_refused(tmp_path):
+    root = _write_feature_corpus(tmp_path / "features")
+    _corrupt_record_npz(
+        root,
+        "v00002",
+        lambda ids, features: (
+            np.concatenate([ids, ids[:1]]),
+            np.vstack([features, features[:1]]),
+        ),
+    )
+    store = _FakeStore(_store_arrays())
+    with pytest.raises(J.M2FeatureJoinError, match="duplicate stable IDs"):
+        J.join_sqi_and_morphology_for_partition(store, _manifest(), root, "validation")
+
+
+def test_a_duplicate_stream_stable_id_is_refused(tmp_path):
+    root = _write_feature_corpus(tmp_path / "features")
+    arrays = _store_arrays()
+    ids = arrays[STABLE_ID_FILE].copy()
+    ids[1] = ids[0]  # two rows of the same stream now share an identity
+    arrays[STABLE_ID_FILE] = ids
+    with pytest.raises(J.M2FeatureJoinError, match="stream cache has duplicate"):
+        J.join_sqi_and_morphology_for_partition(
+            _FakeStore(arrays), _manifest(), root, "validation"
+        )
+
+
+def test_a_feature_row_count_mismatch_is_refused(tmp_path):
+    root = _write_feature_corpus(tmp_path / "features")
+    _corrupt_record_npz(root, "v00002", lambda ids, features: (ids, features[:-1]))
+    store = _FakeStore(_store_arrays())
+    with pytest.raises(J.M2FeatureJoinError, match="not row-aligned with itself"):
+        J.join_sqi_and_morphology_for_partition(store, _manifest(), root, "validation")
+
+
+def test_feature_rows_in_a_different_order_still_align(tmp_path):
+    """Order is not asserted: the join realigns by stable identity."""
+    root = _write_feature_corpus(tmp_path / "features")
+    baseline = J.join_sqi_and_morphology_for_partition(
+        _FakeStore(_store_arrays()), _manifest(), root, "validation"
+    )
+    _corrupt_record_npz(
+        root,
+        "v00001",
+        lambda ids, features: (ids[::-1].copy(), features[::-1].copy()),
+    )
+    permuted = J.join_sqi_and_morphology_for_partition(
+        _FakeStore(_store_arrays()), _manifest(), root, "validation"
+    )
+    for name, values in baseline.items():
+        assert np.array_equal(values, permuted[name]), name
+
+
+# --------------------------------------------------------------------------
+# §8 -- a REAL on-disk M1RowStore, through the real memmap read path
+# --------------------------------------------------------------------------
+
+
+def _write_real_store(directory: Path):
+    """Create a genuine `M1RowStore` on disk with the existing writer.
+
+    Uses the production `M1StoreSpec`/`M1RowStore(create=True)` writer and then
+    reopens through the real `create=False` memmap loader. No production
+    behaviour is invented, and `load_stream_store`'s frozen manifest identities
+    are deliberately not faked: this covers the store layer beneath the join,
+    which is where the join actually reads from.
+    """
+    from cardiosentinel.neural.m1_store import M1RowStore, M1StoreSpec
+
+    arrays = _store_arrays()
+    rows = arrays[RECORD_ID_FILE].shape[0]
+    spec = M1StoreSpec(rows=rows, representation_dim=REPRESENTATION_DIM)
+    store = M1RowStore(directory, spec, create=True)
+    for name, values in arrays.items():
+        store.array(name)[:] = values
+    store.close()
+    return M1RowStore(directory, spec, create=False)
+
+
+def test_the_join_reads_a_real_on_disk_store(tmp_path):
+    """§8 -- the same join, driven through the real memmap store."""
+    root = _write_feature_corpus(tmp_path / "features")
+    store = _write_real_store(tmp_path / "store")
+    try:
+        columns = J.join_sqi_and_morphology_for_partition(
+            store, _manifest(), root, "validation"
+        )
+    finally:
+        store.close()
+
+    indices = _combined_column_indices()
+    for position, row in enumerate(_rows_in_causal_order()):
+        for name, column in indices.items():
+            assert columns[name][position] == pytest.approx(
+                _feature_value(*row, column)
+            )
+
+
+def test_a_real_on_disk_store_still_refuses_a_train_only_corpus(tmp_path):
+    root = _write_feature_corpus(tmp_path / "features", validation=False, train=True)
+    store = _write_real_store(tmp_path / "store")
+    try:
+        with pytest.raises(J.M2FeatureJoinError, match="VALIDATION record set"):
+            J.join_sqi_and_morphology_for_partition(
+                store, _manifest(), root, "validation"
+            )
+    finally:
+        store.close()

@@ -305,35 +305,33 @@ def test_execution_history_reports_both_attempts(tmp_path):
     assert history["recovery_attempt"]["state"] == R.STATE_UNCLAIMED
 
 
-def test_a_claimed_original_reports_consumed_failed_pre_scoring(tmp_path):
+def test_a_claimed_original_is_not_assumed_to_be_the_frozen_failure(tmp_path):
+    """§2.A -- directory existence never grants `consumed_failed_pre_scoring`.
+
+    The verified positive case is proved in `test_m2_attempt1_lineage.py`
+    against attempt #1's frozen bytes.
+    """
     run_root = tmp_path / "runs"
     for arm in R.CANONICAL_ARM_ORDER:
         run_dir = run_root / PS.arm_experiment_id(R.ORIGINAL_SUITE_ID, arm)
         run_dir.mkdir(parents=True)
         (run_dir / PS.RUN_STATUS_NAME).write_text(json.dumps({"status": "STARTED"}))
-    history = R.canonical_execution_history(run_root)
-    original = history["original_attempt"]
-    assert original["state"] == R.STATE_CONSUMED_FAILED_PRE_SCORING
-    assert original["scoring_started"] is False
-    assert original["metrics_computed"] is False
-    assert original["test_accessed"] is False
+    original = R.canonical_execution_history(run_root)["original_attempt"]
+    assert original["state"] == R.STATE_CLAIMED
+    assert original["lineage_verified"] is False
+    assert "lineage_error" in original
+    # And nothing asserts an exposure it has not proven.
+    assert "scoring_started" not in original
 
 
 def test_a_claimed_recovery_blocks_a_second_recovery_run(tmp_path):
+    """Refused whether or not the original lineage would have verified."""
     run_root = tmp_path / "runs"
     _claim(run_root, "M2-0")
-    with pytest.raises(R.M2DevelopmentRunError, match="already"):
+    with pytest.raises(
+        (R.M2DevelopmentRunError, PS.M2PersistenceError), match="already|proven"
+    ):
         R.require_recovery_preconditions(run_root, SUITE)
-
-
-def test_recovery_preconditions_pass_on_a_clean_recovery(tmp_path):
-    run_root = tmp_path / "runs"
-    for arm in R.CANONICAL_ARM_ORDER:
-        run_dir = run_root / PS.arm_experiment_id(R.ORIGINAL_SUITE_ID, arm)
-        run_dir.mkdir(parents=True)
-        (run_dir / PS.RUN_STATUS_NAME).write_text(json.dumps({"status": "STARTED"}))
-    history = R.require_recovery_preconditions(run_root, SUITE)
-    assert history["recovery_attempt"]["state"] == R.STATE_UNCLAIMED
 
 
 def test_a_failed_recovery_is_reported_as_failed(tmp_path):
@@ -351,7 +349,10 @@ def test_a_failed_recovery_is_reported_as_failed(tmp_path):
     history = R.canonical_execution_history(run_root)
     assert history["recovery_attempt"]["state"] == R.STATE_FAILED
     assert history["recovery_attempt"]["failure_receipt_present"] is True
-    with pytest.raises(R.M2DevelopmentRunError, match="attempt is consumed"):
+    # And no further recovery is implicitly authorized.
+    with pytest.raises(
+        (R.M2DevelopmentRunError, PS.M2PersistenceError), match="consumed|proven"
+    ):
         R.require_recovery_preconditions(run_root, SUITE)
 
 
@@ -393,3 +394,237 @@ def test_this_module_opens_no_real_development_data():
         if isinstance(node, ast.Call)
     }
     assert not (called & forbidden), sorted(called & forbidden)
+
+
+# --------------------------------------------------------------------------
+# §3-§6 -- a failure receipt reports REAL exposure, not a hard-coded optimism
+# --------------------------------------------------------------------------
+
+
+def _tracker(tmp_path, **fields):
+    tracker = R._AttemptTracker(run_root=tmp_path / "runs", suite_id=SUITE)
+    tracker.claimed_arms = list(R.CANONICAL_ARM_ORDER)
+    for name, value in fields.items():
+        setattr(tracker, name, value)
+    return tracker
+
+
+def test_a_failure_before_scoring_records_scoring_started_false(tmp_path):
+    """§13.7."""
+    tracker = _tracker(tmp_path, stage="development_source_integrity")
+    exposure = tracker.exposure()
+    assert exposure["scoring_started"] is False
+    assert exposure["post_replay_evaluation_started"] is False
+    assert exposure["metrics_computed_or_completed"] is False
+
+
+def test_a_failure_after_the_first_scorer_call_records_scoring_started_true(tmp_path):
+    """§13.8 -- the wrapper flags exposure the moment the scorer is invoked."""
+    calls = []
+
+    class _Scorer:
+        def __call__(self, representation, d_long):
+            calls.append((representation, d_long))
+            return 0.1234567890123456
+
+    tracker = _tracker(tmp_path, stage="full_label_blind_replay_both_arms")
+    assert tracker.scoring_started is False
+    wrapped = tracker.tracking_scorer(_Scorer())
+    wrapped([1.0, 2.0], 0.5)
+    assert tracker.scoring_started is True
+    assert tracker.exposure()["scoring_started"] is True
+    assert calls == [([1.0, 2.0], 0.5)]
+
+
+def test_the_tracking_wrapper_changes_no_numeric(tmp_path):
+    """§13.19 -- scorer parity: the wrapper returns the exact same object."""
+    import numpy as np
+
+    sentinel = object()
+
+    class _Scorer:
+        weights = "frozen"
+
+        def __call__(self, representation, d_long):
+            return sentinel
+
+        def identity(self):
+            return {"retained_lock_sha256": "x"}
+
+    scorer = _Scorer()
+    wrapped = _tracker(tmp_path).tracking_scorer(scorer)
+    assert wrapped(np.zeros(3), 0.0) is sentinel
+    # Attribute access passes straight through to the frozen scorer.
+    assert wrapped.identity() == scorer.identity()
+    assert wrapped.weights == "frozen"
+
+    # And on real float values, byte-for-byte equality.
+    class _Real:
+        def __call__(self, representation, d_long):
+            return float(np.sqrt(np.mean(np.asarray(representation) ** 2)) + d_long)
+
+    real = _Real()
+    tracked = _tracker(tmp_path).tracking_scorer(real)
+    for vector in (np.array([0.1, 0.2, 0.3]), np.array([1e-17, np.pi, -1234.5])):
+        assert tracked(vector, 0.75).hex() == real(vector, 0.75).hex()
+
+
+def test_an_unfinished_replay_records_scoring_as_indeterminate(tmp_path):
+    """A mid-replay exception cannot honestly claim scoring never started."""
+    tracker = _tracker(
+        tmp_path,
+        stage="full_label_blind_replay_both_arms",
+        validation_opened=True,
+    )
+    assert tracker.exposure()["scoring_started"] == PS.INDETERMINATE
+
+
+def test_a_failure_during_post_replay_evidence_records_evaluation_started(tmp_path):
+    """§13.9."""
+    tracker = _tracker(
+        tmp_path,
+        stage="post_replay_population_construction",
+        validation_opened=True,
+        scoring_started=True,
+        replay_completed=True,
+        post_replay_evaluation_started=True,
+    )
+    exposure = tracker.exposure()
+    assert exposure["post_replay_evaluation_started"] is True
+    assert exposure["scoring_started"] is True
+    # Evidence construction began but completed for no arm: not a confident no.
+    assert exposure["metrics_computed_or_completed"] == PS.INDETERMINATE
+
+
+def test_a_failure_after_metric_construction_never_claims_none_were_computed(tmp_path):
+    """§13.10."""
+    tracker = _tracker(
+        tmp_path,
+        stage="persist_and_promote_per_arm:M2-G",
+        validation_opened=True,
+        scoring_started=True,
+        replay_completed=True,
+        post_replay_evaluation_started=True,
+        metrics_completed={"M2-0": True},
+    )
+    exposure = tracker.exposure()
+    assert exposure["metrics_computed_or_completed"] is True
+    assert exposure["metrics_completed_per_arm"] == {"M2-0": True}
+
+    receipt = tracker.record_failure(RuntimeError("boom"))
+    assert receipt["metrics_computed_or_completed"] is True
+    assert receipt["scoring_started"] is True
+    assert receipt["metrics_completed_per_arm"] == {"M2-0": True}
+
+
+def test_the_receipt_carries_the_trackers_exposure(tmp_path):
+    tracker = _tracker(
+        tmp_path,
+        stage="full_label_blind_replay_both_arms",
+        validation_opened=True,
+        scoring_started=True,
+    )
+    for arm in R.CANONICAL_ARM_ORDER:
+        _claim(tracker.run_root, arm)
+    receipt = tracker.record_failure(RuntimeError("boom"))
+    assert receipt["scoring_started"] is True
+    assert receipt["validation_opened"] is True
+    assert receipt["replay_completed"] is False
+    assert receipt["exposure_source"] == "runtime execution tracker"
+
+
+def test_attempt_one_style_optimism_is_not_hard_coded():
+    """The old receipt asserted scoring_started=false for every future failure."""
+    source = inspect.getsource(PS.record_attempt_failure)
+    assert '"scoring_started": False' not in source
+    assert '"metrics_computed": False' not in source
+    assert "INDETERMINATE" in source
+
+
+# --------------------------------------------------------------------------
+# §4 -- promotion accounting is PER ARM
+# --------------------------------------------------------------------------
+
+
+def test_promotion_state_is_arm_specific(tmp_path):
+    """§13.11."""
+    run_root = tmp_path / "runs"
+    for arm in R.CANONICAL_ARM_ORDER:
+        _claim(run_root, arm)
+    receipt = PS.record_attempt_failure(
+        run_root,
+        SUITE,
+        exception=RuntimeError("x"),
+        stage="persist_and_promote_per_arm:M2-G",
+        claimed_arms=list(R.CANONICAL_ARM_ORDER),
+        validation_opened=True,
+        promotion_state={
+            "arm_result_promoted": {"M2-0": True, "M2-G": False},
+            "experiment_lock_promoted": {"M2-0": True, "M2-G": False},
+            "suite_result_promoted": False,
+        },
+    )
+    state = receipt["promotion_state"]
+    assert state["arm_result_promoted"] == {"M2-0": True, "M2-G": False}
+    assert state["experiment_lock_promoted"] == {"M2-0": True, "M2-G": False}
+    assert state["suite_result_promoted"] is False
+
+
+def test_m2_0_promoted_and_m2_g_failed_is_represented_exactly(tmp_path):
+    """§13.12 -- one arm promoting never implies the other did."""
+    run_root = tmp_path / "runs"
+    for arm in R.CANONICAL_ARM_ORDER:
+        _claim(run_root, arm)
+    tracker = R._AttemptTracker(run_root=run_root, suite_id=SUITE)
+    tracker.claimed_arms = list(R.CANONICAL_ARM_ORDER)
+    tracker.arm_result_promoted["M2-0"] = True
+    tracker.experiment_lock_promoted["M2-0"] = True
+    tracker.stage = "persist_and_promote_per_arm:M2-G"
+
+    receipt = tracker.record_failure(RuntimeError("M2-G failed"))
+    state = receipt["promotion_state"]
+    assert state["arm_result_promoted"]["M2-0"] is True
+    assert state["arm_result_promoted"]["M2-G"] is False
+    assert state["suite_result_promoted"] is False
+
+    # The per-arm status files agree.
+    statuses = {
+        arm: json.loads(
+            (
+                run_root / PS.arm_experiment_id(SUITE, arm) / PS.RUN_STATUS_NAME
+            ).read_text()
+        )
+        for arm in R.CANONICAL_ARM_ORDER
+    }
+    assert statuses["M2-0"]["claim_bearing_result_promoted"] is True
+    assert statuses["M2-G"]["claim_bearing_result_promoted"] is False
+    for status in statuses.values():
+        assert status["status"] == PS.STATUS_FAILED
+        assert status["canonical"] is False
+
+
+def test_a_scalar_promotion_flag_is_normalised_per_arm(tmp_path):
+    """A single boolean must never silently mean 'both arms'."""
+    run_root = tmp_path / "runs"
+    _claim(run_root, "M2-0")
+    receipt = PS.record_attempt_failure(
+        run_root,
+        SUITE,
+        exception=RuntimeError("x"),
+        stage="two_arm_suite_without_selection",
+        claimed_arms=["M2-0"],
+        validation_opened=True,
+        promotion_state={"arm_result_promoted": False},
+    )
+    assert receipt["promotion_state"]["arm_result_promoted"] == {
+        "M2-0": False,
+        "M2-G": False,
+    }
+
+
+def test_the_run_marks_metrics_and_promotion_per_arm():
+    source = inspect.getsource(R._run)
+    assert "track.metrics_completed[arm] = True" in source
+    assert "track.arm_result_promoted[arm] = True" in source
+    assert "track.experiment_lock_promoted[arm] = True" in source
+    assert "track.tracking_scorer(scorer)" in source
