@@ -18,6 +18,8 @@ from cardiosentinel.neural.u1_protocol import (
     assign_calibration_folds,
     equal_mass_group_boundaries,
     equal_mass_group_sizes,
+    equal_mass_groups,
+    equal_mass_sort_order,
     equal_width_bin_edges,
     equal_width_bin_index,
     fold_assignment_digest,
@@ -599,7 +601,9 @@ def test_equal_mass_groups_are_contiguous_and_cover_every_row():
 def test_equal_mass_refuses_too_few_rows_and_mismatched_ids():
     with pytest.raises(U1ProtocolError, match="cannot fill"):
         equal_mass_group_sizes(14)
-    with pytest.raises(U1ProtocolError, match="resolved by stable_id"):
+    # message unified across both helpers during hardening; the refusal is the
+    # same one, now reporting the counts that disagreed
+    with pytest.raises(U1ProtocolError, match="tie-break is not"):
         equal_mass_group_boundaries([0.1, 0.2], ["a"])
 
 
@@ -653,3 +657,180 @@ def test_c_star_is_a_design_assumption_not_measured_capacity():
     assert "a-priori operational design assumption" in text
     assert "not** as measured deployment capacity" in text
     assert "measured later in E1" in text
+
+
+# ---------------------------------------------------------------------------
+# Equal-mass ECE: the helper must actually perform the frozen sort
+# ---------------------------------------------------------------------------
+
+
+def test_equal_mass_helper_actually_sorts_by_probability_then_stable_id():
+    """The frozen order must be produced, not assumed of the caller."""
+    probabilities = [0.9, 0.1, 0.5, 0.5, 0.3]
+    ids = ["e", "a", "d", "c", "b"]
+    order = equal_mass_sort_order(probabilities, ids)
+    # ascending p, then stable_id: a(0.1) b(0.3) c(0.5) d(0.5) e(0.9)
+    assert [ids[i] for i in order] == ["a", "b", "c", "d", "e"]
+    assert [probabilities[i] for i in order] == [0.1, 0.3, 0.5, 0.5, 0.9]
+
+
+def test_equal_mass_group_membership_is_independent_of_incoming_row_order():
+    """Shuffling the input must not move a single row between groups."""
+    n = 45  # 45 = 15 * 3, exactly three rows per group
+    base_p = [round((i % 9) / 10, 4) for i in range(n)]
+    base_ids = [f"w{i:03d}" for i in range(n)]
+
+    canonical = equal_mass_groups(base_p, base_ids)
+    membership = {
+        identity: group.group_index
+        for group in canonical
+        for identity in group.member_stable_ids
+    }
+
+    order = list(range(n))
+    for shift in (1, 7, 23, 44):
+        shuffled = order[shift:] + order[:shift]
+        shuffled_groups = equal_mass_groups(
+            [base_p[i] for i in shuffled], [base_ids[i] for i in shuffled]
+        )
+        shuffled_membership = {
+            identity: group.group_index
+            for group in shuffled_groups
+            for identity in group.member_stable_ids
+        }
+        assert shuffled_membership == membership
+
+
+def test_stable_id_decides_which_side_of_a_boundary_a_tie_falls_on():
+    """A tie deliberately spanning an equal-mass boundary must be resolved."""
+    bins = 3
+    # 6 rows, 2 per group; the four 0.5 ties span the group-0/1 and 1/2 edges
+    probabilities = [0.1, 0.5, 0.5, 0.5, 0.5, 0.9]
+    ids = ["id1", "id5", "id3", "id2", "id4", "id6"]
+
+    groups = equal_mass_groups(probabilities, ids, bins=bins)
+    assert [g.count for g in groups] == [2, 2, 2]
+
+    # ascending (p, stable_id): id1(0.1) id2 id3 id4 id5 (all 0.5) id6(0.9)
+    assert groups[0].member_stable_ids == ("id1", "id2")
+    assert groups[1].member_stable_ids == ("id3", "id4")
+    assert groups[2].member_stable_ids == ("id5", "id6")
+
+    # the tie is genuinely split across a boundary by stable_id alone
+    assert groups[0].maximum_probability == 0.5
+    assert groups[1].minimum_probability == 0.5
+
+    # and reversing the input changes nothing
+    reversed_groups = equal_mass_groups(
+        list(reversed(probabilities)), list(reversed(ids)), bins=bins
+    )
+    assert [g.member_stable_ids for g in reversed_groups] == [
+        g.member_stable_ids for g in groups
+    ]
+
+
+def test_every_row_belongs_to_exactly_one_equal_mass_group():
+    n = 100
+    probabilities = [round((i * 7 % 100) / 100, 4) for i in range(n)]
+    ids = [f"w{i:03d}" for i in range(n)]
+    groups = equal_mass_groups(probabilities, ids)
+
+    seen_indices = [i for g in groups for i in g.member_indices]
+    seen_ids = [s for g in groups for s in g.member_stable_ids]
+    assert sorted(seen_indices) == list(range(n))
+    assert sorted(seen_ids) == sorted(ids)
+    assert len(seen_indices) == n == len(set(seen_indices))
+    assert sum(g.count for g in groups) == n
+
+
+def test_boundaries_refuse_unsorted_rows():
+    """Applying frozen boundaries to unsorted rows must be impossible."""
+    probabilities = [0.9, 0.1, 0.5] * 5
+    ids = [f"w{i:02d}" for i in range(15)]
+    with pytest.raises(U1ProtocolError, match="not in the frozen"):
+        equal_mass_group_boundaries(probabilities, ids)
+
+
+def test_boundaries_accept_already_sorted_rows():
+    n = 30
+    probabilities = [i / n for i in range(n)]
+    ids = [f"w{i:03d}" for i in range(n)]
+    boundaries = equal_mass_group_boundaries(probabilities, ids)
+    assert boundaries[0][0] == 0
+    assert boundaries[-1][1] == n
+    # and they agree with the sorting construction path
+    groups = equal_mass_groups(probabilities, ids)
+    assert [stop - start for start, stop in boundaries] == [g.count for g in groups]
+
+
+# ---------------------------------------------------------------------------
+# stable_id integrity
+# ---------------------------------------------------------------------------
+
+
+def test_duplicate_stable_ids_are_refused_not_deduplicated():
+    with pytest.raises(U1ProtocolError, match="Duplicate stable_ids"):
+        select_routing_threshold([0.1, 0.2, 0.3], ["a", "a", "b"], 0.5)
+    with pytest.raises(U1ProtocolError, match="Duplicate stable_ids"):
+        equal_mass_groups([0.1, 0.2, 0.3], ["a", "a", "b"], bins=3)
+
+
+def test_empty_stable_ids_are_refused():
+    for bad in ("", "   "):
+        with pytest.raises(U1ProtocolError, match="is empty"):
+            select_routing_threshold([0.1, 0.2], [bad, "b"], 0.5)
+        with pytest.raises(U1ProtocolError, match="is empty"):
+            equal_mass_sort_order([0.1, 0.2], [bad, "b"])
+
+
+def test_missing_stable_ids_are_refused_for_both_helpers():
+    with pytest.raises(U1ProtocolError, match="tie-break is not"):
+        select_routing_threshold([0.1, 0.2], ["only-one"], 0.5)
+    with pytest.raises(U1ProtocolError, match="tie-break is not"):
+        equal_mass_sort_order([0.1, 0.2], ["only-one"])
+
+
+# ---------------------------------------------------------------------------
+# numeric domain
+# ---------------------------------------------------------------------------
+
+
+def test_non_finite_uncertainty_is_refused_before_sorting():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(U1ProtocolError, match="NaN and infinities"):
+            select_routing_threshold([0.1, bad], ["a", "b"], 0.5)
+
+
+def test_out_of_range_uncertainty_is_refused():
+    for bad in (-0.001, 1.001, 2.0, -1.0):
+        with pytest.raises(U1ProtocolError, match=r"outside \[0, 1\]"):
+            select_routing_threshold([0.1, bad], ["a", "b"], 0.5)
+
+
+def test_non_finite_ece_probability_is_refused():
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(U1ProtocolError, match="NaN and infinities"):
+            equal_mass_groups([0.1, 0.2, bad], ["a", "b", "c"], bins=3)
+
+
+def test_out_of_range_ece_probability_is_refused():
+    for bad in (-1e-9, 1.0000001, 5.0):
+        with pytest.raises(U1ProtocolError, match=r"outside \[0, 1\]"):
+            equal_mass_groups([0.1, 0.2, bad], ["a", "b", "c"], bins=3)
+
+
+def test_domain_checks_do_not_disturb_the_frozen_routing_rule():
+    """Hardening added checks only; the rule itself is untouched."""
+    assert U.U1_THRESHOLD_RULE == "empirical_order_statistic_ceil_1_based"
+    assert U.U1_THRESHOLD_ACCEPTANCE == "u <= u_star"
+    assert U.U1_THRESHOLD_SORT_KEY == ("uncertainty", "stable_id")
+    n = U.U1_PRIMARY_ROW_COUNT
+    assert routing_threshold_rank(n, 0.90) == 426_508
+    values = [0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.5, 0.5, 0.9, 1.0]
+    ids = [f"w{i}" for i in range(10)]
+    result = select_routing_threshold(values, ids, 0.60)
+    assert (result.u_star, result.accepted_count, result.achieved_coverage) == (
+        0.5,
+        8,
+        0.8,
+    )

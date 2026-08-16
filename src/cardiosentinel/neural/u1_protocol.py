@@ -396,6 +396,64 @@ def validate_against_frozen_split(split_path: Path) -> dict[str, Any]:
     }
 
 
+def _require_unit_interval(values: Sequence[float], label: str) -> tuple[float, ...]:
+    """Every value must be finite and inside [0, 1] before any ordering.
+
+    NaN would make the frozen sort order undefined and silently corrupt both
+    the order statistic and the bin membership, so it is refused up front
+    rather than propagated.
+    """
+    checked: list[float] = []
+    for position, raw in enumerate(values):
+        value = float(raw)
+        if not math.isfinite(value):
+            raise U1ProtocolError(
+                f"{label}[{position}] is {raw!r}; NaN and infinities are "
+                "refused before sorting."
+            )
+        if not 0.0 <= value <= 1.0:
+            raise U1ProtocolError(f"{label}[{position}] is {value!r}, outside [0, 1].")
+        checked.append(value)
+    return tuple(checked)
+
+
+def _require_stable_ids(
+    stable_ids: Sequence[str], expected_count: int, label: str
+) -> tuple[str, ...]:
+    """One non-empty, unique stable_id per row. Duplicates raise.
+
+    The stable_id is the frozen tie-break. A duplicate would make the ordering
+    ambiguous, so it is refused -- never silently deduplicated.
+    """
+    identities = tuple(str(identity) for identity in stable_ids)
+    if len(identities) != expected_count:
+        raise U1ProtocolError(
+            f"Every {label} needs its stable_id; the tie-break is not "
+            f"optional ({len(identities)} ids for {expected_count} rows)."
+        )
+    for position, identity in enumerate(identities):
+        if not identity.strip():
+            raise U1ProtocolError(f"stable_id[{position}] is empty.")
+    duplicates = sorted({i for i in identities if identities.count(i) > 1})
+    if duplicates:
+        raise U1ProtocolError(
+            f"Duplicate stable_ids {duplicates[:5]} are refused; the frozen "
+            "ordering would be ambiguous. They are never deduplicated."
+        )
+    return identities
+
+
+class U1EqualMassGroup(NamedTuple):
+    """One frozen equal-mass ECE group, with explicit membership."""
+
+    group_index: int
+    count: int
+    member_indices: tuple[int, ...]
+    member_stable_ids: tuple[str, ...]
+    minimum_probability: float
+    maximum_probability: float
+
+
 class U1RoutingThreshold(NamedTuple):
     """A routing threshold derived by the frozen empirical order statistic."""
 
@@ -438,12 +496,8 @@ def select_routing_threshold(
     """
     if name not in (U1_DEV_THRESHOLD_NAME, U1_DEPLOY_THRESHOLD_NAME):
         raise U1ProtocolError(f"Unknown routing threshold name {name!r}.")
-    values = [float(value) for value in uncertainties]
-    identities = [str(identity) for identity in stable_ids]
-    if len(values) != len(identities):
-        raise U1ProtocolError(
-            "Every uncertainty needs its stable_id; the tie-break is not optional."
-        )
+    values = _require_unit_interval(uncertainties, "uncertainty")
+    identities = _require_stable_ids(stable_ids, len(values), "uncertainty")
     total = len(values)
     rank = routing_threshold_rank(total, target_coverage)
 
@@ -511,24 +565,89 @@ def equal_mass_group_sizes(
     )
 
 
+def equal_mass_sort_order(
+    probabilities: Sequence[float], stable_ids: Sequence[str]
+) -> tuple[int, ...]:
+    """Original row positions in frozen ascending `(probability, stable_id)`.
+
+    This is the one place the frozen equal-mass ordering is defined. Both the
+    boundary check and the group construction below go through it, so the
+    sort can never drift from the protocol text.
+    """
+    values = _require_unit_interval(probabilities, "calibrated probability")
+    identities = _require_stable_ids(stable_ids, len(values), "calibrated probability")
+    return tuple(
+        sorted(
+            range(len(values)),
+            key=lambda index: (values[index], identities[index]),
+        )
+    )
+
+
 def equal_mass_group_boundaries(
     probabilities: Sequence[float],
     stable_ids: Sequence[str],
     bins: int = U1_ECE_BIN_COUNT,
 ) -> tuple[tuple[int, int], ...]:
-    """Half-open [start, stop) index ranges over the stable (p, id) order."""
-    if len(probabilities) != len(stable_ids):
+    """Half-open `[start, stop)` ranges over the frozen `(p, stable_id)` order.
+
+    The supplied rows must ALREADY be in that order: applying these ranges to
+    unsorted rows would silently produce bins that are not the frozen
+    equal-mass bins, so unsorted input raises instead of being accepted. Use
+    `equal_mass_groups()` to sort and build membership in one step.
+    """
+    order = equal_mass_sort_order(probabilities, stable_ids)
+    if order != tuple(range(len(order))):
         raise U1ProtocolError(
-            "Every probability needs its stable_id; ties spanning a group "
-            "boundary are resolved by stable_id."
+            "Rows are not in the frozen (calibrated_probability, stable_id) "
+            "order, so these boundaries would not describe the frozen "
+            "equal-mass bins. Use equal_mass_groups() instead of sorting by "
+            "hand."
         )
-    sizes = equal_mass_group_sizes(len(probabilities), bins)
+    sizes = equal_mass_group_sizes(len(order), bins)
     boundaries: list[tuple[int, int]] = []
     start = 0
     for size in sizes:
         boundaries.append((start, start + size))
         start += size
     return tuple(boundaries)
+
+
+def equal_mass_groups(
+    probabilities: Sequence[float],
+    stable_ids: Sequence[str],
+    bins: int = U1_ECE_BIN_COUNT,
+) -> tuple[U1EqualMassGroup, ...]:
+    """Build the frozen equal-mass ECE groups, sorting the rows itself.
+
+    Membership is returned explicitly, so a caller never has to combine index
+    ranges with an ordering of its own -- which is exactly how unsorted rows
+    would otherwise slip into bins claiming to be the frozen ones. Incoming
+    row order is irrelevant: membership depends only on
+    `(calibrated_probability, stable_id)`.
+    """
+    order = equal_mass_sort_order(probabilities, stable_ids)
+    values = tuple(float(value) for value in probabilities)
+    identities = tuple(str(identity) for identity in stable_ids)
+    sizes = equal_mass_group_sizes(len(order), bins)
+
+    groups: list[U1EqualMassGroup] = []
+    start = 0
+    for group_index, size in enumerate(sizes):
+        members = order[start : start + size]
+        member_values = [values[index] for index in members]
+        groups.append(
+            U1EqualMassGroup(
+                group_index=group_index,
+                count=size,
+                member_indices=tuple(members),
+                member_stable_ids=tuple(identities[index] for index in members),
+                minimum_probability=min(member_values),
+                maximum_probability=max(member_values),
+            )
+        )
+        start += size
+    return tuple(groups)
 
 
 def u1_protocol_identity() -> dict[str, Any]:
