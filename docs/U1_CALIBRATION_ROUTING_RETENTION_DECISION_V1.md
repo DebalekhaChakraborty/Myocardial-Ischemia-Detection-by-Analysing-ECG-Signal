@@ -163,9 +163,16 @@ Accepted-population discrimination at `u_star_dev`, exactly as persisted:
 | accepted specificity | `0.9997091737650701` |
 | accepted PPV | `0.06201550387596899` |
 | accepted NPV | `0.9755053602546092` |
-| accepted true positives | 8 |
+| **accepted positive-label windows** (the sensitivity denominator) | **10,452** |
+| accepted true-positive detections | 8 |
 | accepted false negatives | 10,444 |
-| label positives in the population | 21,628 |
+| positive-label windows in the PRIMARY population | 21,628 |
+
+Accepted sensitivity is computed over the **accepted** positive-label windows:
+`8 / (8 + 10,444) = 8 / 10,452 = 0.0007654037504783774`. The PRIMARY total of
+**21,628 positive-label windows is the population count, not this denominator** —
+the remaining 11,176 positive-label windows were escalated and are therefore not
+part of the accepted population at all.
 
 Subject-level (n = 12, the inferential unit): macro coverage 0.8789353968217225,
 macro escalation 0.1210646031782775, macro accepted risk 0.025130228890384968,
@@ -182,15 +189,23 @@ calibration**; folds were not refitted per replicate.
 ## 6. Interpretation — what the low accepted risk does and does not mean
 
 The low overall accepted risk **MUST NOT be interpreted in isolation.** The
-DEVELOPMENT population is strongly class imbalanced: 21,628 positives against
-452,269 negatives. An accepted population that is almost entirely negative will
-show low error rate and high specificity whether or not the router is useful.
+DEVELOPMENT population is strongly class imbalanced: 21,628 positive-label
+windows against 452,269 negative-label windows. An accepted population that is
+almost entirely negative will show low error rate and high specificity whether
+or not the router is useful.
 
 At `c_star = 0.90` the router disproportionately escalates positive-label
-windows — 51.67 % of positives against 8.01 % of negatives — and the locally
-accepted population retains **8 true positives out of 21,628**, an accepted
-sensitivity of `0.0007654037504783774`. Almost all detected ischemia is routed
-away; what stays local is overwhelmingly the easy negative mass.
+windows — 51.67 % of positive-label windows against 8.01 % of negative-label
+windows. Of the **21,628 positive-label windows in the PRIMARY population**, the
+router escalates 51.67 %, leaving **10,452 positive-label windows locally
+accepted**. Only **8** of those accepted positive-label windows are
+**true-positive detections** and **10,444** are false negatives, yielding
+accepted sensitivity `8 / 10,452 = 0.0007654037504783774`.
+
+A positive-label window is not the same thing as a true-positive detection: the
+label says ischemia is present, the detection says the frozen classifier fired.
+Almost all detected ischemia is routed away; what stays local is overwhelmingly
+the easy negative mass.
 
 Therefore this decision does **NOT** claim:
 

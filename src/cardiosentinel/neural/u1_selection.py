@@ -56,7 +56,7 @@ U1_RETENTION_DECISION_PATH: Final = (
     REPOSITORY_ROOT / "docs" / f"{U1_RETENTION_DECISION_NAME}.md"
 )
 U1_RETENTION_DECISION_SHA256: Final = (
-    "ff5f121bf1a247d66762148eef87f91ff4cf62bf22979c9c10e2deda21889a9f"
+    "9d8436f2b7d2c303aeeb03e438c60fb8110f7d06d0bbd589f5be65ea8f80cb7b"
 )
 
 # ---------------------------------------------------------------------------

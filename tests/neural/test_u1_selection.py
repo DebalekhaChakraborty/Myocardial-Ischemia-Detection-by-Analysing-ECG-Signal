@@ -375,6 +375,65 @@ def _canonical(name: str) -> dict:
     return json.loads(path.read_text())
 
 
+def _u_star_dev_point() -> dict:
+    """The persisted c_star = 0.90 risk-coverage point, read-only.
+
+    Nothing is recomputed from the per-row evidence: this reads the promoted
+    artifact and checks only that its own recorded counts agree with each other.
+    """
+    oof = _canonical("U1_OOF_RESULT.json")
+    points = [
+        point
+        for point in oof["risk_coverage"]["points"]
+        if point["target_coverage"] == S.U1_EVALUATED_COVERAGE
+    ]
+    assert len(points) == 1
+    return points[0]
+
+
+def test_accepted_sensitivity_denominator_is_the_accepted_positive_windows():
+    """8 / 10,452, never 8 / 21,628.
+
+    The PRIMARY total is the population count. The accepted-sensitivity
+    denominator is the *accepted* positive-label windows, which is a strictly
+    smaller set because the router escalated the rest -- and the two ratios are
+    genuinely different numbers, so conflating them misreports the result.
+    """
+    point = _u_star_dev_point()
+
+    true_positives = point["accepted_true_positive_count"]
+    false_negatives = point["accepted_false_negative_count"]
+    accepted_positives = point["accepted_positive_count"]
+    primary_positives = point["label_positive_count"]
+
+    assert true_positives == 8
+    assert false_negatives == 10_444
+    assert accepted_positives == 10_452
+    assert primary_positives == 21_628
+
+    # The accepted positive-label windows are exactly TP + FN, and they are not
+    # the population total: 11,176 positive-label windows were escalated.
+    assert true_positives + false_negatives == accepted_positives
+    assert accepted_positives < primary_positives
+    assert primary_positives - accepted_positives == 11_176
+
+    sensitivity = true_positives / accepted_positives
+    assert sensitivity == point["accepted_sensitivity"]
+    assert sensitivity == S.U1_ACCEPTED_SENSITIVITY_AT_U_STAR_DEV
+    assert sensitivity == 0.0007654037504783774
+    # The wrong denominator yields a different number; that is the whole point.
+    assert true_positives / primary_positives != sensitivity
+
+
+def test_decision_document_states_the_denominator_unambiguously():
+    text = S.U1_RETENTION_DECISION_PATH.read_text()
+    assert "8 / 10,452 = 0.0007654037504783774" in text
+    assert "10,452 positive-label windows locally" in text
+    assert "21,628 positive-label windows in the PRIMARY population" in text
+    # positive-label window and true-positive detection are distinguished
+    assert "true-positive detections" in text
+
+
 def test_guard_proof_refuses_a_result_where_the_guard_did_not_fire():
     result = _canonical("U1_RESULT.json")
     result["routing_guards"]["flags"]["asymmetric_abstention"] = False
