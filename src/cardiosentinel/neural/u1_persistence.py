@@ -32,6 +32,7 @@ flags record it.
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 import time
@@ -479,7 +480,118 @@ def validate_u1_run_lock(
                 raise U1PersistenceError(
                     f"U1 artifact {name} does not match its lock digest."
                 )
+    if run_dir is not None:
+        # The per-row binary evidence is part of the canonical artifact, not an
+        # optional extra. A caller verifying a U1 attempt must not have to
+        # remember a second validator, so the sibling workspace is derived
+        # deterministically from the experiment id and verified here.
+        validate_u1_evidence_binding(lock, run_dir=Path(run_dir))
     return lock
+
+
+def validate_u1_evidence_binding(
+    lock: dict[str, Any], *, run_dir: Path
+) -> dict[str, Any]:
+    """Verify the sibling OOF evidence workspace against the promoted lock.
+
+    Mutating a `.npz` after the lock was written must break canonical U1
+    validation, not merely a separately-invoked store validator. The workspace
+    path is derived from `experiment_id`, so no caller supplies it and none can
+    point the check at a different directory.
+    """
+    from cardiosentinel.neural.u1_evidence_store import (
+        U1_STORE_MANIFEST_NAME,
+        U1EvidenceStoreError,
+        validate_u1_evidence_store,
+    )
+
+    workspace = u1_evidence_workspace(Path(run_dir).parent, str(lock["experiment_id"]))
+    manifest_path = workspace / U1_STORE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise U1PersistenceError(
+            f"The canonical U1 attempt binds an OOF evidence store but none is "
+            f"present at {manifest_path}."
+        )
+    try:
+        manifest = validate_u1_evidence_store(
+            json.loads(manifest_path.read_text()), root=workspace
+        )
+    except U1EvidenceStoreError as error:
+        raise U1PersistenceError(
+            f"The U1 OOF evidence store bound by this lock is not intact: {error}"
+        ) from error
+
+    if manifest["content_sha256"] != lock["oof_evidence_store_sha256"]:
+        raise U1PersistenceError(
+            f"The OOF evidence store digests to {manifest['content_sha256']!r}, "
+            f"but the lock binds {lock['oof_evidence_store_sha256']!r}. The "
+            "per-row evidence has changed since the lock was written."
+        )
+    if manifest["selected_family"] != lock["selected_family"]:
+        raise U1PersistenceError(
+            f"The evidence store records selected family "
+            f"{manifest['selected_family']!r}, the lock {lock['selected_family']!r}."
+        )
+    if manifest["fold_assignment_sha256"] != lock["fold_assignment_sha256"]:
+        raise U1PersistenceError(
+            "The evidence store's fold assignment differs from the lock's."
+        )
+    if sorted(manifest["row_groups"]) != ["challenge_metric", "primary_metric"]:
+        raise U1PersistenceError(
+            f"The evidence store carries row groups "
+            f"{sorted(manifest['row_groups'])}; PRIMARY and CHALLENGE are "
+            "separate groups and neither is optional."
+        )
+    return {
+        "binding_class": "u1_oof_evidence_binding",
+        "workspace": str(workspace),
+        "content_sha256": manifest["content_sha256"],
+        "row_group_sha256": {
+            name: entry["sha256"] for name, entry in manifest["row_groups"].items()
+        },
+        "matches_lock": True,
+    }
+
+
+def validate_canonical_u1_attempt(run_root: Path, experiment_id: str) -> dict[str, Any]:
+    """The one complete canonical verification of a promoted U1 attempt.
+
+    Result payload, every component digest, the lock and its provenance, and
+    the sibling per-row evidence store -- in one call, so a verifier cannot
+    accidentally check only part of the artifact.
+    """
+    run_dir = u1_run_directory(run_root, experiment_id)
+    result_path = run_dir / RESULT_NAME
+    lock_path = run_dir / EXPERIMENT_LOCK_NAME
+    for path in (result_path, lock_path):
+        if not path.is_file():
+            raise U1PersistenceError(f"No canonical U1 artifact at {path}.")
+
+    result = json.loads(result_path.read_text())
+    validate_u1_result_payload(result)
+    for name, digest in result["component_sha256"].items():
+        path = run_dir / name
+        if not path.is_file() or sha256_file(path) != digest:
+            raise U1PersistenceError(
+                f"U1 component {name} does not match the digest the result binds."
+            )
+    lock = validate_u1_run_lock(json.loads(lock_path.read_text()), run_dir=run_dir)
+    if (
+        result["oof_evidence_store"]["content_sha256"]
+        != (lock["oof_evidence_store_sha256"])
+    ):
+        raise U1PersistenceError(
+            "The result and the lock disagree about the OOF evidence store."
+        )
+    return {
+        "verification_class": "u1_canonical_attempt_verification",
+        "experiment_id": str(experiment_id),
+        "result_sha256": sha256_file(result_path),
+        "experiment_lock_sha256": lock["experiment_lock_sha256"],
+        "component_sha256": dict(result["component_sha256"]),
+        "oof_evidence_store_sha256": lock["oof_evidence_store_sha256"],
+        "verified": True,
+    }
 
 
 # --------------------------------------------------------------------------

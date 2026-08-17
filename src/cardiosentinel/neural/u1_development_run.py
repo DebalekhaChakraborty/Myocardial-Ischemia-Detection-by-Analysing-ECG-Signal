@@ -375,7 +375,11 @@ def m2g_input_identity(roots: dict[str, Path]) -> dict[str, Any]:
     Static frozen metadata only: the suite result, the arm result and the lock.
     No per-window row is read here, so this is safely pre-claim.
     """
-    from cardiosentinel.neural.m2_persistence import ARM_RESULT_NAME, arm_experiment_id
+    from cardiosentinel.neural.m2_persistence import (
+        ARM_RESULT_NAME,
+        EXPERIMENT_LOCK_NAME,
+        arm_experiment_id,
+    )
     from cardiosentinel.neural.m2_policy import M2_ARM_GATED
     from cardiosentinel.neural.m2_selection import (
         M2_RETAINED_SUITE_ID,
@@ -383,12 +387,12 @@ def m2g_input_identity(roots: dict[str, Path]) -> dict[str, Any]:
     )
 
     retention = validate_retained_m2_arm(Path(roots["m2_run_root"]))
-    arm_result_path = (
-        Path(roots["m2_run_root"])
-        / arm_experiment_id(M2_RETAINED_SUITE_ID, M2_ARM_GATED)
-        / ARM_RESULT_NAME
+    arm_dir = Path(roots["m2_run_root"]) / arm_experiment_id(
+        M2_RETAINED_SUITE_ID, M2_ARM_GATED
     )
+    arm_result_path = arm_dir / ARM_RESULT_NAME
     arm_result = json.loads(arm_result_path.read_text())
+    arm_lock = json.loads((arm_dir / EXPERIMENT_LOCK_NAME).read_text())
     primary = arm_result["primary_evaluation_population_identity"]
     challenge = arm_result["challenge_evaluation_population_identity"]
     replay = arm_result["replay_population_identity"]
@@ -404,6 +408,19 @@ def m2g_input_identity(roots: dict[str, Path]) -> dict[str, Any]:
         )
     if arm_result.get("test_accessed") is not False:
         raise U1DevelopmentRunError("The retained M2-G result records TEST access.")
+
+    # The M1 stream cache U1 reads the per-row recording-age strata from is
+    # already bound by M2, in two independent places. Both are carried, and a
+    # disagreement between them stops the run rather than picking one.
+    lock_cache = arm_lock.get("stream_cache_sha256")
+    replay_cache = replay.get("stream_cache_sha256")
+    if not lock_cache or lock_cache != replay_cache:
+        raise U1DevelopmentRunError(
+            f"The retained M2-G lock binds stream_cache_sha256 {lock_cache!r} "
+            f"while its replay population identity binds {replay_cache!r}. The "
+            "exact stream-cache identity the cold-start strata depend on cannot "
+            "be established. STOP FOR HUMAN REVIEW."
+        )
     return {
         "identity_class": "u1_m2g_input_identity",
         "retention": retention,
@@ -413,6 +430,12 @@ def m2g_input_identity(roots: dict[str, Path]) -> dict[str, Any]:
         "challenge_population_identity": challenge,
         "full_replay_population_identity": replay,
         "m2g_evidence_store_identity": arm_result["evidence_store_identity"],
+        "m2g_experiment_lock_sha256": arm_lock["experiment_lock_sha256"],
+        "stream_cache_sha256": lock_cache,
+        "stream_cache_identity_source": (
+            "m2g_experiment_lock.stream_cache_sha256, cross-checked against "
+            "m2g_arm_result.replay_population_identity.stream_cache_sha256"
+        ),
         # The frozen recording-age strata M2 already reported. U1 introduces no
         # cold-start rule of its own, so its strata must reproduce these counts
         # exactly -- which is how a drifted stream cache is caught rather than
@@ -422,6 +445,123 @@ def m2g_input_identity(roots: dict[str, Path]) -> dict[str, Any]:
             for stratum, entry in arm_result["cold_start_evidence"]["strata"].items()
         },
         "read_only": True,
+    }
+
+
+def require_m2g_evidence_store_lineage(
+    observed: dict[str, Any], frozen: dict[str, Any]
+) -> dict[str, Any]:
+    """A self-consistent store is not enough: it must be THE frozen store.
+
+    The retained M2-G arm result already carries the store's own manifest
+    verbatim, so the comparison is against that existing canonical identity --
+    no second digest scheme is invented here. A store that validates perfectly
+    against its own manifest but differs from the one the frozen arm result
+    binds is refused: no fit, no regeneration, no replay, no repair.
+    """
+    from cardiosentinel.neural.integrity import canonical_sha256
+
+    if not isinstance(frozen, dict) or not frozen:
+        raise U1DevelopmentRunError(
+            "The retained M2-G arm result binds no evidence-store identity; the "
+            "opened store cannot be authenticated. STOP FOR HUMAN REVIEW."
+        )
+    observed_identity = canonical_sha256(observed)
+    frozen_identity = canonical_sha256(frozen)
+    if observed_identity != frozen_identity:
+        differing = sorted(
+            key
+            for key in set(observed) | set(frozen)
+            if observed.get(key) != frozen.get(key)
+        )
+        raise U1DevelopmentRunError(
+            "The observed M2-G evidence-store identity does not equal the "
+            "identity bound by the frozen retained arm result: observed "
+            f"content_sha256 {observed.get('content_sha256')!r} against frozen "
+            f"{frozen.get('content_sha256')!r}, differing fields {differing}. "
+            "The store is internally consistent but it is not the frozen store. "
+            "No calibrator is fitted, nothing is regenerated, no M2 replay is "
+            "performed and nothing is repaired. STOP FOR HUMAN REVIEW."
+        )
+    return {
+        "lineage_class": "u1_m2g_evidence_store_lineage",
+        "identity_source": "m2g_arm_result.evidence_store_identity",
+        "content_sha256": observed["content_sha256"],
+        "row_evidence_sha256": observed["row_evidence_sha256"],
+        "schema": observed["schema"],
+        "arm": observed["arm"],
+        "row_count": observed["row_count"],
+        "canonical_identity_sha256": observed_identity,
+        "self_consistent": True,
+        "matches_frozen_arm_result_identity": True,
+        "second_digest_scheme_introduced": False,
+    }
+
+
+def require_population_identity_lineage(
+    observed: dict[str, Any], frozen: dict[str, Any], *, name: str
+) -> dict[str, Any]:
+    """Every field the observed authority issues must match the M2-bound one.
+
+    The frozen bundle identity in the M2-G arm result is the authority's own
+    identity payload plus a handful of evaluation-side keys, so requiring every
+    OBSERVED key to be present and equal in the frozen identity compares the
+    complete scientific identity -- population, partition, authority, row and
+    class counts, ordered stable-id digest, and the upstream cache or selection
+    digest -- rather than a single field. Nothing is normalised away.
+    """
+    if not isinstance(observed, dict) or not isinstance(frozen, dict) or not frozen:
+        raise U1DevelopmentRunError(
+            f"The {name} identity cannot be cross-linked to the retained M2-G "
+            "result. STOP FOR HUMAN REVIEW."
+        )
+    missing = sorted(key for key in observed if key not in frozen)
+    differing = sorted(
+        key for key in observed if key in frozen and observed[key] != frozen[key]
+    )
+    if missing or differing:
+        raise U1DevelopmentRunError(
+            f"The observed {name} identity does not match the identity bound by "
+            f"the frozen retained M2-G arm result: fields absent upstream "
+            f"{missing}, fields differing {differing}. U1 calibrates exactly the "
+            "frozen population; a disagreement is never normalised away."
+        )
+    return {
+        "lineage_class": f"u1_{name}_identity_lineage",
+        "identity_source": f"m2g_arm_result.{name}_identity",
+        "compared_fields": sorted(observed),
+        "compared_field_count": len(observed),
+        "matches_frozen_m2g_identity": True,
+    }
+
+
+def require_stream_cache_identity(
+    observed_sha256: Any, expected_sha256: str
+) -> dict[str, Any]:
+    """The cold-start bins must come from THE stream cache M2 replayed.
+
+    Aggregate stratum counts cannot detect a permutation of bin assignments
+    across rows; the cache's own content-bound digest can. The expected value
+    is the one M2 already froze -- it is never derived here, and it is never
+    re-derived by inspecting VALIDATION rows.
+    """
+    observed = str(observed_sha256)
+    if observed != str(expected_sha256):
+        raise U1DevelopmentRunError(
+            f"The M1 stream cache supplying the per-row recording-age strata "
+            f"digests to {observed!r}, not the {expected_sha256!r} the frozen "
+            "retained M2-G evidence binds. Identical stratum totals do not make "
+            "it the same artifact. No cache is derived from source, no bin is "
+            "regenerated and M1 is not replayed. STOP FOR HUMAN REVIEW."
+        )
+    return {
+        "provenance_class": "u1_cold_start_stream_cache_identity",
+        "stream_cache_sha256": observed,
+        "identity_source": "m2g_experiment_lock.stream_cache_sha256",
+        "matches_frozen_m2_identity": True,
+        "cache_derived_from_source": False,
+        "m1_replayed": False,
+        "bins_regenerated": False,
     }
 
 
@@ -551,12 +691,18 @@ def load_cold_start_bins(stream_cache_root: Path, stable_ids: tuple[str, ...]):
     """Per-row recording-age strata, from the frozen persisted M1 stream cache.
 
     Label-free by construction and read from a persisted array -- this reads a
-    frozen artifact, it does not replay a stream.
+    frozen artifact, it does not replay a stream. The repository's existing
+    `load_stream_store` is the reader, so the cache's manifest self-digest and
+    every array's content digest are re-verified by already-reviewed code
+    before a single bin is joined.
+
+    Returns the bins AND the cache's own identity. The identity check itself
+    lives in the caller, so an injected loader cannot bypass it.
     """
     from cardiosentinel.neural.m1_experiment import load_stream_store
     from cardiosentinel.neural.m1_store import COLD_START_BIN_FILE, STABLE_ID_FILE
 
-    store, _manifest = load_stream_store(Path(stream_cache_root), "validation")
+    store, manifest = load_stream_store(Path(stream_cache_root), "validation")
     try:
         cache_ids = np.asarray(store.array(STABLE_ID_FILE))
         bins = np.asarray(store.array(COLD_START_BIN_FILE))
@@ -569,7 +715,8 @@ def load_cold_start_bins(stream_cache_root: Path, stable_ids: tuple[str, ...]):
             f"{len(missing)} PRIMARY rows have no persisted recording-age "
             f"stratum, beginning {missing[:3]}."
         )
-    return np.asarray([str(bins[index[sid]]) for sid in stable_ids], dtype=np.str_)
+    joined = np.asarray([str(bins[index[sid]]) for sid in stable_ids], dtype=np.str_)
+    return joined, str(manifest["stream_cache_sha256"])
 
 
 # --------------------------------------------------------------------------
@@ -1046,8 +1193,16 @@ def _run_after_claim(
     # -- 3. Permitted M2-G DEVELOPMENT evidence, read-only. ------------------
     exposure["stage"] = "open_retained_m2g_evidence_read_only"
     exposure["per_window_evidence_opened"] = True
+    frozen_inputs = readiness["m2g_input_identity"]
     table, store_manifest = _use("load_m2g_score_table", load_m2g_score_table)(
         roots["m2g_evidence_root"]
+    )
+    # A store that validates against its own manifest is only self-consistent.
+    # This is the LINEAGE check: it must be the exact store the frozen retained
+    # arm result binds. Performed in the caller, so an injected reader cannot
+    # bypass it.
+    store_lineage = require_m2g_evidence_store_lineage(
+        store_manifest, frozen_inputs["m2g_evidence_store_identity"]
     )
     primary = _use("primary_population", _default_primary_population)(
         roots["p1_cache_root"]
@@ -1057,28 +1212,23 @@ def _run_after_claim(
     )
 
     exposure["stage"] = "prove_exact_primary_population"
-    expected = readiness["m2g_input_identity"]["primary_population_identity"]
     observed = primary.identity()
-    if observed["ordered_stable_id_sha256"] != expected["ordered_stable_id_sha256"]:
-        raise U1DevelopmentRunError(
-            "The PRIMARY population identity differs from the one the retained "
-            "M2-G result binds; U1 calibrates exactly the frozen population."
-        )
+    primary_lineage = require_population_identity_lineage(
+        observed,
+        frozen_inputs["primary_population_identity"],
+        name="primary_population",
+    )
     if observed["row_count"] != U1_PRIMARY_ROW_COUNT:
         raise U1DevelopmentRunError(
             f"The PRIMARY population holds {observed['row_count']} rows, not "
             f"the frozen {U1_PRIMARY_ROW_COUNT}."
         )
     challenge_identity = challenge.identity()
-    if (
-        challenge_identity["challenge_selection_sha256"]
-        != readiness["m2g_input_identity"]["challenge_population_identity"][
-            "challenge_selection_sha256"
-        ]
-    ):
-        raise U1DevelopmentRunError(
-            "The CHALLENGE selection digest differs from the retained M2-G one."
-        )
+    challenge_lineage = require_population_identity_lineage(
+        challenge_identity,
+        frozen_inputs["challenge_population_identity"],
+        name="challenge_population",
+    )
     require_calibration_subjects(sorted(set(primary.subject_ids)))
 
     stable_ids = tuple(primary.stable_ids)
@@ -1211,8 +1361,14 @@ def _run_after_claim(
     )
 
     exposure["stage"] = "cold_start_evidence"
-    cold_start_bins = _use("cold_start_bins", load_cold_start_bins)(
-        roots["stream_cache_root"], stable_ids
+    cold_start_bins, observed_cache_sha256 = _use(
+        "cold_start_bins", load_cold_start_bins
+    )(roots["stream_cache_root"], stable_ids)
+    # The artifact identity FIRST: identical stratum totals do not make it the
+    # same cache, so a permuted bin assignment is refused here, before the
+    # counts are ever compared.
+    cache_provenance = require_stream_cache_identity(
+        observed_cache_sha256, frozen_inputs["stream_cache_sha256"]
     )
     cold_start = cold_start_evidence(
         labels=labels,
@@ -1223,7 +1379,7 @@ def _run_after_claim(
         cold_start_bins=cold_start_bins,
         u_star=u_star_dev["u_star"],
     )
-    expected_strata = readiness["m2g_input_identity"]["cold_start_strata_window_counts"]
+    expected_strata = frozen_inputs["cold_start_strata_window_counts"]
     observed_strata = {
         stratum: entry["window_count"]
         for stratum, entry in cold_start["strata"].items()
@@ -1235,6 +1391,7 @@ def _run_after_claim(
             "definition and never re-stratifies the population."
         )
     cold_start["strata_match_frozen_m2g_counts"] = True
+    cold_start["stream_cache_provenance"] = cache_provenance
 
     exposure["stage"] = "challenge_routing_evidence"
     challenge_subjects = np.asarray(challenge.subject_ids, dtype=np.str_)
@@ -1317,6 +1474,13 @@ def _run_after_claim(
         "family_selection": selection,
         "primary_population_identity": observed,
         "challenge_population_identity": challenge_identity,
+        "input_lineage": {
+            "m2g_evidence_store": store_lineage,
+            "primary_population": primary_lineage,
+            "challenge_population": challenge_lineage,
+            "cold_start_stream_cache": cache_provenance,
+            "self_consistency_alone_accepted": False,
+        },
         "decision_equivalence_per_fold": equivalence,
         "risk_coverage": risk_coverage,
         "u_star_dev": u_star_dev,
@@ -1412,6 +1576,13 @@ def _run_after_claim(
         "experiment_identity": U1_EXPERIMENT_IDENTITY,
         "pre_claim_readiness": readiness,
         "m2g_evidence_store_identity": store_manifest,
+        "input_lineage": {
+            "m2g_evidence_store": store_lineage,
+            "primary_population": primary_lineage,
+            "challenge_population": challenge_lineage,
+            "cold_start_stream_cache": cache_provenance,
+            "self_consistency_alone_accepted": False,
+        },
         "component_sha256": {
             names["census"]: census_digest,
             names["folds"]: fold_digest,

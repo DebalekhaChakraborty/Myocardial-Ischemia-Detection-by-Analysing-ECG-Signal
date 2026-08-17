@@ -196,8 +196,13 @@ def _corpus(seed: int = 11, *, saturate: float = 0.0):
     }
 
 
-def _write_m2g_store(root: Path, corpus, *, arm: str = "M2-G") -> Path:
-    """A synthetic store in the frozen `m2_v1_evidence_store/1` format on disk."""
+def _write_m2g_store(root: Path, corpus, *, arm: str = "M2-G", scores=None) -> dict:
+    """A synthetic store in the frozen `m2_v1_evidence_store/1` format on disk.
+
+    Returns the manifest, which is exactly what a real M2-G arm result carries
+    as `evidence_store_identity` -- so a fixture can bind STORE A and point the
+    runner at STORE B.
+    """
     from cardiosentinel.data.provenance import sha256_file
     from cardiosentinel.neural.m2_evidence_store import (
         ROW_EVIDENCE_NAME,
@@ -208,7 +213,8 @@ def _write_m2g_store(root: Path, corpus, *, arm: str = "M2-G") -> Path:
     identities = np.asarray(
         list(corpus["stable_ids"]) + list(corpus["challenge_ids"]), dtype=np.str_
     )
-    scores = np.concatenate([corpus["scores"], corpus["challenge_scores"]])
+    if scores is None:
+        scores = np.concatenate([corpus["scores"], corpus["challenge_scores"]])
     total = int(identities.shape[0])
     arrays = {
         "stable_id": identities,
@@ -249,7 +255,7 @@ def _write_m2g_store(root: Path, corpus, *, arm: str = "M2-G") -> Path:
     (root / STORE_MANIFEST_NAME).write_text(
         json.dumps(manifest, indent=2, sort_keys=True)
     )
-    return root
+    return manifest
 
 
 def _primary_population(corpus):
@@ -302,7 +308,10 @@ def _roots(tmp_path: Path) -> dict[str, Path]:
     }
 
 
-def _loaders(corpus, primary, challenge, **overrides):
+SYNTHETIC_STREAM_CACHE_SHA256 = "9" * 64
+
+
+def _loaders(corpus, primary, challenge, store_manifest, **overrides):
     identity = {
         "identity_class": "u1_m2g_input_identity",
         "retention": {
@@ -321,28 +330,40 @@ def _loaders(corpus, primary, challenge, **overrides):
             stratum: int(np.count_nonzero(corpus["cold_start"] == stratum))
             for stratum in U.U1_COLD_START_STRATA
         },
+        "m2g_evidence_store_identity": store_manifest,
+        "m2g_experiment_lock_sha256": U.U1_M2G_LOCK_SHA256,
+        "stream_cache_sha256": SYNTHETIC_STREAM_CACHE_SHA256,
         "read_only": True,
     }
     loaders = {
         "m2g_input_identity": lambda _roots: identity,
         "primary_population": lambda _root: primary,
         "challenge_population": lambda _root: challenge,
-        "cold_start_bins": lambda _root, stable_ids: corpus["cold_start"],
+        "cold_start_bins": lambda _root, stable_ids: (
+            corpus["cold_start"],
+            SYNTHETIC_STREAM_CACHE_SHA256,
+        ),
     }
     loaders.update(overrides)
     return loaders
 
 
-def _execute(tmp_path, corpus, **overrides):
+def _execute(tmp_path, corpus, *, store_manifest=None, **overrides):
     roots = _roots(tmp_path)
-    _write_m2g_store(roots["m2g_evidence_root"], corpus)
+    written = _write_m2g_store(roots["m2g_evidence_root"], corpus)
     primary = _primary_population(corpus)
     challenge = _challenge_population(corpus)
     return R.execute_canonical_u1_development(
         expected_git_sha=GIT_SHA,
         execute=True,
         _roots=roots,
-        _loaders=_loaders(corpus, primary, challenge, **overrides),
+        _loaders=_loaders(
+            corpus,
+            primary,
+            challenge,
+            written if store_manifest is None else store_manifest,
+            **overrides,
+        ),
     )
 
 
@@ -388,13 +409,13 @@ def test_execution_requires_explicit_consent(
     tmp_path, corpus, frozen_runtime, synthetic_frozen_populations
 ):
     roots = _roots(tmp_path)
-    _write_m2g_store(roots["m2g_evidence_root"], corpus)
+    written = _write_m2g_store(roots["m2g_evidence_root"], corpus)
     primary = _primary_population(corpus)
     challenge = _challenge_population(corpus)
     plan = R.execute_canonical_u1_development(
         expected_git_sha=GIT_SHA,
         _roots=roots,
-        _loaders=_loaders(corpus, primary, challenge),
+        _loaders=_loaders(corpus, primary, challenge, written),
     )
     assert plan["executed"] is False
     assert plan["planned_execution_order"] == list(R.PLANNED_EXECUTION_ORDER)
@@ -405,7 +426,7 @@ def test_an_absent_expected_git_sha_is_refused(
     tmp_path, corpus, frozen_runtime, synthetic_frozen_populations
 ):
     roots = _roots(tmp_path)
-    _write_m2g_store(roots["m2g_evidence_root"], corpus)
+    written = _write_m2g_store(roots["m2g_evidence_root"], corpus)
     primary = _primary_population(corpus)
     challenge = _challenge_population(corpus)
     with pytest.raises(R.U1DevelopmentRunError, match="is required"):
@@ -413,7 +434,7 @@ def test_an_absent_expected_git_sha_is_refused(
             expected_git_sha=None,
             execute=True,
             _roots=roots,
-            _loaders=_loaders(corpus, primary, challenge),
+            _loaders=_loaders(corpus, primary, challenge, written),
         )
     assert not roots["run_root"].exists()
 
@@ -422,7 +443,7 @@ def test_a_mismatched_git_sha_stops_before_any_claim(
     tmp_path, corpus, frozen_runtime, synthetic_frozen_populations
 ):
     roots = _roots(tmp_path)
-    _write_m2g_store(roots["m2g_evidence_root"], corpus)
+    written = _write_m2g_store(roots["m2g_evidence_root"], corpus)
     primary = _primary_population(corpus)
     challenge = _challenge_population(corpus)
     with pytest.raises(R.U1DevelopmentRunError, match="human authorization names"):
@@ -430,7 +451,7 @@ def test_a_mismatched_git_sha_stops_before_any_claim(
             expected_git_sha="f" * 40,
             execute=True,
             _roots=roots,
-            _loaders=_loaders(corpus, primary, challenge),
+            _loaders=_loaders(corpus, primary, challenge, written),
         )
     assert not roots["run_root"].exists()
 
@@ -470,7 +491,10 @@ def test_no_per_window_evidence_is_opened_before_the_claim(
     roots = _roots(tmp_path)
     primary = _primary_population(corpus)
     challenge = _challenge_population(corpus)
-    loaders = _loaders(corpus, primary, challenge)
+    # The frozen identity exists; the STORE does not. Written somewhere the
+    # runner never looks, purely to supply a realistic bound identity.
+    written = _write_m2g_store(tmp_path / "never-opened" / "M2-G", corpus)
+    loaders = _loaders(corpus, primary, challenge, written)
 
     readiness = R.pre_claim_readiness(
         expected_git_sha=GIT_SHA, roots=roots, loaders=loaders
@@ -525,7 +549,8 @@ def test_a_mutated_evidence_store_is_refused_never_regenerated(tmp_path, corpus)
         M2EvidenceStoreError,
     )
 
-    root = _write_m2g_store(tmp_path / "evidence" / "M2-G", corpus)
+    root = tmp_path / "evidence" / "M2-G"
+    _write_m2g_store(root, corpus)
     (root / ROW_EVIDENCE_NAME).write_bytes(b"corrupted")
     with pytest.raises(M2EvidenceStoreError):
         R.load_m2g_score_table(root)
@@ -548,16 +573,18 @@ def test_primary_membership_must_match_the_retained_identity(
     tmp_path, corpus, frozen_runtime, synthetic_frozen_populations
 ):
     roots = _roots(tmp_path)
-    _write_m2g_store(roots["m2g_evidence_root"], corpus)
+    written = _write_m2g_store(roots["m2g_evidence_root"], corpus)
     primary = _primary_population(corpus)
     challenge = _challenge_population(corpus)
-    loaders = _loaders(corpus, primary, challenge)
+    loaders = _loaders(corpus, primary, challenge, written)
     identity = loaders["m2g_input_identity"](roots)
     identity["primary_population_identity"] = dict(
         identity["primary_population_identity"], ordered_stable_id_sha256="e" * 64
     )
     loaders["m2g_input_identity"] = lambda _roots: identity
-    with pytest.raises(R.U1DevelopmentRunError, match="PRIMARY population identity"):
+    with pytest.raises(
+        R.U1DevelopmentRunError, match="observed primary_population identity"
+    ):
         R.execute_canonical_u1_development(
             expected_git_sha=GIT_SHA,
             execute=True,
@@ -1525,7 +1552,10 @@ def test_restratified_cold_start_bins_are_refused(
         _execute(
             tmp_path,
             corpus,
-            cold_start_bins=lambda _root, stable_ids: drifted,
+            cold_start_bins=lambda _root, stable_ids: (
+                drifted,
+                SYNTHETIC_STREAM_CACHE_SHA256,
+            ),
         )
 
 
@@ -1610,3 +1640,449 @@ def test_the_completed_run_stops_for_human_review(executed):
     assert result["result"]["test_accessed"] is False
     assert result["result"]["sealed_test_state"] == "unopened"
     assert result["result"]["validation_accessed"] is True
+
+
+# ==========================================================================
+# Provenance closure: input lineage, not merely self-consistency
+# ==========================================================================
+
+
+def test_a_self_consistent_but_non_frozen_m2g_store_is_refused(
+    tmp_path, corpus, frozen_runtime, synthetic_frozen_populations
+):
+    """STORE A is bound; STORE B validates perfectly and must still be refused.
+
+    Both stores are internally valid, carry the same arm, the same schema and
+    the same row count. Only the score bytes differ. Self-consistency is not
+    lineage.
+    """
+    store_a = _write_m2g_store(tmp_path / "store-a" / "M2-G", corpus)
+    perturbed = np.concatenate([corpus["scores"], corpus["challenge_scores"]])
+    perturbed[0] = float(np.nextafter(perturbed[0], 0.0))
+    roots = _roots(tmp_path)
+    store_b = _write_m2g_store(roots["m2g_evidence_root"], corpus, scores=perturbed)
+
+    assert store_a["arm"] == store_b["arm"] == "M2-G"
+    assert store_a["schema"] == store_b["schema"]
+    assert store_a["row_count"] == store_b["row_count"]
+    assert store_a["content_sha256"] != store_b["content_sha256"]
+    # STORE B is genuinely valid in its own right.
+    from cardiosentinel.neural.m2_evidence_store import validate_evidence_store_manifest
+
+    validate_evidence_store_manifest(store_b, root=roots["m2g_evidence_root"])
+
+    primary = _primary_population(corpus)
+    challenge = _challenge_population(corpus)
+    with pytest.raises(
+        R.U1DevelopmentRunError,
+        match="does not equal the identity bound by the frozen retained arm result",
+    ):
+        R.execute_canonical_u1_development(
+            expected_git_sha=GIT_SHA,
+            execute=True,
+            _roots=roots,
+            _loaders=_loaders(corpus, primary, challenge, store_a),
+        )
+    run_dir = roots["run_root"] / R.CANONICAL_RUN_ID
+    assert not (run_dir / PS.FOLD_MANIFEST_NAME).exists()
+    receipt = json.loads(
+        (
+            roots["run_root"]
+            / f"{R.CANONICAL_RUN_ID}__review"
+            / PS.ATTEMPT_FAILURE_RECEIPT_NAME
+        ).read_text()
+    )
+    assert receipt["exposure"]["calibrator_fitting_started"] is False
+
+
+def test_the_exact_frozen_m2g_store_identity_is_accepted(executed):
+    result, tmp_path, _corpus_ = executed
+    lineage = result["result"]["input_lineage"]["m2g_evidence_store"]
+    assert lineage["matches_frozen_arm_result_identity"] is True
+    assert lineage["self_consistent"] is True
+    assert lineage["second_digest_scheme_introduced"] is False
+    assert lineage["identity_source"] == "m2g_arm_result.evidence_store_identity"
+    assert result["result"]["input_lineage"]["self_consistency_alone_accepted"] is False
+
+
+def test_the_store_lineage_check_compares_the_whole_canonical_identity():
+    frozen = {
+        "schema": "s",
+        "arm": "M2-G",
+        "row_count": 3,
+        "content_sha256": "a" * 64,
+        "row_evidence_sha256": "b" * 64,
+    }
+    same = dict(frozen)
+    assert R.require_m2g_evidence_store_lineage(same, frozen)["row_count"] == 3
+    # A field OUTSIDE content_sha256 still breaks lineage.
+    drifted = dict(frozen, row_evidence_sha256="c" * 64)
+    with pytest.raises(R.U1DevelopmentRunError, match="differing fields"):
+        R.require_m2g_evidence_store_lineage(drifted, frozen)
+
+
+def test_an_absent_frozen_store_identity_stops_rather_than_trusting_the_store():
+    with pytest.raises(R.U1DevelopmentRunError, match="cannot be authenticated"):
+        R.require_m2g_evidence_store_lineage({"content_sha256": "a" * 64}, {})
+
+
+def test_the_primary_identity_cross_link_compares_every_authority_field(executed):
+    result, tmp_path, corpus = executed
+    lineage = result["result"]["input_lineage"]["primary_population"]
+    primary = _primary_population(corpus)
+    assert lineage["compared_fields"] == sorted(primary.identity())
+    assert lineage["compared_field_count"] == len(primary.identity())
+    for field in (
+        "population",
+        "partition",
+        "authority",
+        "row_count",
+        "counts",
+        "ordered_stable_id_sha256",
+        "p1_embedding_cache_sha256",
+    ):
+        assert field in lineage["compared_fields"]
+
+
+def test_a_primary_identity_differing_on_the_p1_cache_digest_is_refused(corpus):
+    primary = _primary_population(corpus)
+    observed = primary.identity()
+    frozen = dict(observed, p1_embedding_cache_sha256="f" * 64)
+    with pytest.raises(R.U1DevelopmentRunError, match="fields differing"):
+        R.require_population_identity_lineage(
+            observed, frozen, name="primary_population"
+        )
+
+
+def test_a_primary_identity_field_absent_upstream_is_refused(corpus):
+    primary = _primary_population(corpus)
+    observed = primary.identity()
+    frozen = {k: v for k, v in observed.items() if k != "counts"}
+    with pytest.raises(R.U1DevelopmentRunError, match="fields absent upstream"):
+        R.require_population_identity_lineage(
+            observed, frozen, name="primary_population"
+        )
+
+
+def test_the_frozen_m2g_bundle_identity_is_a_superset_of_the_authority_identity():
+    """The cross-link is exact because M2 recorded the authority payload verbatim."""
+    roots = R.canonical_roots()
+    if not roots["m2_run_root"].is_dir():
+        pytest.skip("the retained M2 run root is not on this filesystem")
+    identity = R.m2g_input_identity(roots)
+    authority_fields = {
+        "population",
+        "partition",
+        "authority",
+        "authority_detail",
+        "row_count",
+        "counts",
+        "ordered_stable_id_sha256",
+        "p1_embedding_cache_sha256",
+        "membership_derived_from_m2_scores",
+        "binary_labels_present",
+    }
+    assert authority_fields <= set(identity["primary_population_identity"])
+    challenge_fields = {
+        "population",
+        "partition",
+        "authority",
+        "authority_detail",
+        "row_count",
+        "counts",
+        "challenge_selection_sha256",
+        "ordered_stable_id_sha256",
+        "binary_labels_invented",
+        "membership_derived_from_m2_scores",
+    }
+    assert challenge_fields <= set(identity["challenge_population_identity"])
+
+
+def test_the_challenge_identity_cross_link_compares_every_authority_field(executed):
+    result, tmp_path, corpus = executed
+    lineage = result["result"]["input_lineage"]["challenge_population"]
+    challenge = _challenge_population(corpus)
+    assert lineage["compared_fields"] == sorted(challenge.identity())
+    for field in (
+        "partition",
+        "row_count",
+        "counts",
+        "challenge_selection_sha256",
+        "ordered_stable_id_sha256",
+    ):
+        assert field in lineage["compared_fields"]
+
+
+def test_a_matching_selection_sha_alone_does_not_satisfy_the_challenge_cross_link(
+    corpus,
+):
+    challenge = _challenge_population(corpus)
+    observed = challenge.identity()
+    frozen = dict(observed, ordered_stable_id_sha256="f" * 64)
+    assert (
+        observed["challenge_selection_sha256"] == frozen["challenge_selection_sha256"]
+    )
+    with pytest.raises(R.U1DevelopmentRunError, match="fields differing"):
+        R.require_population_identity_lineage(
+            observed, frozen, name="challenge_population"
+        )
+
+
+# --------------------------------------------------------------------------
+# Cold start: counts are not an identity
+# --------------------------------------------------------------------------
+
+
+def test_the_stream_cache_identity_comes_from_the_frozen_m2g_lock():
+    roots = R.canonical_roots()
+    if not roots["m2_run_root"].is_dir():
+        pytest.skip("the retained M2 run root is not on this filesystem")
+    identity = R.m2g_input_identity(roots)
+    assert identity["stream_cache_sha256"] == (
+        "a3e39137a04ebebb3b97ef6c6c614339c990a6041cf649a0ba6e3c2d43baae18"
+    )
+    assert "m2g_experiment_lock" in identity["stream_cache_identity_source"]
+    assert "replay_population_identity" in identity["stream_cache_identity_source"]
+
+
+def _mirror_retained_m2_artifacts(destination: Path) -> Path:
+    """Copy ONLY the promoted JSON identity artifacts the binder reads.
+
+    Static already-promoted metadata, no per-window evidence, no trajectory.
+    """
+    import shutil
+
+    source = R.canonical_roots()["m2_run_root"]
+    suite = "m2-v1-development-two-arm-recovery2"
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / suite).mkdir(exist_ok=True)
+    shutil.copy2(
+        source / suite / "M2_SUITE_RESULT.json",
+        destination / suite / "M2_SUITE_RESULT.json",
+    )
+    for arm in ("M2-0", "M2-G"):
+        arm_dir = destination / f"{suite}__{arm}"
+        arm_dir.mkdir(exist_ok=True)
+        for name in ("M2_ARM_RESULT.json", "M2_EXPERIMENT_LOCK.json"):
+            shutil.copy2(source / f"{suite}__{arm}" / name, arm_dir / name)
+    return destination
+
+
+def test_a_disagreeing_stream_cache_identity_stops_rather_than_choosing_one(tmp_path):
+    """If M2's two records of the cache disagree, the proof cannot be made.
+
+    The lock's `experiment_lock_sha256` is left untouched, so the existing
+    retention binder still accepts the arm; only the cross-check between the
+    lock and the replay identity catches the drift.
+    """
+    roots = R.canonical_roots()
+    if not roots["m2_run_root"].is_dir():
+        pytest.skip("the retained M2 run root is not on this filesystem")
+    mirrored = _mirror_retained_m2_artifacts(tmp_path / "m2-identity")
+
+    intact = dict(roots, m2_run_root=mirrored)
+    assert R.m2g_input_identity(intact)["stream_cache_sha256"]
+
+    lock_path = (
+        mirrored
+        / "m2-v1-development-two-arm-recovery2__M2-G"
+        / "M2_EXPERIMENT_LOCK.json"
+    )
+    lock = json.loads(lock_path.read_text())
+    lock["stream_cache_sha256"] = "1" * 64
+    lock_path.write_text(json.dumps(lock))
+    with pytest.raises(R.U1DevelopmentRunError, match="cannot be established"):
+        R.m2g_input_identity(intact)
+
+
+def test_same_counts_with_a_permuted_cold_start_mapping_is_refused(
+    tmp_path, corpus, frozen_runtime, synthetic_frozen_populations
+):
+    """A different artifact with identical stratum totals must not pass.
+
+    The permuted cache is honestly resealed, so it is internally valid and its
+    aggregate counts are byte-identical. Only its content-bound identity
+    differs -- which is exactly what the provenance gate compares.
+    """
+    rng = np.random.default_rng(21)
+    permuted = np.asarray(rng.permutation(corpus["cold_start"]).tolist(), dtype=np.str_)
+    assert not np.array_equal(permuted, corpus["cold_start"])
+    for stratum in U.U1_COLD_START_STRATA:
+        assert int(np.count_nonzero(permuted == stratum)) == int(
+            np.count_nonzero(corpus["cold_start"] == stratum)
+        )
+    # An honestly resealed cache: its identity is the digest of its content.
+    resealed = canonical_sha256(
+        {"cold_start_bin": permuted.tolist(), "partition": "validation"}
+    )
+    assert resealed != SYNTHETIC_STREAM_CACHE_SHA256
+
+    with pytest.raises(
+        R.U1DevelopmentRunError, match="do not make it the same artifact"
+    ):
+        _execute(
+            tmp_path,
+            corpus,
+            cold_start_bins=lambda _root, stable_ids: (permuted, resealed),
+        )
+    run_dir = _roots(tmp_path)["run_root"] / R.CANONICAL_RUN_ID
+    assert not (run_dir / PS.RESULT_NAME).exists()
+    receipt = json.loads(
+        (
+            _roots(tmp_path)["run_root"]
+            / f"{R.CANONICAL_RUN_ID}__review"
+            / PS.ATTEMPT_FAILURE_RECEIPT_NAME
+        ).read_text()
+    )
+    assert receipt["failed_stage"] == "cold_start_evidence"
+
+
+def test_the_stream_cache_gate_precedes_the_aggregate_count_check():
+    provenance = R.require_stream_cache_identity("a" * 64, "a" * 64)
+    assert provenance["matches_frozen_m2_identity"] is True
+    assert provenance["m1_replayed"] is False
+    assert provenance["bins_regenerated"] is False
+    assert provenance["cache_derived_from_source"] is False
+    with pytest.raises(R.U1DevelopmentRunError, match="Identical stratum totals"):
+        R.require_stream_cache_identity("b" * 64, "a" * 64)
+
+
+def test_the_cold_start_reader_returns_the_cache_identity_it_verified():
+    """The join is separate from the gate, so an injected reader cannot skip it."""
+    import inspect
+
+    source = inspect.getsource(R.load_cold_start_bins)
+    assert "load_stream_store" in source
+    assert 'manifest["stream_cache_sha256"]' in source
+    run_source = inspect.getsource(R._run_after_claim)
+    assert "require_stream_cache_identity(" in run_source
+
+
+def test_the_completed_run_records_the_cold_start_cache_provenance(executed):
+    result, tmp_path, _corpus_ = executed
+    run_dir = _roots(tmp_path)["run_root"] / R.CANONICAL_RUN_ID
+    oof = json.loads((run_dir / PS.OOF_RESULT_NAME).read_text())
+    provenance = oof["cold_start_evidence"]["stream_cache_provenance"]
+    assert provenance["stream_cache_sha256"] == SYNTHETIC_STREAM_CACHE_SHA256
+    assert provenance["identity_source"] == "m2g_experiment_lock.stream_cache_sha256"
+    assert oof["cold_start_evidence"]["strata_match_frozen_m2g_counts"] is True
+
+
+# --------------------------------------------------------------------------
+# Output evidence is part of canonical lock validation
+# --------------------------------------------------------------------------
+
+
+def test_canonical_validation_succeeds_with_intact_sibling_evidence(executed):
+    result, tmp_path, _corpus_ = executed
+    verified = PS.validate_canonical_u1_attempt(
+        _roots(tmp_path)["run_root"], R.CANONICAL_RUN_ID
+    )
+    assert verified["verified"] is True
+    assert (
+        verified["oof_evidence_store_sha256"]
+        == (result["lock"]["oof_evidence_store_sha256"])
+    )
+    assert sorted(verified["component_sha256"]) == sorted(PS.COMPONENT_ARTIFACTS)
+
+
+def test_canonical_lock_validation_fails_after_primary_npz_mutation(executed):
+    result, tmp_path, _corpus_ = executed
+    run_root = _roots(tmp_path)["run_root"]
+    workspace = run_root / f"{R.CANONICAL_RUN_ID}__evidence"
+    (workspace / E.U1_PRIMARY_ROWS_NAME).write_bytes(b"mutated")
+    with pytest.raises(PS.U1PersistenceError, match="not intact"):
+        PS.validate_u1_run_lock(result["lock"], run_dir=run_root / R.CANONICAL_RUN_ID)
+    with pytest.raises(PS.U1PersistenceError, match="not intact"):
+        PS.validate_canonical_u1_attempt(run_root, R.CANONICAL_RUN_ID)
+
+
+def test_canonical_lock_validation_fails_after_challenge_npz_mutation(executed):
+    result, tmp_path, _corpus_ = executed
+    run_root = _roots(tmp_path)["run_root"]
+    workspace = run_root / f"{R.CANONICAL_RUN_ID}__evidence"
+    (workspace / E.U1_CHALLENGE_ROWS_NAME).write_bytes(b"mutated")
+    with pytest.raises(PS.U1PersistenceError, match="not intact"):
+        PS.validate_canonical_u1_attempt(run_root, R.CANONICAL_RUN_ID)
+
+
+def test_canonical_lock_validation_fails_after_manifest_mutation(executed):
+    result, tmp_path, _corpus_ = executed
+    run_root = _roots(tmp_path)["run_root"]
+    workspace = run_root / f"{R.CANONICAL_RUN_ID}__evidence"
+    manifest_path = workspace / E.U1_STORE_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["selected_family"] = C.FAMILY_PLATT
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(PS.U1PersistenceError, match="not intact"):
+        PS.validate_canonical_u1_attempt(run_root, R.CANONICAL_RUN_ID)
+
+
+def test_canonical_lock_validation_fails_when_the_store_digest_moves(executed):
+    """A resealed manifest is still refused: the LOCK binds the old digest."""
+    result, tmp_path, _corpus_ = executed
+    run_root = _roots(tmp_path)["run_root"]
+    workspace = run_root / f"{R.CANONICAL_RUN_ID}__evidence"
+    manifest_path = workspace / E.U1_STORE_MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text())
+    manifest["clamp_delta"] = 1e-6
+    manifest.pop("content_sha256")
+    manifest["content_sha256"] = canonical_sha256(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(
+        PS.U1PersistenceError, match="has changed since the lock was written"
+    ):
+        PS.validate_canonical_u1_attempt(run_root, R.CANONICAL_RUN_ID)
+
+
+def test_canonical_lock_validation_fails_when_the_evidence_store_is_absent(executed):
+    result, tmp_path, _corpus_ = executed
+    run_root = _roots(tmp_path)["run_root"]
+    workspace = run_root / f"{R.CANONICAL_RUN_ID}__evidence"
+    (workspace / E.U1_STORE_MANIFEST_NAME).unlink()
+    with pytest.raises(PS.U1PersistenceError, match="but none is present"):
+        PS.validate_canonical_u1_attempt(run_root, R.CANONICAL_RUN_ID)
+
+
+def test_the_lock_digest_equals_the_validated_manifest_content_identity(executed):
+    result, tmp_path, _corpus_ = executed
+    run_root = _roots(tmp_path)["run_root"]
+    workspace = run_root / f"{R.CANONICAL_RUN_ID}__evidence"
+    manifest = E.validate_u1_evidence_store(
+        json.loads((workspace / E.U1_STORE_MANIFEST_NAME).read_text()), root=workspace
+    )
+    assert manifest["content_sha256"] == result["lock"]["oof_evidence_store_sha256"]
+    binding = PS.validate_u1_evidence_binding(
+        result["lock"], run_dir=run_root / R.CANONICAL_RUN_ID
+    )
+    assert binding["matches_lock"] is True
+    assert sorted(binding["row_group_sha256"]) == [
+        "challenge_metric",
+        "primary_metric",
+    ]
+
+
+def test_the_evidence_workspace_path_is_derived_not_supplied():
+    import inspect
+
+    signature = inspect.signature(PS.validate_u1_evidence_binding)
+    assert set(signature.parameters) == {"lock", "run_dir"}
+    source = inspect.getsource(PS.validate_u1_evidence_binding)
+    assert "u1_evidence_workspace(" in source
+    assert 'lock["experiment_id"]' in source
+
+
+def test_provenance_closure_changed_no_scientific_rule():
+    assert U.U1_PROTOCOL_SHA256 == (
+        "d6235b477af278fe051822bdcccb54f985e4eceb0c6e92c1424f5e9d7d79b33b"
+    )
+    assert U.validate_u1_protocol_document() == U.U1_PROTOCOL_SHA256
+    assert U.U1_RETAINED_COVERAGE == 0.90
+    assert U.U1_CLAMP_DELTA == 1e-7
+    assert U.U1_SATURATED_FRACTION_REVIEW_BOUND == 0.01
+    assert U.U1_NLL_TIE_TOLERANCE == 1e-4
+    assert U.U1_BOOTSTRAP_REPLICATES == 1000 and U.U1_BOOTSTRAP_SEED == 2026
+    assert U.U1_CLASSIFICATION_THRESHOLD == 0.7554003000259399
+    assert U.U1_FOLD_COUNT == 12
+    assert C.U1_OPTIMIZER == "L-BFGS-B" and C.U1_OPTIMIZER_MAXITER == 500
+    assert C.U1_OPTIMIZER_GTOL == 1e-10
