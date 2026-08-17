@@ -424,6 +424,12 @@ def _require_stable_ids(
 
     The stable_id is the frozen tie-break. A duplicate would make the ordering
     ambiguous, so it is refused -- never silently deduplicated.
+
+    The uniqueness check is a single hashed pass, O(N) in time. An earlier
+    `identities.count(i)` per row was structurally correct but quadratic, and
+    at the frozen PRIMARY size (473,897 rows) it is not executable. The refusal
+    is unchanged: the same duplicated ids are reported, in the same sorted
+    order, and a duplicate is still fatal.
     """
     identities = tuple(str(identity) for identity in stable_ids)
     if len(identities) != expected_count:
@@ -431,10 +437,16 @@ def _require_stable_ids(
             f"Every {label} needs its stable_id; the tie-break is not "
             f"optional ({len(identities)} ids for {expected_count} rows)."
         )
+    seen: set[str] = set()
+    repeated: set[str] = set()
     for position, identity in enumerate(identities):
         if not identity.strip():
             raise U1ProtocolError(f"stable_id[{position}] is empty.")
-    duplicates = sorted({i for i in identities if identities.count(i) > 1})
+        if identity in seen:
+            repeated.add(identity)
+        else:
+            seen.add(identity)
+    duplicates = sorted(repeated)
     if duplicates:
         raise U1ProtocolError(
             f"Duplicate stable_ids {duplicates[:5]} are refused; the frozen "
