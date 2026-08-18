@@ -35,6 +35,32 @@ def _split_partitions() -> dict[str, list[str]]:
     }
 
 
+def _row(
+    record: str = "s20011",
+    channel: int = 0,
+    start_sample: int = 0,
+    observation_state: int | None = None,
+    *,
+    stable_id: str | None = None,
+) -> T2Row:
+    """One synthetic row whose stable_id is canonical unless deliberately broken."""
+    state = (
+        T.T2_OBSERVATION_AVAILABLE if observation_state is None else observation_state
+    )
+    end = start_sample + T.T2_WINDOW_LENGTH_SAMPLES
+    return T2Row(
+        stable_id=(
+            stable_id
+            if stable_id is not None
+            else f"ltstdb:{record}:{channel}:{start_sample}:{end}"
+        ),
+        record_id=record,
+        channel_index=channel,
+        start_sample=start_sample,
+        observation_state=state,
+    )
+
+
 def _stream(
     record: str = "s20011",
     channel: int = 0,
@@ -45,16 +71,18 @@ def _stream(
 ) -> tuple[T2Row, ...]:
     """A synthetic causal stream at the frozen 2500-sample / 1250-stride grid."""
     return tuple(
-        T2Row(
-            record_id=record,
-            channel_index=channel,
-            window_start_samples=start + index * 1250,
-            observation_state=(
-                states[index] if states is not None else T.T2_OBSERVATION_AVAILABLE
-            ),
+        _row(
+            record,
+            channel,
+            start + index * 1250,
+            states[index] if states is not None else T.T2_OBSERVATION_AVAILABLE,
         )
         for index in range(count)
     )
+
+
+def _frozen_ids(rows) -> tuple[str, ...]:
+    return tuple(row.stable_id for row in rows)
 
 
 def _document_prose() -> str:
@@ -553,7 +581,6 @@ def test_latency_is_not_part_of_scientific_selection():
 
 def test_challenge_evidence_cannot_select_the_model():
     assert T.T2_CHALLENGE_IS_SELECTION_INPUT is False
-    assert T.T2_CHALLENGE_TRAINED_ON is False
     assert T.T2_CHALLENGE_MERGED_INTO_PRIMARY is False
     assert T.T2_WEIGHTED_COMPOSITE_SCORE_PERMITTED is False
     assert T.T2_LATENCY_ADJUSTED_SCORE_PERMITTED is False
@@ -843,86 +870,6 @@ def test_primary_masking_does_not_alter_stream_chronology():
         )
 
 
-def _replay(rows):
-    ids = tuple(
-        f"{row.record_id}:{row.channel_index}:{row.window_start_samples}"
-        for row in rows
-    )
-    return ids
-
-
-def test_a_full_timeline_replay_is_accepted():
-    rows = _stream(count=8)
-    ids = _replay(rows)
-    proof = T.require_full_timeline_replay(
-        offered_rows=rows,
-        frozen_stable_ids=ids,
-        offered_stable_ids=ids,
-        stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-        expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-    )
-    assert proof["thinned"] is False
-    assert proof["row_count"] == 8
-    assert proof["stream_count"] == 1
-    assert proof["order_field"] == "start_sample"
-
-
-def test_removing_a_non_primary_row_is_refused_as_a_full_replay():
-    """Dropping a context row is exactly the failure the integrity gate exists for."""
-    rows = _stream(count=8)
-    frozen = _replay(rows)
-    thinned_rows = rows[:3] + rows[4:]
-    with pytest.raises(T2ProtocolError, match="thinned by nothing at all"):
-        T.require_full_timeline_replay(
-            offered_rows=thinned_rows,
-            frozen_stable_ids=frozen,
-            offered_stable_ids=_replay(thinned_rows),
-            stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-        )
-
-
-def test_equal_row_count_with_changed_membership_is_not_equivalence():
-    """Aggregate counts are not an identity; membership is."""
-    rows = _stream(count=8)
-    frozen = _replay(rows)
-    swapped = frozen[:-1] + ("s20011:0:999999999",)
-    with pytest.raises(T2ProtocolError, match="Equal length is not"):
-        T.require_full_timeline_replay(
-            offered_rows=rows,
-            frozen_stable_ids=frozen,
-            offered_stable_ids=swapped,
-            stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-        )
-
-
-def test_duplicate_rows_are_refused():
-    rows = _stream(count=4)
-    frozen = _replay(rows)
-    with pytest.raises(T2ProtocolError, match="repeats a stable_id"):
-        T.require_full_timeline_replay(
-            offered_rows=rows,
-            frozen_stable_ids=frozen,
-            offered_stable_ids=frozen[:-1] + (frozen[0],),
-            stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-        )
-
-
-def test_a_replay_from_the_wrong_stream_cache_is_refused():
-    rows = _stream(count=4)
-    ids = _replay(rows)
-    with pytest.raises(T2ProtocolError, match="not the\\s+frozen"):
-        T.require_full_timeline_replay(
-            offered_rows=rows,
-            frozen_stable_ids=ids,
-            offered_stable_ids=ids,
-            stream_cache_sha256="0" * 64,
-            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
-        )
-
-
 def test_primary_and_challenge_come_from_one_identical_replay():
     assert T.T2_SINGLE_CONTINUOUS_REPLAY_REQUIRED is True
     assert T.T2_MASKS_APPLIED_AFTER_SCORING is True
@@ -1062,3 +1009,206 @@ def test_test_remains_unopened_after_the_closure():
     identity = T.t2_protocol_identity()
     assert identity["test_accessed"] is False
     assert identity["sealed_test_state"] == "unopened"
+
+
+# ==========================================================================
+# Row lineage: the stable_id rides on the row, so a caller cannot attest
+# identities for rows it did not supply.
+# ==========================================================================
+
+
+def test_canonical_row_identity_carries_its_own_stable_id():
+    row = _row("s20011", 1, 1250)
+    assert row.stable_id == "ltstdb:s20011:1:1250:3750"
+    assert row.record_id == "s20011"
+    assert row.channel_index == 1
+    assert row.start_sample == 1250
+    # the conceptual name resolves deterministically to the persisted field
+    assert row.window_start_samples == row.start_sample
+    assert T.canonical_stable_id(row) == row.stable_id
+    assert T.T2_WINDOW_LENGTH_SAMPLES == 2500
+    assert T.T2_DATASET == "ltstdb"
+
+
+def test_stable_id_record_component_must_match_the_row():
+    row = _row("s20011", 0, 0, stable_id="ltstdb:s20021:0:0:2500")
+    with pytest.raises(T2ProtocolError, match="encodes record"):
+        T.require_stable_id_matches_row(row)
+
+
+def test_stable_id_channel_component_must_match_the_row():
+    row = _row("s20011", 0, 0, stable_id="ltstdb:s20011:2:0:2500")
+    with pytest.raises(T2ProtocolError, match="encodes channel"):
+        T.require_stable_id_matches_row(row)
+
+
+def test_stable_id_start_component_must_match_the_row():
+    row = _row("s20011", 0, 1250, stable_id="ltstdb:s20011:0:0:2500")
+    with pytest.raises(T2ProtocolError, match="encodes start"):
+        T.require_stable_id_matches_row(row)
+
+
+def test_stable_id_end_component_must_be_start_plus_2500():
+    row = _row("s20011", 0, 0, stable_id="ltstdb:s20011:0:0:2400")
+    with pytest.raises(T2ProtocolError, match="encodes end"):
+        T.require_stable_id_matches_row(row)
+
+
+def test_malformed_or_foreign_stable_ids_are_refused():
+    with pytest.raises(T2ProtocolError, match="malformed"):
+        T.require_stable_id_matches_row(_row(stable_id="ltstdb:s20011:0:0"))
+    with pytest.raises(T2ProtocolError, match="names dataset"):
+        T.require_stable_id_matches_row(_row(stable_id="edb:s20011:0:0:2500"))
+    with pytest.raises(T2ProtocolError, match="non-integer"):
+        T.require_stable_id_matches_row(_row(stable_id="ltstdb:s20011:x:0:2500"))
+
+
+def _verify(rows, frozen_ids, cache=None):
+    return T.require_full_timeline_replay(
+        offered_rows=rows,
+        frozen_stable_ids=frozen_ids,
+        stream_cache_sha256=cache or T.T2_TRAIN_STREAM_CACHE_SHA256,
+        expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+    )
+
+
+def test_a_correct_full_timeline_replay_still_passes():
+    rows = _stream(count=8)
+    proof = _verify(rows, _frozen_ids(rows))
+    assert proof["row_count"] == 8
+    assert proof["stream_count"] == 1
+    assert proof["thinned"] is False
+    assert proof["row_substituted"] is False
+    assert proof["stable_ids_derived_from_rows"] is True
+    assert proof["order_field"] == "start_sample"
+
+
+def test_returned_row_count_comes_from_the_actual_rows():
+    """Not from an identity vector: there is no longer one to count."""
+    rows = _stream(count=8)
+    assert _verify(rows, _frozen_ids(rows))["row_count"] == len(rows)
+    import inspect
+
+    signature = inspect.signature(T.require_full_timeline_replay)
+    assert "offered_stable_ids" not in signature.parameters
+
+
+def test_thinned_rows_with_the_full_frozen_id_vector_are_refused():
+    """The exact gap: 7 rows attested by 8 complete frozen ids."""
+    rows = _stream(count=8)
+    frozen = _frozen_ids(rows)
+    thinned = rows[:3] + rows[4:]
+    assert len(thinned) == 7 and len(frozen) == 8
+    with pytest.raises(T2ProtocolError, match="thinned by nothing at all"):
+        _verify(thinned, frozen)
+
+
+def test_full_rows_with_a_thinned_id_vector_are_refused():
+    rows = _stream(count=8)
+    frozen = _frozen_ids(rows)[:7]
+    with pytest.raises(T2ProtocolError, match="thinned by nothing at all"):
+        _verify(rows, frozen)
+
+
+def test_same_count_row_substitution_is_refused():
+    """Same length and a valid frozen id vector is not valid row lineage."""
+    timeline_a = _stream("s20011", 0, count=8)
+    timeline_b = _stream("s20021", 0, count=8)
+    frozen = _frozen_ids(timeline_a)
+    substituted = timeline_a[:4] + (timeline_b[4],) + timeline_a[5:]
+    assert len(substituted) == len(frozen)
+    with pytest.raises(T2ProtocolError, match="Equal length is not"):
+        _verify(substituted, frozen)
+
+
+def test_a_row_whose_id_disagrees_with_its_own_identity_is_refused():
+    """Right count, right ids, but one row does not match the id it carries."""
+    rows = _stream(count=8)
+    frozen = _frozen_ids(rows)
+    broken = rows[:5] + (rows[5]._replace(start_sample=999_999),) + rows[6:]
+    assert len(broken) == 8
+    with pytest.raises(T2ProtocolError, match="encodes start"):
+        _verify(broken, frozen)
+
+
+def test_duplicate_rows_are_refused():
+    rows = _stream(count=4)
+    frozen = _frozen_ids(rows)
+    duplicated = rows[:3] + (rows[0],)
+    with pytest.raises(T2ProtocolError, match="repeats a stable_id"):
+        _verify(duplicated, frozen)
+
+
+def test_reordered_rows_are_refused():
+    rows = _stream(count=6)
+    frozen = _frozen_ids(rows)
+    swapped = rows[:2] + (rows[3], rows[2]) + rows[4:]
+    with pytest.raises(T2ProtocolError, match="different order"):
+        _verify(swapped, frozen)
+
+
+def test_a_replay_from_the_wrong_stream_cache_is_refused():
+    rows = _stream(count=4)
+    with pytest.raises(T2ProtocolError, match="not the\\s+frozen"):
+        _verify(rows, _frozen_ids(rows), cache="0" * 64)
+
+
+# --- the stale broad flag, and the precise ones that replaced it ----------
+
+
+def test_broad_challenge_trained_on_flag_no_longer_exists():
+    """It was ambiguous: challenge context can reach a later PRIMARY loss."""
+    assert not hasattr(T, "T2_CHALLENGE_TRAINED_ON")
+
+
+def test_precise_challenge_context_semantics_are_unchanged():
+    assert T.T2_CHALLENGE_RECEIVES_DIRECT_LOSS is False
+    assert T.T2_CHALLENGE_IDENTITY_IS_MODEL_INPUT is False
+    assert T.T2_CHALLENGE_LABEL_IS_MODEL_INPUT is False
+    assert T.T2_CHALLENGE_MAY_BE_LABEL_BLIND_CONTEXT is True
+    assert T.T2_CHALLENGE_IS_CHECKPOINT_EVIDENCE is False
+    assert T.T2_CHALLENGE_IS_SELECTION_INPUT is False
+    assert T.T2_CHALLENGE_MERGED_INTO_PRIMARY is False
+
+
+def test_modellable_rows_wording_does_not_overclaim():
+    doc = T.modellable_rows.__doc__ or ""
+    assert "direct loss remains PRIMARY-only" in doc.replace("**", "")
+    rows = _stream(
+        count=3,
+        states=(
+            T.T2_OBSERVATION_AVAILABLE,
+            T.T2_OBSERVATION_UNAVAILABLE_EXACT_FLAT,
+            T.T2_OBSERVATION_AVAILABLE,
+        ),
+    )
+    assert T.modellable_rows(rows) == (rows[0], rows[2])
+
+
+def test_s4d_notation_is_self_contained():
+    spec = T.architecture_spec(T.T2_ARM_S4D)
+    assert spec["zeta_definition"] == "zeta = exp(log_step) * lambda"
+    assert spec["transition_abar"].startswith("Abar = exp(zeta)")
+    assert spec["input_gain_bbar"].startswith("Bbar = expm1(zeta) / lambda")
+    equations = spec["per_step_equations"]
+    assert "state_t = Abar * state_(t-1) + Bbar * value_t" in equations
+    assert "output_t = x_t + Dropout(branch_t)" in equations
+    assert spec["ssm_input_u_t"] == "the projected value branch, not the gate branch"
+    # notation only: the architecture itself is unchanged
+    assert spec["state_dim"] == 16
+    assert spec["blocks"] == 2
+    assert spec["discretization"] == "zero_order_hold"
+
+
+def test_science_remains_unexecuted_and_test_unopened():
+    assert T.T2_TEST_ACCESSED is False
+    assert T.T2_SEALED_TEST_STATE == "unopened"
+    identity = T.t2_protocol_identity()
+    assert identity["test_accessed"] is False
+    assert identity["sealed_test_state"] == "unopened"
+    # still no training, scoring or execution path in the module
+    tree = ast.parse(Path(T.__file__).read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            assert name not in {"backward", "fit", "train", "no_grad", "DataLoader"}

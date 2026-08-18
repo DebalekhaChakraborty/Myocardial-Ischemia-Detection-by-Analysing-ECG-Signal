@@ -295,6 +295,13 @@ T2_FORBIDDEN_TRAINABLE_INPUTS: Final = (
 # ---------------------------------------------------------------------------
 T2_WINDOW_LENGTH_SECONDS: Final = 10.0
 T2_WINDOW_STRIDE_SECONDS: Final = 5.0
+# Frozen corpus row identity, reused unchanged -- no new identity format:
+#   ltstdb:{record_id}:{channel_index}:{start_sample}:{end_sample}
+T2_DATASET: Final = "ltstdb"
+T2_WINDOW_LENGTH_SAMPLES: Final = 2500
+T2_STABLE_ID_FORM: Final = (
+    "ltstdb:{record_id}:{channel_index}:{start_sample}:{end_sample}"
+)
 T2_STREAM_KEY_FIELDS: Final = ("record_id", "channel_index")
 # The persisted array in the frozen stream cache is `start_sample`. The
 # conceptual name used in prose is `window_start_samples`; the alias is declared
@@ -506,8 +513,21 @@ T2_S4D_SPEC: Final = {
     "discretization": "zero_order_hold",
     "timestep_parameterization": "exp(log_step) per channel",
     "timestep_initialization": "uniform(log(1e-3), log(1e-1))",
-    "transition_abar": "exp(exp(log_step) * lambda)",
-    "input_gain_bbar": "expm1(zeta) / lambda * state_input",
+    # zeta is defined once here so the two expressions below are self-contained.
+    "zeta_definition": "zeta = exp(log_step) * lambda",
+    "transition_abar": "Abar = exp(zeta) = exp(exp(log_step) * lambda)",
+    "input_gain_bbar": "Bbar = expm1(zeta) / lambda * state_input",
+    # Which projected branch is which: the VALUE branch enters the SSM as u_t,
+    # the second branch is the SiLU gate. Notation only; no architecture change.
+    "per_step_equations": (
+        "normed = LayerNorm(x_t); "
+        "[value_t, gate_t] = Linear(normed).chunk(2); "
+        "state_t = Abar * state_(t-1) + Bbar * value_t; "
+        "represented_t = real(C * state_t).sum(-1) + D * value_t; "
+        "branch_t = Linear(represented_t * SiLU(gate_t)); "
+        "output_t = x_t + Dropout(branch_t)"
+    ),
+    "ssm_input_u_t": "the projected value branch, not the gate branch",
     "b_parameterization": "real_state_input_matrix_cast_to_complex",
     "c_parameterization": "complex(state_output_real, state_output_imaginary)",
     "d_skip_term": "real_per_channel_vector_initialized_zero",
@@ -630,7 +650,13 @@ T2_ALTERNATIVE_STATE_INITIALIZATION_PERMITTED: Final = False
 
 T2_CHALLENGE_FAMILIES: Final = ("rate_related", "axis_shift", "conduction_change")
 T2_CHALLENGE_MERGED_INTO_PRIMARY: Final = False
-T2_CHALLENGE_TRAINED_ON: Final = False
+# NOTE: a broad `T2_CHALLENGE_TRAINED_ON = False` flag deliberately does NOT
+# exist. It would be scientifically ambiguous: an available challenge z_t may
+# influence a later PRIMARY loss through carried recurrent state inside the
+# gradient horizon. Only the precise facts above are asserted --
+# T2_CHALLENGE_RECEIVES_DIRECT_LOSS, T2_CHALLENGE_IDENTITY_IS_MODEL_INPUT,
+# T2_CHALLENGE_LABEL_IS_MODEL_INPUT, T2_CHALLENGE_MAY_BE_LABEL_BLIND_CONTEXT,
+# T2_CHALLENGE_IS_CHECKPOINT_EVIDENCE and T2_CHALLENGE_IS_SELECTION_INPUT.
 T2_CONDUCTION_EVIDENCE_LEVEL: Final = "exploratory_descriptive"
 
 # ---------------------------------------------------------------------------
@@ -692,12 +718,23 @@ class T2StreamKey(NamedTuple):
 
 
 class T2Row(NamedTuple):
-    """One window position in a stream, as the protocol validates it."""
+    """One window position in a stream, carrying its own frozen identity.
 
+    `stable_id` lives on the row rather than in a parallel vector. That is the
+    whole point: a caller cannot attest identities for rows it did not supply,
+    because there is no separate identity vector to supply.
+    """
+
+    stable_id: str
     record_id: str
     channel_index: int
-    window_start_samples: int
+    start_sample: int
     observation_state: int
+
+    @property
+    def window_start_samples(self) -> int:
+        """Conceptual alias; resolves deterministically to `start_sample`."""
+        return self.start_sample
 
 
 class T2Chunk(NamedTuple):
@@ -793,7 +830,7 @@ def require_chronological_stream(rows: Sequence[T2Row]) -> tuple[T2Row, ...]:
         )
     previous = None
     for row in ordered:
-        position = int(row.window_start_samples)
+        position = int(row.start_sample)
         if previous is not None and position <= previous:
             raise T2ProtocolError(
                 f"T2 requires strict chronological order by "
@@ -860,7 +897,12 @@ def require_available_for_modelling(row: T2Row) -> T2Row:
 
 
 def modellable_rows(rows: Sequence[T2Row]) -> tuple[T2Row, ...]:
-    """The rows T2 may score and train on: available observations only."""
+    """Physically available observations.
+
+    These are the rows T2 may consume as causal context and, where the row-role
+    mask permits, score and use for direct loss. Availability alone does not
+    imply a training target: **direct loss remains PRIMARY-only**.
+    """
     return tuple(row for row in rows if is_available(row))
 
 
@@ -1107,28 +1149,98 @@ def select_t2_arm(
 # ---------------------------------------------------------------------------
 
 
+def canonical_stable_id(row: T2Row) -> str:
+    """The frozen corpus stable-id form, derived from the row's own identity."""
+    end_sample = int(row.start_sample) + T2_WINDOW_LENGTH_SAMPLES
+    return (
+        f"{T2_DATASET}:{row.record_id}:{int(row.channel_index)}:"
+        f"{int(row.start_sample)}:{end_sample}"
+    )
+
+
+def require_stable_id_matches_row(row: T2Row) -> str:
+    """Prove a row's stable_id encodes that row, component by component.
+
+    The frozen semantics are
+    `ltstdb:{record_id}:{channel_index}:{start_sample}:{end_sample}` with a
+    2500-sample window. No new identity format is introduced; this only refuses
+    an id that disagrees with the row it is attached to.
+    """
+    observed = str(row.stable_id)
+    parts = observed.split(":")
+    if len(parts) != 5:
+        raise T2ProtocolError(
+            f"Stable id {observed!r} is malformed; the frozen form is "
+            f"{T2_STABLE_ID_FORM!r}."
+        )
+    dataset, record, channel, start, end = parts
+    if dataset != T2_DATASET:
+        raise T2ProtocolError(
+            f"Stable id {observed!r} names dataset {dataset!r}, not {T2_DATASET!r}."
+        )
+    if record != str(row.record_id):
+        raise T2ProtocolError(
+            f"Stable id {observed!r} encodes record {record!r} but the row is "
+            f"{row.record_id!r}."
+        )
+    for label, text in (("channel", channel), ("start", start), ("end", end)):
+        if not text.lstrip("-").isdigit():
+            raise T2ProtocolError(
+                f"Stable id {observed!r} carries a non-integer {label} {text!r}."
+            )
+    if int(channel) != int(row.channel_index):
+        raise T2ProtocolError(
+            f"Stable id {observed!r} encodes channel {channel}, but the row is "
+            f"channel {row.channel_index}."
+        )
+    if int(start) != int(row.start_sample):
+        raise T2ProtocolError(
+            f"Stable id {observed!r} encodes start {start}, but the row starts at "
+            f"{row.start_sample}."
+        )
+    expected_end = int(row.start_sample) + T2_WINDOW_LENGTH_SAMPLES
+    if int(end) != expected_end:
+        raise T2ProtocolError(
+            f"Stable id {observed!r} encodes end {end}; a {T2_WINDOW_LENGTH_SAMPLES}"
+            f"-sample window starting at {row.start_sample} ends at {expected_end}."
+        )
+    return observed
+
+
 def require_full_timeline_replay(
     *,
     offered_rows: Sequence[T2Row],
     frozen_stable_ids: Sequence[str],
-    offered_stable_ids: Sequence[str],
     stream_cache_sha256: str,
     expected_stream_cache_sha256: str,
 ) -> dict[str, Any]:
     """Prove a replay really is the frozen full timeline, not merely as long.
 
-    Matching a row count is not identity. This binds the stream-cache digest,
-    the exact stable-id membership, the exact stream membership and the
-    chronological ordering, and refuses duplicates -- so a silent category
-    filter, a swap or a thinning cannot pass as a full replay.
+    The offered identity sequence is **derived from the rows themselves**, never
+    supplied alongside them. An earlier revision accepted an independent
+    `offered_stable_ids` vector and validated the two separately, so a complete
+    identity vector could be paired with a thinned or substituted row sequence
+    and pass. There is now no such seam: the identities are the rows'.
+
+    Matching a row count is not identity either. This binds the stream-cache
+    digest, proves every stable id encodes its own row, and requires the exact
+    frozen identity sequence, uniqueness, stream membership and chronological
+    ordering -- so a silent category filter, a substitution or a thinning cannot
+    pass as a full replay.
     """
     if stream_cache_sha256 != expected_stream_cache_sha256:
         raise T2ProtocolError(
             f"The replay reads stream cache {stream_cache_sha256!r}, not the "
             f"frozen {expected_stream_cache_sha256!r}."
         )
+    rows = tuple(offered_rows)
     frozen = tuple(str(value) for value in frozen_stable_ids)
-    offered = tuple(str(value) for value in offered_stable_ids)
+
+    # Every id must describe the row it rides on, before any sequence compare.
+    for row in rows:
+        require_stable_id_matches_row(row)
+    offered = tuple(str(row.stable_id) for row in rows)
+
     if len(offered) != len(set(offered)):
         raise T2ProtocolError("The replay repeats a stable_id; rows are not unique.")
     if len(offered) != len(frozen):
@@ -1149,14 +1261,17 @@ def require_full_timeline_replay(
             "The replay carries the frozen rows in a different order; the "
             "chronological ordering is part of the artifact."
         )
-    streams = split_into_streams(offered_rows)  # validates ordering per stream
+    streams = split_into_streams(rows)  # validates ordering within each stream
     return {
         "integrity_class": "t2_full_timeline_replay",
         "stream_cache_sha256": stream_cache_sha256,
-        "row_count": len(offered),
+        # Derived from the actual row sequence, never from a separate id vector.
+        "row_count": len(rows),
         "stream_count": len(streams),
+        "stable_ids_derived_from_rows": True,
         "thinned": False,
         "duplicate_rows": False,
+        "row_substituted": False,
         "category_filtered_before_replay": False,
         "order_field": T2_STREAM_ORDER_FIELD,
     }
