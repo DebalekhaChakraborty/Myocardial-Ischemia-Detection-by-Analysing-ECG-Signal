@@ -500,7 +500,55 @@ def test_the_0_002_tie_rule_is_exact():
         parameter_counts={T.T2_ARM_GRU: 200, T.T2_ARM_S4D: 100},
     )
     assert smaller["selected_arm"] == T.T2_ARM_S4D
-    assert smaller["selection_basis"] == T.T2_SELECTION_FINAL_TIE_BREAK
+    assert smaller["selection_basis"] == T.T2_SELECTION_PARAMETER_TIE_BREAK
+
+
+# --- the corrected two-stage 0.002 boundary (§8 of the closure) -----------
+
+
+def _select(pooled_gap: float, macro_gap: float, counts=(100, 100)) -> dict:
+    """S4D leads on both metrics by the given gaps; counts are (GRU, S4D)."""
+    return T.select_t2_arm(
+        pooled_auprc={T.T2_ARM_GRU: 0.400, T.T2_ARM_S4D: 0.400 + pooled_gap},
+        subject_macro_auprc={T.T2_ARM_GRU: 0.500, T.T2_ARM_S4D: 0.500 + macro_gap},
+        parameter_counts={T.T2_ARM_GRU: counts[0], T.T2_ARM_S4D: counts[1]},
+    )
+
+
+def test_pooled_difference_just_below_tolerance_is_a_tie():
+    decision = _select(0.001999, 0.0)
+    assert decision["selection_basis"] != T.T2_PRIMARY_SELECTION_METRIC
+
+
+def test_pooled_difference_of_exactly_the_tolerance_is_not_a_tie():
+    decision = _select(0.002, 0.0)
+    assert decision["selection_basis"] == T.T2_PRIMARY_SELECTION_METRIC
+    assert decision["selected_arm"] == T.T2_ARM_S4D
+
+
+def test_subject_macro_difference_just_below_tolerance_falls_to_parameters():
+    """The written tolerance applies at the second stage too, not exact equality."""
+    decision = _select(0.0005, 0.001999, counts=(200, 100))
+    assert decision["selection_basis"] == T.T2_SELECTION_PARAMETER_TIE_BREAK
+    assert decision["selected_arm"] == T.T2_ARM_S4D
+
+
+def test_subject_macro_difference_of_exactly_the_tolerance_selects_higher_macro():
+    decision = _select(0.0005, 0.002, counts=(100, 999))
+    assert decision["selection_basis"] == T.T2_SECONDARY_SELECTION_METRIC
+    assert decision["selected_arm"] == T.T2_ARM_S4D
+
+
+def test_equal_parameter_counts_resolve_deterministically_to_gru():
+    decision = _select(0.0, 0.0, counts=(100, 100))
+    assert decision["selected_arm"] == T.T2_ARM_GRU
+    assert decision["selection_basis"] == T.T2_SELECTION_TERMINAL_TIE_BREAK
+    assert T.T2_SELECTION_TERMINAL_ARM == T.T2_ARM_GRU
+
+
+def test_latency_is_not_part_of_scientific_selection():
+    assert T.T2_LATENCY_IN_SCIENTIFIC_SELECTION is False
+    assert _select(0.0, 0.0)["latency_used"] is False
 
 
 def test_challenge_evidence_cannot_select_the_model():
@@ -681,3 +729,336 @@ def test_module_contains_no_training_or_scoring_path():
         if isinstance(node, ast.Call):
             name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
             assert name not in forbidden, name
+
+
+# ==========================================================================
+# Closure additions: full timeline vs PRIMARY mask, row roles, replay
+# integrity, persisted order field, and the frozen architectures.
+# ==========================================================================
+
+
+def test_full_timeline_is_context_and_primary_is_only_a_mask():
+    assert T.T2_CONTEXT_POPULATION == "full_replay_timeline"
+    assert T.T2_LOSS_POPULATION == "primary_metric_mask"
+    assert T.T2_PRIMARY_IS_A_MASK_NOT_A_SEQUENCE is True
+    # TRAIN: the mask is strictly smaller than the timeline it is applied to
+    assert T.T2_TRAIN_PRIMARY_ROW_COUNT == 2_143_599
+    assert T.T2_TRAIN_PRIMARY_ROW_COUNT < T.T2_TRAIN_FULL_STREAM_ROW_COUNT
+    assert T.T2_TRAIN_NON_PRIMARY_ROW_COUNT == 64_832
+    assert (
+        T.T2_TRAIN_CHALLENGE_ROW_COUNT + T.T2_TRAIN_OTHER_NON_PRIMARY_ROW_COUNT
+        == T.T2_TRAIN_NON_PRIMARY_ROW_COUNT
+    )
+    # VALIDATION agrees with the populations U1 and M2 already bound
+    assert T.T2_VALIDATION_PRIMARY_ROW_COUNT == 473_897
+    assert T.T2_VALIDATION_CHALLENGE_ROW_COUNT == 8_137
+    assert T.T2_VALIDATION_NON_PRIMARY_ROW_COUNT == 19_007
+
+
+def test_frozen_counts_match_the_corpus_authority():
+    """The counts are read from the frozen corpus, never derived here."""
+    manifest_path = Path("cardiosentinel-features/ltstdb-baseline-v1/manifest.json")
+    if not manifest_path.is_file():
+        pytest.skip("the frozen feature corpus is not on this filesystem")
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["feature_corpus_sha256"] == T.T2_FEATURE_CORPUS_SHA256
+    totals: dict[str, int] = {}
+    for record in manifest["records"]:
+        if record["partition"] != "train":
+            continue
+        for name, count in record["target_counts"].items():
+            totals[name] = totals.get(name, 0) + count
+    assert totals["ischemic_positive"] == T.T2_TRAIN_ISCHEMIC_POSITIVE
+    assert totals["background_negative"] == T.T2_TRAIN_BACKGROUND_NEGATIVE
+    assert sum(totals.values()) == T.T2_TRAIN_FULL_STREAM_ROW_COUNT
+    challenge = sum(totals[name] for name in T.T2_CHALLENGE_CATEGORIES)
+    other = sum(totals[name] for name in T.T2_OTHER_NON_PRIMARY_CATEGORIES)
+    assert challenge == T.T2_TRAIN_CHALLENGE_ROW_COUNT
+    assert other == T.T2_TRAIN_OTHER_NON_PRIMARY_ROW_COUNT
+
+
+def test_available_challenge_row_is_context_with_no_direct_loss():
+    semantics = T.role_semantics(T.ROLE_CHALLENGE_CONTEXT)
+    assert semantics["consumes_z"] is True
+    assert semantics["updates_state"] is True
+    assert semantics["produces_score"] is True
+    assert semantics["direct_loss"] is False
+    assert semantics["primary_metric"] is False
+    assert semantics["challenge_metric"] is True
+    # the honest gradient claim, not the false one
+    assert T.T2_CHALLENGE_RECEIVES_DIRECT_LOSS is False
+    assert T.T2_CHALLENGE_MAY_BE_LABEL_BLIND_CONTEXT is True
+    assert T.T2_CHALLENGE_IS_CHECKPOINT_EVIDENCE is False
+
+
+def test_available_other_non_primary_row_is_context_only():
+    semantics = T.role_semantics(T.ROLE_OTHER_NONPRIMARY_CONTEXT)
+    assert semantics["consumes_z"] is True
+    assert semantics["updates_state"] is True
+    assert semantics["direct_loss"] is False
+    assert semantics["primary_metric"] is False
+    assert semantics["challenge_metric"] is False
+
+
+def test_unavailable_row_neither_updates_state_nor_receives_loss_or_score():
+    semantics = T.role_semantics(T.ROLE_UNAVAILABLE_NO_STATE_UPDATE)
+    assert semantics == {
+        "consumes_z": False,
+        "updates_state": False,
+        "produces_score": False,
+        "direct_loss": False,
+        "primary_metric": False,
+        "challenge_metric": False,
+    }
+
+
+def test_only_primary_rows_carry_direct_loss():
+    direct = [
+        role for role in T.T2_ROW_ROLES if T.T2_ROW_ROLE_SEMANTICS[role]["direct_loss"]
+    ]
+    assert direct == [T.ROLE_PRIMARY_DIRECT_LOSS]
+
+
+def test_row_role_is_never_a_trainable_feature():
+    assert T.T2_ROW_ROLE_IS_MODEL_INPUT is False
+    assert T.T2_CHALLENGE_IDENTITY_IS_MODEL_INPUT is False
+    assert T.T2_CHALLENGE_LABEL_IS_MODEL_INPUT is False
+    with pytest.raises(T2ProtocolError):
+        T.role_semantics("SOME_INVENTED_ROLE")
+
+
+def test_primary_masking_does_not_alter_stream_chronology():
+    rows = _stream(count=10)
+    before = T.require_chronological_stream(rows)
+    proof = T.require_mask_does_not_thin_the_stream(
+        replay_row_count=len(rows), masked_row_count=4
+    )
+    assert proof["context_rows_retained"] == len(rows)
+    assert proof["masked_row_count"] == 4
+    # the replay itself is untouched by the mask
+    assert T.require_chronological_stream(rows) == before
+    with pytest.raises(T2ProtocolError, match="cannot select more rows"):
+        T.require_mask_does_not_thin_the_stream(
+            replay_row_count=10, masked_row_count=11
+        )
+
+
+def _replay(rows):
+    ids = tuple(
+        f"{row.record_id}:{row.channel_index}:{row.window_start_samples}"
+        for row in rows
+    )
+    return ids
+
+
+def test_a_full_timeline_replay_is_accepted():
+    rows = _stream(count=8)
+    ids = _replay(rows)
+    proof = T.require_full_timeline_replay(
+        offered_rows=rows,
+        frozen_stable_ids=ids,
+        offered_stable_ids=ids,
+        stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+        expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+    )
+    assert proof["thinned"] is False
+    assert proof["row_count"] == 8
+    assert proof["stream_count"] == 1
+    assert proof["order_field"] == "start_sample"
+
+
+def test_removing_a_non_primary_row_is_refused_as_a_full_replay():
+    """Dropping a context row is exactly the failure the integrity gate exists for."""
+    rows = _stream(count=8)
+    frozen = _replay(rows)
+    thinned_rows = rows[:3] + rows[4:]
+    with pytest.raises(T2ProtocolError, match="thinned by nothing at all"):
+        T.require_full_timeline_replay(
+            offered_rows=thinned_rows,
+            frozen_stable_ids=frozen,
+            offered_stable_ids=_replay(thinned_rows),
+            stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+        )
+
+
+def test_equal_row_count_with_changed_membership_is_not_equivalence():
+    """Aggregate counts are not an identity; membership is."""
+    rows = _stream(count=8)
+    frozen = _replay(rows)
+    swapped = frozen[:-1] + ("s20011:0:999999999",)
+    with pytest.raises(T2ProtocolError, match="Equal length is not"):
+        T.require_full_timeline_replay(
+            offered_rows=rows,
+            frozen_stable_ids=frozen,
+            offered_stable_ids=swapped,
+            stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+        )
+
+
+def test_duplicate_rows_are_refused():
+    rows = _stream(count=4)
+    frozen = _replay(rows)
+    with pytest.raises(T2ProtocolError, match="repeats a stable_id"):
+        T.require_full_timeline_replay(
+            offered_rows=rows,
+            frozen_stable_ids=frozen,
+            offered_stable_ids=frozen[:-1] + (frozen[0],),
+            stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+        )
+
+
+def test_a_replay_from_the_wrong_stream_cache_is_refused():
+    rows = _stream(count=4)
+    ids = _replay(rows)
+    with pytest.raises(T2ProtocolError, match="not the\\s+frozen"):
+        T.require_full_timeline_replay(
+            offered_rows=rows,
+            frozen_stable_ids=ids,
+            offered_stable_ids=ids,
+            stream_cache_sha256="0" * 64,
+            expected_stream_cache_sha256=T.T2_TRAIN_STREAM_CACHE_SHA256,
+        )
+
+
+def test_primary_and_challenge_come_from_one_identical_replay():
+    assert T.T2_SINGLE_CONTINUOUS_REPLAY_REQUIRED is True
+    assert T.T2_MASKS_APPLIED_AFTER_SCORING is True
+    assert T.T2_STATE_RESET_BEFORE_CHALLENGE_ROWS is False
+    assert T.T2_INTERVENING_NON_PRIMARY_REMOVAL_PERMITTED is False
+    # one pass produces scores for every available role; masks only select
+    scored = [
+        role
+        for role in T.T2_ROW_ROLES
+        if T.T2_ROW_ROLE_SEMANTICS[role]["produces_score"]
+    ]
+    assert set(scored) == {
+        T.ROLE_PRIMARY_DIRECT_LOSS,
+        T.ROLE_CHALLENGE_CONTEXT,
+        T.ROLE_OTHER_NONPRIMARY_CONTEXT,
+    }
+
+
+def test_a_challenge_only_replay_is_forbidden():
+    assert T.T2_CHALLENGE_ONLY_REPLAY_PERMITTED is False
+    assert T.T2_PRIMARY_ONLY_REPLAY_PERMITTED is False
+
+
+def test_persisted_chronological_field_and_alias_are_explicit():
+    assert T.T2_STREAM_ORDER_FIELD == "start_sample"
+    assert T.T2_STREAM_ORDER_FIELD_ALIAS == "window_start_samples"
+    assert T.T2_STREAM_ORDER_FIELD_SEMANTICS == "window start in samples"
+    text = _document_prose()
+    assert "`window_start_samples := persisted start_sample`" in text
+
+
+def test_state_must_carry_across_tbptt_chunks_and_detach():
+    chunks = T.tbptt_chunks(T2StreamKey("s20011", 0), 700)
+    assert len(chunks) == 3
+    for chunk in chunks[1:]:
+        assert chunk.carries_state_in is True
+        assert chunk.detaches_state_in is True
+    assert T.T2_STATE_CARRIES_ACROSS_CHUNK is True
+    assert T.T2_STATE_DETACHED_AT_CHUNK_BOUNDARY is True
+    assert T.T2_STATE_RESET_AT_CHUNK_BOUNDARY is False
+    text = _document_prose()
+    assert "MUST carry causally** across TBPTT chunk boundaries" in text
+
+
+def test_exact_gru_architecture_is_complete():
+    spec = T.architecture_spec(T.T2_ARM_GRU)
+    assert spec["temporal_core"] == "torch.nn.GRU"
+    assert spec["gru_input_size"] == 64
+    assert spec["gru_hidden_size"] == 64
+    assert spec["gru_num_layers"] == 2
+    assert spec["gru_bidirectional"] is False
+    assert spec["gru_bias"] is True
+    assert spec["gru_dropout"] == 0.10
+    assert "except the last" not in spec["gru_dropout_semantics"]
+    assert spec["gru_dropout_semantics"] == (
+        "between_stacked_layers_only_not_after_final_layer"
+    )
+    assert spec["hidden_state_initialization"] == "zeros"
+    assert spec["recurrent_state_shape"] == "(num_layers=2, batch, hidden=64)"
+    assert spec["residual_connection"] is False
+    assert spec["input_projection"] == "Linear(146, 64, bias=True)"
+    assert spec["input_projection_activation"] is None
+    assert spec["readout"] == "Linear(64, 1, bias=True)"
+    assert spec["dtype"] == "float32"
+    proof = T.require_architecture_is_fully_specified(T.T2_ARM_GRU)
+    assert proof["fully_specified"] is True
+    assert proof["expected_trainable_parameters"] == 59_521
+
+
+def test_exact_s4d_architecture_is_complete():
+    spec = T.architecture_spec(T.T2_ARM_S4D)
+    assert spec["state_dim"] == 16
+    assert spec["blocks"] == 2
+    assert spec["model_width"] == 64
+    assert spec["discretization"] == "zero_order_hold"
+    assert spec["lambda_parameterization"] == "complex(-exp(log_decay), frequency)"
+    assert spec["stability_constraint"] == (
+        "negative_real_part_guaranteed_by_negative_exp"
+    )
+    assert spec["state_update"] == "state = Abar * state + Bbar * u_t"
+    assert spec["output_equation"] == "(C * state).real.sum(-1) + D * u_t"
+    assert spec["activation"] == "SiLU on the gate branch only"
+    assert spec["block_norm"] == "LayerNorm(64, eps=1e-5) pre-norm at block input"
+    assert spec["residual_connection"] is True
+    assert spec["dropout_placement"] == "on_the_branch_before_the_residual_add"
+    assert spec["d_skip_term"] == "real_per_channel_vector_initialized_zero"
+    assert spec["hidden_state_initialization"] == "zeros"
+    assert spec["recurrent_inference"] == (
+        "explicit_step_recurrence_carrying_state_across_windows"
+    )
+    proof = T.require_architecture_is_fully_specified(T.T2_ARM_S4D)
+    assert proof["fully_specified"] is True
+    assert proof["expected_trainable_parameters"] == 45_313
+
+
+def test_b4c_conventions_reused_and_divergences_stated():
+    assert T.T2_S4D_REUSES_B4C_CONVENTIONS
+    assert "state_dim_16" in T.T2_S4D_REUSES_B4C_CONVENTIONS
+    assert any("zero_order_hold" in name for name in T.T2_S4D_REUSES_B4C_CONVENTIONS)
+    # exactly two divergences, each with a stated prospective reason
+    assert len(T.T2_S4D_DIVERGES_FROM_B4C) == 2
+    assert any("carried across" in reason for reason in T.T2_S4D_DIVERGES_FROM_B4C)
+    assert any("64 rather than" in reason for reason in T.T2_S4D_DIVERGES_FROM_B4C)
+
+
+def test_frozen_parameter_counts_sit_inside_the_shared_envelope():
+    proof = T.require_capacity_envelope(T.T2_EXPECTED_PARAMETER_COUNTS)
+    assert proof["within_envelope"] is True
+    assert 0.5 <= proof["ratio_s4d_over_gru"] <= 2.0
+    assert proof["parameter_counts"] == {
+        T.T2_ARM_GRU: 59_521,
+        T.T2_ARM_S4D: 45_313,
+    }
+
+
+def test_no_unbound_model_design_choice_remains():
+    assert T.T2_UNBOUND_ARCHITECTURAL_CHOICE_REMAINS is False
+    assert T.T2_IMPLEMENTATION_MAY_CHOOSE == ()
+    for arm in T.T2_ARMS:
+        proof = T.require_architecture_is_fully_specified(arm)
+        assert proof["implementation_may_choose"] == []
+    with pytest.raises(T2ProtocolError, match="not a frozen T2 candidate"):
+        T.architecture_spec("causal_lstm_longitudinal_v1")
+
+
+def test_challenge_identity_and_labels_cannot_enter_trainable_inputs():
+    for name in ("challenge_family_identity", "future_window_label"):
+        with pytest.raises(T2ProtocolError, match="may not be a trainable"):
+            T.require_permitted_trainable_inputs(["z_t", name])
+    assert T.T2_CHALLENGE_IDENTITY_IS_MODEL_INPUT is False
+    assert T.T2_CHALLENGE_LABEL_IS_MODEL_INPUT is False
+
+
+def test_test_remains_unopened_after_the_closure():
+    assert T.T2_TEST_ACCESSED is False
+    assert T.T2_SEALED_TEST_STATE == "unopened"
+    identity = T.t2_protocol_identity()
+    assert identity["test_accessed"] is False
+    assert identity["sealed_test_state"] == "unopened"

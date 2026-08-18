@@ -35,7 +35,7 @@ REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[3]
 T2_PROTOCOL_NAME: Final = "T2_LONGITUDINAL_TEMPORAL_PROTOCOL_V1"
 T2_PROTOCOL_PATH: Final = REPOSITORY_ROOT / "docs" / f"{T2_PROTOCOL_NAME}.md"
 T2_PROTOCOL_SHA256: Final = (
-    "6510f831cd9cb7870f8cffba7eac1ffd5d95dea40272c279e6bcc75439cf3e25"
+    "6546086a55fe2c9c109f4121cdb6b42d4d53ce0112c9611eb895bd8c805cfefb"
 )
 
 # ---------------------------------------------------------------------------
@@ -140,6 +140,132 @@ T2_NEGATIVE_SAMPLING_PERMITTED: Final = False
 T2_FULL_CHRONOLOGICAL_POPULATION_REQUIRED: Final = True
 
 # ---------------------------------------------------------------------------
+# Timeline context vs loss / metric mask (§1, §2)
+#
+# These are two different populations and conflating them is the mistake this
+# section exists to prevent:
+#
+#   * the CAUSAL STATE CONTEXT population is the FULL REPLAY TIMELINE;
+#   * PRIMARY is a LOSS / METRIC MASK applied to scores produced during that
+#     one replay -- never a separate, thinned sequence.
+#
+# Counts are read from the frozen feature-corpus authority
+# (cardiosentinel-features/ltstdb-baseline-v1/manifest.json, feature corpus
+# f18785d5...), not derived here.
+# ---------------------------------------------------------------------------
+T2_CORPUS_AUTHORITY: Final = "ltstdb_baseline_v1_feature_corpus"
+T2_FEATURE_CORPUS_SHA256: Final = (
+    "f18785d520828cb171482926922346dda824c8868ed4b7f9be45897cd71d6eb5"
+)
+
+T2_TRAIN_ISCHEMIC_POSITIVE: Final = 93_613
+T2_TRAIN_BACKGROUND_NEGATIVE: Final = 2_049_986
+T2_TRAIN_PRIMARY_ROW_COUNT: Final = (
+    T2_TRAIN_ISCHEMIC_POSITIVE + T2_TRAIN_BACKGROUND_NEGATIVE
+)  # 2_143_599
+T2_TRAIN_NON_PRIMARY_ROW_COUNT: Final = (
+    T2_TRAIN_FULL_STREAM_ROW_COUNT - T2_TRAIN_PRIMARY_ROW_COUNT
+)  # 64_832
+T2_TRAIN_CHALLENGE_ROW_COUNT: Final = 46_025
+T2_TRAIN_OTHER_NON_PRIMARY_ROW_COUNT: Final = 18_807
+
+T2_VALIDATION_ISCHEMIC_POSITIVE: Final = 21_628
+T2_VALIDATION_BACKGROUND_NEGATIVE: Final = 452_269
+T2_VALIDATION_PRIMARY_ROW_COUNT: Final = (
+    T2_VALIDATION_ISCHEMIC_POSITIVE + T2_VALIDATION_BACKGROUND_NEGATIVE
+)  # 473_897
+T2_VALIDATION_NON_PRIMARY_ROW_COUNT: Final = (
+    T2_VALIDATION_FULL_STREAM_ROW_COUNT - T2_VALIDATION_PRIMARY_ROW_COUNT
+)  # 19_007
+T2_VALIDATION_CHALLENGE_ROW_COUNT: Final = 8_137
+T2_VALIDATION_OTHER_NON_PRIMARY_ROW_COUNT: Final = 10_870
+
+# Frozen corpus target categories. PRIMARY is exactly the first two.
+T2_PRIMARY_CATEGORIES: Final = ("ischemic_positive", "background_negative")
+T2_CHALLENGE_CATEGORIES: Final = (
+    "rate_related_confounder",
+    "axis_shift_confounder",
+    "conduction_change_confounder",
+)
+T2_OTHER_NON_PRIMARY_CATEGORIES: Final = (
+    "boundary_ambiguous",
+    "source_censored_or_unknown",
+    "quality_excluded",
+)
+
+T2_CONTEXT_POPULATION: Final = "full_replay_timeline"
+T2_LOSS_POPULATION: Final = "primary_metric_mask"
+T2_PRIMARY_IS_A_MASK_NOT_A_SEQUENCE: Final = True
+
+# Row roles (§2, §13). The role governs loss and metrics; it is NEVER a feature.
+ROLE_PRIMARY_DIRECT_LOSS: Final = "PRIMARY_DIRECT_LOSS"
+ROLE_CHALLENGE_CONTEXT: Final = "CHALLENGE_CONTEXT_NO_DIRECT_LOSS"
+ROLE_OTHER_NONPRIMARY_CONTEXT: Final = "OTHER_NONPRIMARY_CONTEXT_NO_DIRECT_LOSS"
+ROLE_UNAVAILABLE_NO_STATE_UPDATE: Final = "UNAVAILABLE_NO_STATE_UPDATE"
+T2_ROW_ROLES: Final = (
+    ROLE_PRIMARY_DIRECT_LOSS,
+    ROLE_CHALLENGE_CONTEXT,
+    ROLE_OTHER_NONPRIMARY_CONTEXT,
+    ROLE_UNAVAILABLE_NO_STATE_UPDATE,
+)
+
+# consumes_z, updates_state, produces_score, direct_loss, primary_metric,
+# challenge_metric
+T2_ROW_ROLE_SEMANTICS: Final = {
+    ROLE_PRIMARY_DIRECT_LOSS: {
+        "consumes_z": True,
+        "updates_state": True,
+        "produces_score": True,
+        "direct_loss": True,
+        "primary_metric": True,
+        "challenge_metric": False,
+    },
+    ROLE_CHALLENGE_CONTEXT: {
+        "consumes_z": True,
+        "updates_state": True,
+        "produces_score": True,
+        "direct_loss": False,
+        "primary_metric": False,
+        "challenge_metric": True,
+    },
+    ROLE_OTHER_NONPRIMARY_CONTEXT: {
+        "consumes_z": True,
+        "updates_state": True,
+        "produces_score": True,
+        "direct_loss": False,
+        "primary_metric": False,
+        "challenge_metric": False,
+    },
+    ROLE_UNAVAILABLE_NO_STATE_UPDATE: {
+        "consumes_z": False,
+        "updates_state": False,
+        "produces_score": False,
+        "direct_loss": False,
+        "primary_metric": False,
+        "challenge_metric": False,
+    },
+}
+
+# The role is a masking key, never a trainable feature.
+T2_ROW_ROLE_IS_MODEL_INPUT: Final = False
+T2_CHALLENGE_IDENTITY_IS_MODEL_INPUT: Final = False
+T2_CHALLENGE_LABEL_IS_MODEL_INPUT: Final = False
+T2_CHALLENGE_RECEIVES_DIRECT_LOSS: Final = False
+# An available challenge z_t IS label-blind causal stream context, and inside the
+# gradient horizon it can influence a later PRIMARY loss through carried state.
+# Saying "challenge rows are not trained on" would therefore be false.
+T2_CHALLENGE_MAY_BE_LABEL_BLIND_CONTEXT: Final = True
+T2_CHALLENGE_IS_CHECKPOINT_EVIDENCE: Final = False
+
+# One continuous pass (§4)
+T2_SINGLE_CONTINUOUS_REPLAY_REQUIRED: Final = True
+T2_PRIMARY_ONLY_REPLAY_PERMITTED: Final = False
+T2_CHALLENGE_ONLY_REPLAY_PERMITTED: Final = False
+T2_STATE_RESET_BEFORE_CHALLENGE_ROWS: Final = False
+T2_INTERVENING_NON_PRIMARY_REMOVAL_PERMITTED: Final = False
+T2_MASKS_APPLIED_AFTER_SCORING: Final = True
+
+# ---------------------------------------------------------------------------
 # Representation (§4)
 # ---------------------------------------------------------------------------
 T2_EMBEDDING_DIM: Final = 128
@@ -170,7 +296,12 @@ T2_FORBIDDEN_TRAINABLE_INPUTS: Final = (
 T2_WINDOW_LENGTH_SECONDS: Final = 10.0
 T2_WINDOW_STRIDE_SECONDS: Final = 5.0
 T2_STREAM_KEY_FIELDS: Final = ("record_id", "channel_index")
-T2_STREAM_ORDER_FIELD: Final = "window_start_samples"
+# The persisted array in the frozen stream cache is `start_sample`. The
+# conceptual name used in prose is `window_start_samples`; the alias is declared
+# here so no execution harness has to infer the mapping (§6).
+T2_STREAM_ORDER_FIELD: Final = "start_sample"
+T2_STREAM_ORDER_FIELD_ALIAS: Final = "window_start_samples"
+T2_STREAM_ORDER_FIELD_SEMANTICS: Final = "window start in samples"
 T2_BIDIRECTIONAL_PERMITTED: Final = False
 T2_FUTURE_CONTEXT_PERMITTED: Final = False
 T2_SHUFFLE_WITHIN_STREAM_PERMITTED: Final = False
@@ -279,6 +410,158 @@ T2_PARAMETER_RATIO_MAX: Final = 2.0
 T2_MODEL_SIZE_INCREASE_AFTER_RESULTS_PERMITTED: Final = False
 
 # ---------------------------------------------------------------------------
+# Exact frozen architectures (§10 - §12)
+#
+# A future implementer must be able to build both models without making a single
+# new scientific choice. Everything below is therefore prospectively fixed:
+# activations, normalisation and its location, biases, initialisation, dropout
+# placement, state shapes and dtypes.
+#
+# Shared scaffolding, identical in both arms so the comparison isolates the
+# temporal core:
+#   Linear(146 -> 64, bias=True), NO activation, NO normalisation
+#   -> temporal core (2 layers, width 64)
+#   -> LayerNorm(64, eps=1e-5, elementwise_affine=True)
+#   -> Linear(64 -> 1, bias=True)
+# ---------------------------------------------------------------------------
+T2_LAYER_NORM_EPS: Final = 1e-5
+T2_PARAMETER_DTYPE: Final = "float32"
+T2_INITIALIZATION_SEED: Final = T2_SEED
+
+T2_SHARED_SCAFFOLD: Final = {
+    "input_projection": "Linear(146, 64, bias=True)",
+    "input_projection_activation": None,
+    "input_projection_normalization": None,
+    "final_norm": "LayerNorm(64, eps=1e-5, elementwise_affine=True)",
+    "final_norm_location": "after_temporal_core_before_readout",
+    "readout": "Linear(64, 1, bias=True)",
+    "readout_activation": None,
+    "output": "single_current_window_logit",
+    "hidden_state_initialization": "zeros",
+    "dtype": "float32",
+    "linear_initialization": "torch_default_kaiming_uniform_fan_in_with_uniform_bias",
+    "layer_norm_initialization": "weight_ones_bias_zeros",
+}
+
+T2_GRU_SPEC: Final = {
+    "architecture": T2_ARM_GRU,
+    **T2_SHARED_SCAFFOLD,
+    "temporal_core": "torch.nn.GRU",
+    "gru_input_size": 64,
+    "gru_hidden_size": 64,
+    "gru_num_layers": 2,
+    "gru_bias": True,
+    "gru_batch_first": True,
+    "gru_bidirectional": False,
+    # PyTorch applies nn.GRU dropout to the OUTPUT of every layer except the
+    # last, so with num_layers=2 it acts once, between layer 1 and layer 2.
+    "gru_dropout": 0.10,
+    "gru_dropout_semantics": "between_stacked_layers_only_not_after_final_layer",
+    "gru_initialization": "torch_default_uniform_over_plus_minus_one_over_sqrt_hidden",
+    "recurrent_state_shape": "(num_layers=2, batch, hidden=64)",
+    "residual_connection": False,
+    "extra_normalization": None,
+    "dropout_train_eval": "active_in_train_disabled_in_eval",
+}
+
+# The B4-C `DiagonalGatedSSMBlock` conventions are reused verbatim where they
+# transfer; the one deliberate divergence is the carried state, because B4-C
+# created and discarded state inside a single window and T2 must carry it across
+# a stream.
+T2_S4D_REUSES_B4C_CONVENTIONS: Final = (
+    "complex_diagonal_lambda_as_negative_exp_log_decay_plus_i_frequency",
+    "zero_order_hold_discretization_abar_exp_zeta",
+    "bbar_expm1_zeta_over_lambda_times_state_input",
+    "complex_c_from_separate_real_and_imaginary_parameters",
+    "output_takes_real_part_summed_over_state_dimension",
+    "real_per_channel_skip_term_d_initialized_to_zero",
+    "pre_layer_norm_then_input_projection_to_double_width",
+    "silu_gated_branch_then_output_projection",
+    "residual_add_with_dropout_on_the_branch",
+    "log_decay_initialized_to_log_half",
+    "frequency_initialized_to_pi_times_one_to_state_dim",
+    "log_step_initialized_uniform_in_log_1e_3_to_log_1e_1",
+    "b_and_c_initialized_normal_scaled_by_one_over_sqrt_state_dim",
+    "state_dim_16",
+)
+T2_S4D_DIVERGES_FROM_B4C: Final = (
+    "state is carried across windows, chunks and the whole stream rather than "
+    "created and discarded inside one window: B4-C modelled a fixed intra-window "
+    "token sequence, whereas T2 is a causal across-window stream model, so the "
+    "block must accept an incoming state and return the outgoing state",
+    "model width is 64 rather than B4-C's 128, to satisfy the frozen shared "
+    "capacity envelope against the GRU comparator",
+)
+
+T2_S4D_SPEC: Final = {
+    "architecture": T2_ARM_S4D,
+    **T2_SHARED_SCAFFOLD,
+    "temporal_core": "diagonal_gated_state_space_block",
+    "blocks": 2,
+    "model_width": 64,
+    "state_dim": 16,
+    "state_representation": "complex64_from_real_float32_parameters",
+    "lambda_parameterization": "complex(-exp(log_decay), frequency)",
+    "stability_constraint": "negative_real_part_guaranteed_by_negative_exp",
+    "discretization": "zero_order_hold",
+    "timestep_parameterization": "exp(log_step) per channel",
+    "timestep_initialization": "uniform(log(1e-3), log(1e-1))",
+    "transition_abar": "exp(exp(log_step) * lambda)",
+    "input_gain_bbar": "expm1(zeta) / lambda * state_input",
+    "b_parameterization": "real_state_input_matrix_cast_to_complex",
+    "c_parameterization": "complex(state_output_real, state_output_imaginary)",
+    "d_skip_term": "real_per_channel_vector_initialized_zero",
+    "state_update": "state = Abar * state + Bbar * u_t",
+    "output_equation": "(C * state).real.sum(-1) + D * u_t",
+    "block_norm": "LayerNorm(64, eps=1e-5) pre-norm at block input",
+    "block_input_projection": "Linear(64, 128, bias=True) chunked into value/gate",
+    "activation": "SiLU on the gate branch only",
+    "block_output_projection": "Linear(64, 64, bias=True)",
+    "residual_connection": True,
+    "dropout": 0.10,
+    "dropout_placement": "on_the_branch_before_the_residual_add",
+    "recurrent_state_shape": "(batch, width=64, state=16) complex64",
+    "hidden_state_initialization": "zeros",
+    "recurrent_inference": "explicit_step_recurrence_carrying_state_across_windows",
+    "log_decay_initialization": "log(0.5)",
+    "frequency_initialization": "pi * arange(1, state_dim + 1)",
+    "bc_initialization": "normal(0, 1) * (1 / sqrt(state_dim))",
+    "dtype": "float32 parameters, complex64 state",
+    "dropout_train_eval": "active_in_train_disabled_in_eval",
+}
+
+# Frozen expected trainable parameter counts, following the B4-C convention of
+# asserting the count rather than discovering it. Derivation, all biases
+# included:
+#   shared      Linear(146,64)=9408, LayerNorm(64)=128, Linear(64,1)=65
+#   GRU         2 layers x (3*64*64 in + 3*64*64 hh + 2*3*64 bias) = 49920
+#   S4D block   LN 128 + Linear(64,128) 8320 + Linear(64,64) 4160
+#               + 5 x (64*16) 5120 + skip 64 + log_step 64 = 17856; x2 = 35712
+T2_EXPECTED_PARAMETER_COUNTS: Final = {
+    T2_ARM_GRU: 59_521,
+    T2_ARM_S4D: 45_313,
+}
+
+# Every degree of freedom a future implementer could otherwise decide.
+T2_REQUIRED_ARCHITECTURE_KEYS: Final = (
+    "input_projection",
+    "input_projection_activation",
+    "input_projection_normalization",
+    "final_norm",
+    "final_norm_location",
+    "readout",
+    "readout_activation",
+    "temporal_core",
+    "residual_connection",
+    "hidden_state_initialization",
+    "recurrent_state_shape",
+    "dtype",
+    "dropout_train_eval",
+)
+T2_UNBOUND_ARCHITECTURAL_CHOICE_REMAINS: Final = False
+T2_IMPLEMENTATION_MAY_CHOOSE: Final = ()
+
+# ---------------------------------------------------------------------------
 # Evaluation (§15 - §24)
 # ---------------------------------------------------------------------------
 T2_OUTER_VALIDATION_ATTEMPTS: Final = 1
@@ -286,7 +569,12 @@ T2_AUTOMATIC_RETRY_PERMITTED: Final = False
 T2_PRIMARY_SELECTION_METRIC: Final = "pooled_primary_validation_auprc"
 T2_SECONDARY_SELECTION_METRIC: Final = "subject_macro_auprc"
 T2_SELECTION_TIE_TOLERANCE: Final = 0.002
-T2_SELECTION_FINAL_TIE_BREAK: Final = "smaller_faster_model"
+# The 0.002 tolerance applies at BOTH stages; a difference of exactly 0.002 is
+# not a tie. The terminal rule is deterministic and mentions no latency.
+T2_SELECTION_PARAMETER_TIE_BREAK: Final = "lower_trainable_parameter_count"
+T2_SELECTION_TERMINAL_TIE_BREAK: Final = "retain_simpler_conventional_comparator"
+T2_SELECTION_TERMINAL_ARM: Final = "causal_gru_longitudinal_v1"
+T2_LATENCY_IN_SCIENTIFIC_SELECTION: Final = False
 T2_WEIGHTED_COMPOSITE_SCORE_PERMITTED: Final = False
 T2_CHALLENGE_IS_SELECTION_INPUT: Final = False
 T2_LATENCY_ADJUSTED_SCORE_PERMITTED: Final = False
@@ -770,29 +1058,169 @@ def select_t2_arm(
     subject_macro_auprc: dict[str, float],
     parameter_counts: dict[str, int],
 ) -> dict[str, Any]:
-    """The frozen three-step selection rule. Challenge evidence never enters it."""
+    """The frozen three-step selection rule. Challenge evidence never enters it.
+
+    The 0.002 tolerance applies at **both** stages: a subject-macro difference
+    below it is still a tie and falls through to parameter count. An earlier
+    revision required exact equality at the second stage, which made the written
+    tolerance unreachable in practice.
+
+    Boundary semantics, at both stages: a difference of exactly 0.002 is NOT a
+    tie; strictly less than 0.002 IS a tie.
+    """
     for source in (pooled_auprc, subject_macro_auprc, parameter_counts):
         missing = [arm for arm in T2_ARMS if arm not in source]
         if missing:
             raise T2ProtocolError(f"Selection input is missing {missing}.")
     gru, s4d = T2_ARM_GRU, T2_ARM_S4D
-    difference = abs(float(pooled_auprc[gru]) - float(pooled_auprc[s4d]))
-    if difference >= T2_SELECTION_TIE_TOLERANCE:
+    pooled_difference = abs(float(pooled_auprc[gru]) - float(pooled_auprc[s4d]))
+    macro_difference = abs(
+        float(subject_macro_auprc[gru]) - float(subject_macro_auprc[s4d])
+    )
+    if pooled_difference >= T2_SELECTION_TIE_TOLERANCE:
         selected = gru if pooled_auprc[gru] > pooled_auprc[s4d] else s4d
         basis = T2_PRIMARY_SELECTION_METRIC
-    elif subject_macro_auprc[gru] != subject_macro_auprc[s4d]:
+    elif macro_difference >= T2_SELECTION_TIE_TOLERANCE:
         selected = gru if subject_macro_auprc[gru] > subject_macro_auprc[s4d] else s4d
         basis = T2_SECONDARY_SELECTION_METRIC
+    elif parameter_counts[gru] != parameter_counts[s4d]:
+        selected = gru if parameter_counts[gru] < parameter_counts[s4d] else s4d
+        basis = T2_SELECTION_PARAMETER_TIE_BREAK
     else:
-        selected = gru if parameter_counts[gru] <= parameter_counts[s4d] else s4d
-        basis = T2_SELECTION_FINAL_TIE_BREAK
+        # Fully deterministic terminal rule: the simpler conventional comparator.
+        selected = T2_SELECTION_TERMINAL_ARM
+        basis = T2_SELECTION_TERMINAL_TIE_BREAK
     return {
         "selected_arm": selected,
         "selection_basis": basis,
-        "pooled_auprc_difference": difference,
+        "pooled_auprc_difference": pooled_difference,
+        "subject_macro_auprc_difference": macro_difference,
         "tie_tolerance": T2_SELECTION_TIE_TOLERANCE,
         "challenge_evidence_used": T2_CHALLENGE_IS_SELECTION_INPUT,
         "weighted_composite_used": T2_WEIGHTED_COMPOSITE_SCORE_PERMITTED,
+        "latency_used": T2_LATENCY_IN_SCIENTIFIC_SELECTION,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Full-timeline replay integrity (§5)
+# ---------------------------------------------------------------------------
+
+
+def require_full_timeline_replay(
+    *,
+    offered_rows: Sequence[T2Row],
+    frozen_stable_ids: Sequence[str],
+    offered_stable_ids: Sequence[str],
+    stream_cache_sha256: str,
+    expected_stream_cache_sha256: str,
+) -> dict[str, Any]:
+    """Prove a replay really is the frozen full timeline, not merely as long.
+
+    Matching a row count is not identity. This binds the stream-cache digest,
+    the exact stable-id membership, the exact stream membership and the
+    chronological ordering, and refuses duplicates -- so a silent category
+    filter, a swap or a thinning cannot pass as a full replay.
+    """
+    if stream_cache_sha256 != expected_stream_cache_sha256:
+        raise T2ProtocolError(
+            f"The replay reads stream cache {stream_cache_sha256!r}, not the "
+            f"frozen {expected_stream_cache_sha256!r}."
+        )
+    frozen = tuple(str(value) for value in frozen_stable_ids)
+    offered = tuple(str(value) for value in offered_stable_ids)
+    if len(offered) != len(set(offered)):
+        raise T2ProtocolError("The replay repeats a stable_id; rows are not unique.")
+    if len(offered) != len(frozen):
+        raise T2ProtocolError(
+            f"The replay carries {len(offered)} rows against the frozen "
+            f"{len(frozen)}. A full replay is thinned by nothing at all."
+        )
+    if set(offered) != set(frozen):
+        missing = sorted(set(frozen) - set(offered))[:5]
+        extra = sorted(set(offered) - set(frozen))[:5]
+        raise T2ProtocolError(
+            "The replay has the right row count but different membership; "
+            f"missing {missing}, unexpected {extra}. Equal length is not "
+            "full-timeline equivalence."
+        )
+    if offered != frozen:
+        raise T2ProtocolError(
+            "The replay carries the frozen rows in a different order; the "
+            "chronological ordering is part of the artifact."
+        )
+    streams = split_into_streams(offered_rows)  # validates ordering per stream
+    return {
+        "integrity_class": "t2_full_timeline_replay",
+        "stream_cache_sha256": stream_cache_sha256,
+        "row_count": len(offered),
+        "stream_count": len(streams),
+        "thinned": False,
+        "duplicate_rows": False,
+        "category_filtered_before_replay": False,
+        "order_field": T2_STREAM_ORDER_FIELD,
+    }
+
+
+def role_semantics(role: str) -> dict[str, bool]:
+    """The frozen per-role contract. The role is a mask key, never a feature."""
+    if role not in T2_ROW_ROLE_SEMANTICS:
+        raise T2ProtocolError(
+            f"{role!r} is not a frozen T2 row role; {list(T2_ROW_ROLES)} are."
+        )
+    return dict(T2_ROW_ROLE_SEMANTICS[role])
+
+
+def require_mask_does_not_thin_the_stream(
+    *, replay_row_count: int, masked_row_count: int
+) -> dict[str, int]:
+    """A loss/metric mask selects scores; it never shortens the replay."""
+    if masked_row_count > replay_row_count:
+        raise T2ProtocolError("A mask cannot select more rows than were replayed.")
+    return {
+        "replay_row_count": int(replay_row_count),
+        "masked_row_count": int(masked_row_count),
+        "context_rows_retained": int(replay_row_count),
+    }
+
+
+def architecture_spec(arm: str) -> dict[str, Any]:
+    """The exact frozen specification for one candidate."""
+    require_arm(arm)
+    return dict(T2_GRU_SPEC if arm == T2_ARM_GRU else T2_S4D_SPEC)
+
+
+def require_architecture_is_fully_specified(arm: str) -> dict[str, Any]:
+    """Prove no architectural degree of freedom is left to the implementer.
+
+    A missing key here is not a documentation gap: it is a decision a future
+    implementation PR would silently make, which §12 forbids.
+    """
+    spec = architecture_spec(arm)
+    missing = [key for key in T2_REQUIRED_ARCHITECTURE_KEYS if key not in spec]
+    if missing:
+        raise T2ProtocolError(
+            f"The {arm} specification leaves {missing} unbound. A future "
+            "implementation would have to invent them, which is forbidden."
+        )
+    unset = [
+        key
+        for key in T2_REQUIRED_ARCHITECTURE_KEYS
+        if spec[key] is None
+        and key
+        not in (
+            "input_projection_activation",
+            "input_projection_normalization",
+            "readout_activation",
+        )
+    ]
+    if unset:
+        raise T2ProtocolError(f"The {arm} specification leaves {unset} undecided.")
+    return {
+        "architecture": arm,
+        "fully_specified": True,
+        "expected_trainable_parameters": T2_EXPECTED_PARAMETER_COUNTS[arm],
+        "implementation_may_choose": list(T2_IMPLEMENTATION_MAY_CHOOSE),
     }
 
 
@@ -879,7 +1307,9 @@ def t2_protocol_identity() -> dict[str, Any]:
             "primary": T2_PRIMARY_SELECTION_METRIC,
             "secondary": T2_SECONDARY_SELECTION_METRIC,
             "tie_tolerance": T2_SELECTION_TIE_TOLERANCE,
-            "final_tie_break": T2_SELECTION_FINAL_TIE_BREAK,
+            "parameter_tie_break": T2_SELECTION_PARAMETER_TIE_BREAK,
+            "terminal_tie_break": T2_SELECTION_TERMINAL_TIE_BREAK,
+            "terminal_arm": T2_SELECTION_TERMINAL_ARM,
         },
         "environment_dependency_digest": T2_ENVIRONMENT_DEPENDENCY_DIGEST,
         "test_accessed": T2_TEST_ACCESSED,

@@ -131,8 +131,15 @@ consistently.
 
 ## 5. Availability semantics
 
-The stream unit is `(record_id, channel_index)`, ordered by
-`window_start_samples`.
+The stream unit is `(record_id, channel_index)`, ordered chronologically.
+
+**Persisted order field.** The frozen stream artifact exposes **`start_sample`**
+— window start in samples — as the persisted chronological position. Where this
+document uses the conceptual name `window_start_samples`, the exact alias is:
+
+> `window_start_samples := persisted start_sample`
+
+The execution harness is never left to infer this mapping.
 
 At a physically unavailable exact-flat observation
 (`observation_state == 2`, `UNAVAILABLE_EXACT_FLAT`):
@@ -212,15 +219,116 @@ participates.**
 Neither partition contains any outer VALIDATION or sealed TEST subject; the
 three outer partitions are pairwise disjoint at source.
 
-## 9. Training population
+## 9. Training population — full timeline context, PRIMARY loss mask
 
-Full chronological PRIMARY TRAIN streams. **The old 3:1 negative sampling
-strategy is forbidden inside T2 temporal sequences** — dropping arbitrary
-negative windows destroys the temporal continuity T2 exists to model.
+These are **two different populations**, and conflating them is the mistake this
+section exists to prevent.
 
-All available PRIMARY windows in the permitted T2 training subjects are used.
+- The model's **causal state context population** is the **FULL REPLAY
+  TIMELINE** from the frozen M1 full-stream memory cache.
+- **PRIMARY is a LOSS / METRIC MASK** applied to scores produced during that one
+  replay. It is **not** the temporal sequence itself.
+
+T2 preserves the complete frozen physical timeline. **The old 3:1 negative
+sampling strategy is forbidden**, and so is any other thinning: dropping windows
+destroys the temporal continuity T2 exists to model.
+
+### 9.1 Frozen population counts
+
+Read from the frozen feature-corpus authority
+(`cardiosentinel-features/ltstdb-baseline-v1/manifest.json`, feature corpus
+`f18785d520828cb171482926922346dda824c8868ed4b7f9be45897cd71d6eb5`), not derived
+here.
+
+| | TRAIN | VALIDATION |
+|---|---|---|
+| Full replay timeline | **2 208 431** | **492 904** |
+| `ischemic_positive` | 93 613 | 21 628 |
+| `background_negative` | 2 049 986 | 452 269 |
+| **PRIMARY (mask)** | **2 143 599** | **473 897** |
+| Non-PRIMARY timeline positions | **64 832** | **19 007** |
+| — challenge (rate / axis / conduction) | 46 025 | 8 137 |
+| — other non-primary | 18 807 | 10 870 |
+
+TRAIN non-PRIMARY decomposes exactly: 24 512 rate-related + 13 630 axis-shift +
+7 883 conduction-change + 2 836 boundary-ambiguous + 2 872
+source-censored-or-unknown + 13 099 quality-excluded = **64 832**. The
+VALIDATION PRIMARY count 473 897 and challenge count 8 137 are the same
+populations U1 and M2 bound.
+
 Class imbalance is handled **only** through the prospectively frozen loss
 weighting of §10.
+
+### 9.2 Exact row semantics
+
+For every row, in chronological stream order:
+
+| Role | Consumes `z_t` | Updates state | Score | Direct BCE loss | PRIMARY metric | Challenge metric |
+|---|---|---|---|---|---|---|
+| **A.** AVAILABLE + PRIMARY | yes | yes | yes | **yes** (on the fitting partition) | yes | no |
+| **B.** AVAILABLE + CHALLENGE | yes | yes | yes | **no** | no | yes (separate evidence) |
+| **C.** AVAILABLE + OTHER NON-PRIMARY | yes | yes | yes | **no** | no | no |
+| **D.** PHYSICALLY UNAVAILABLE EXACT-FLAT | **no** | **no** | **no** | **no** | no | no |
+
+For **B**, no challenge-family identity and no challenge label ever enters the
+model. For **C** — quality, boundary and censored populations as already frozen
+— no hidden category identity enters the model either. For **D**, the timeline
+position still advances and causal state carries across the gap.
+
+**The row role is a masking key, never a trainable feature.**
+
+### 9.3 Gradient wording — what may and may not be claimed
+
+It would be **false** to say "challenge rows are not trained on". An available
+challenge `z_t` is consumed as temporal context, and inside the causal gradient
+horizon it can influence a later PRIMARY loss through the carried hidden state.
+
+The correct claims, which this protocol makes instead:
+
+- challenge **identity** is never a model input;
+- challenge **labels** are never a model input;
+- challenge rows receive **no direct training loss**;
+- challenge evidence is never checkpoint or model-selection evidence;
+- an available challenge `z_t` **may participate as label-blind causal stream
+  context**.
+
+The same applies to every other physically available non-PRIMARY row.
+
+## 9A. One continuous pass
+
+For each stream, the complete chronological **full** timeline is processed
+**exactly once**. State begins from zeros at the real stream boundary and
+evolves causally over every AVAILABLE timeline observation. Masks are applied
+**after** scores exist.
+
+**Internal-dev:** PRIMARY mask only, for AUPRC checkpoint selection, early
+stopping and F1 threshold derivation.
+
+**Outer VALIDATION:** PRIMARY mask only for headline metrics and model
+selection; CHALLENGE mask only for the separate challenge evidence; other
+non-primary rows contribute to no headline metric.
+
+Forbidden: a PRIMARY-only replay; a challenge-only replay; resetting state
+before challenge rows; removing intervening non-primary windows.
+
+**PRIMARY and CHALLENGE results must come from the SAME causal stream pass.**
+
+## 9B. Full-timeline integrity
+
+"Full chronological" means more than matching a row count. The later harness
+must prove:
+
+- the exact frozen stream-cache identity;
+- exact stream membership;
+- exact `stable_id` membership;
+- chronological `start_sample` ordering;
+- no thinning;
+- no duplicate row;
+- no silent category filter before temporal replay.
+
+**Equal row count with different membership is not full-timeline equivalence.**
+No new scientific representation is created; the frozen M1 stream-cache identity
+is reused.
 
 ## 10. Loss
 
@@ -242,13 +350,14 @@ Frozen **truncated backpropagation through time**, TBPTT length **256 windows** 
 
 The distinction that matters:
 
-- hidden state **MAY** carry causally from one chunk into the next;
-- the carried state is **detached** at the chunk boundary;
+- hidden state **MUST carry causally** across TBPTT chunk boundaries and **MUST
+  be detached** at each boundary;
 - gradients **do NOT** propagate beyond 256 windows;
 - state resets **only** at real stream boundaries.
 
-**There is no artificial state reset every 256 windows.** Stream chronological
-order is preserved throughout.
+Carrying is mandatory, not optional: the chunk boundary is a gradient boundary
+and nothing else. **There is no artificial temporal-state reset every 256
+windows.** Stream chronological order is preserved throughout.
 
 ## 12. Model arms
 
@@ -277,9 +386,128 @@ The comparison must not be won by one candidate being dramatically larger.
 | dropout | 0.10 |
 | output | single current-window logit |
 
-Both candidates must remain within approximately **0.5× to 2.0×** of each
-other's trainable parameter count. Exact parameter counts are persisted. **Model
-size is never increased after seeing results.**
+Both candidates must remain within **0.5× to 2.0×** of each other's trainable
+parameter count. **Model size is never increased after seeing results.**
+
+### 13.1 Shared scaffolding
+
+Identical in both arms, so the comparison isolates the temporal core:
+
+```
+Linear(146 -> 64, bias=True)      # no activation, no normalisation
+  -> temporal core (2 layers, width 64)
+  -> LayerNorm(64, eps=1e-5, elementwise_affine=True)
+  -> Linear(64 -> 1, bias=True)   # single current-window logit, no activation
+```
+
+Hidden state initialises to **zeros**. Parameters are **float32**. Linear layers
+use PyTorch default initialisation (Kaiming-uniform weights, uniform bias);
+LayerNorm initialises weight to ones and bias to zeros. Dropout is active in
+`train` and disabled in `eval`.
+
+### 13.2 Frozen trainable parameter counts
+
+| Component | Count |
+|---|---|
+| `Linear(146, 64)` | 9 408 |
+| `LayerNorm(64)` | 128 |
+| `Linear(64, 1)` | 65 |
+| GRU recurrent (2 layers) | 49 920 |
+| S4D block × 2 | 35 712 |
+| **`causal_gru_longitudinal_v1` total** | **59 521** |
+| **`causal_s4d_longitudinal_v1` total** | **45 313** |
+| Ratio S4D / GRU | **0.7613** — inside [0.5, 2.0] |
+
+Following the B4-C convention, the implementation asserts these counts rather
+than discovering them.
+
+## 13A. Exact GRU architecture — `causal_gru_longitudinal_v1`
+
+| Property | Frozen value |
+|---|---|
+| input projection | `Linear(146, 64, bias=True)` |
+| projection activation | **none** |
+| projection normalisation | **none** |
+| temporal core | `torch.nn.GRU` |
+| `input_size` | 64 |
+| `hidden_size` | 64 |
+| `num_layers` | 2 |
+| `bias` | true |
+| `batch_first` | true |
+| `bidirectional` | **false** |
+| `dropout` | 0.10 |
+| dropout semantics | PyTorch applies `nn.GRU` dropout to the output of every layer **except the last**, so with `num_layers=2` it acts once, between layer 1 and layer 2 |
+| GRU initialisation | PyTorch default, uniform over ±1/√hidden |
+| recurrent state shape | `(num_layers=2, batch, hidden=64)` |
+| hidden-state init | zeros |
+| residual connection | **none** |
+| extra normalisation | **none** beyond the shared final LayerNorm |
+| readout | `Linear(64, 1, bias=True)`, no activation |
+| dtype | float32 |
+
+## 13B. Exact S4D architecture — `causal_s4d_longitudinal_v1`
+
+Two `DiagonalGatedSSMBlock`s at width 64, state dimension 16.
+
+| Property | Frozen value |
+|---|---|
+| state representation | complex64 state from real float32 parameters |
+| diagonal λ | `complex(-exp(log_decay), frequency)` |
+| stability constraint | negative real part guaranteed by `-exp(·)` |
+| discretisation | zero-order hold |
+| timestep | `exp(log_step)` per channel |
+| timestep init | `uniform(log 1e-3, log 1e-1)` |
+| transition `Ā` | `exp(exp(log_step) · λ)` |
+| input gain `B̄` | `expm1(ζ) / λ · state_input` |
+| `B` parameterisation | real `state_input` matrix cast to complex |
+| `C` parameterisation | `complex(state_output_real, state_output_imaginary)` |
+| `D` skip term | real per-channel vector, initialised to zero |
+| state update | `state = Ā · state + B̄ · u_t` |
+| output equation | `(C · state).real.sum(-1) + D · u_t` |
+| block norm | `LayerNorm(64, eps=1e-5)`, **pre-norm** at block input |
+| block input projection | `Linear(64, 128, bias=True)`, chunked into value / gate |
+| activation | **SiLU on the gate branch only** |
+| block output projection | `Linear(64, 64, bias=True)` |
+| residual connection | **yes** |
+| dropout | 0.10, **on the branch before the residual add** |
+| recurrent state shape | `(batch, width=64, state=16)` complex64 |
+| hidden-state init | zeros |
+| `log_decay` init | `log(0.5)` |
+| `frequency` init | `π · arange(1, state_dim + 1)` |
+| `B`, `C` init | `normal(0, 1) · (1/√state_dim)` |
+| recurrent inference | explicit step recurrence **carrying state across windows** |
+| dtype | float32 parameters, complex64 state |
+
+### 13B.1 B4-C conventions reused
+
+The repository's existing B4-C `DiagonalGatedSSMBlock` conventions are reused
+verbatim rather than reinvented: the complex diagonal λ parameterisation; the
+zero-order-hold discretisation and `expm1`-based input gain; the complex `C`
+from separate real and imaginary parameters; taking the real part summed over
+the state dimension; the real per-channel `D` initialised to zero; pre-LayerNorm
+then projection to double width; the SiLU-gated branch and output projection;
+the residual add with dropout on the branch; and every initialiser
+(`log_decay = log 0.5`, `frequency = π·[1..N]`, `log_step ~ U(log 1e-3, log
+1e-1)`, `B`/`C` normal scaled by `1/√N`), including **state dimension 16**.
+
+### 13B.2 Two deliberate divergences, and why
+
+1. **State is carried** across windows, chunks and the whole stream, rather than
+   created and discarded inside one window. B4-C modelled a fixed intra-window
+   token sequence and explicitly discarded state on return; T2 is a causal
+   across-window stream model, so the block must accept an incoming state and
+   return the outgoing state.
+2. **Width is 64, not B4-C's 128**, to satisfy the frozen shared capacity
+   envelope against the GRU comparator.
+
+## 13C. No unbound architectural choice remains
+
+A future implementation PR may translate this specification into PyTorch. It may
+**not** decide another activation, normalisation scheme, discretisation, SSM
+parameterisation, residual structure, dropout position, layer count or width.
+
+Every such degree of freedom is fixed above; the executable specification proves
+completeness, and the set of choices left to the implementer is **empty**.
 
 ## 14. Optimisation
 
@@ -313,10 +541,29 @@ status exactly as M1/M2/U1 did.
 
 Primary: **pooled PRIMARY VALIDATION AUPRC.** Secondary: subject-macro AUPRC.
 
-1. higher pooled AUPRC wins;
-2. if the absolute pooled-AUPRC difference is `< 0.002`, higher subject-macro
-   AUPRC wins;
-3. if still tied within `0.002`, retain the smaller / faster model.
+The frozen rule, with the `0.002` tolerance applying at **both** stages:
+
+```
+d_pooled = abs(pooled_auprc_A - pooled_auprc_B)
+
+if d_pooled >= 0.002:
+    higher pooled AUPRC wins
+else:
+    d_macro = abs(subject_macro_auprc_A - subject_macro_auprc_B)
+    if d_macro >= 0.002:
+        higher subject-macro AUPRC wins
+    else:
+        lower trainable parameter count wins
+        if parameter counts are exactly equal:
+            retain causal_gru_longitudinal_v1
+```
+
+**Boundary semantics, at both stages:** a difference of exactly `0.002` is **not**
+a tie; strictly less than `0.002` **is** a tie.
+
+The terminal rule is fully deterministic: `causal_gru_longitudinal_v1` is
+retained as the simpler conventional comparator. **Latency is not part of the
+scientific model-selection rule** — it belongs to later edge / system evidence.
 
 No weighted composite scores, no challenge-weighted selection, no
 latency-adjusted scientific scores. **Challenge evidence is never a selection
@@ -479,14 +726,18 @@ generalisation and must never be described as such.
 | M2 retention decision | `da4a05b4e2e3dd633493b87a08ed369010fa91c9cac21d906980a658fcf2be47` |
 | M2-G arm result | `a061d4d8c5211381c18baa228436bb9abc78b2f87f71fe4cab6ca71b2d15cf75` |
 | **T2 internal subject split** | **`54f8091ee7d4620ab6e24aaa32b121874b6a1610003e3df63f94f9727618e28e`** |
-| Stream ordering rule | `(record_id, channel_index)` ordered by `window_start_samples` |
+| Stream ordering rule | `(record_id, channel_index)` ordered by persisted `start_sample` (alias `window_start_samples`) |
 | Availability rule | `AVAILABLE = 1`, `UNAVAILABLE_EXACT_FLAT = 2`; never synthesised, never absorbed |
+| Feature-corpus authority | `f18785d520828cb171482926922346dda824c8868ed4b7f9be45897cd71d6eb5` |
+| Context population | full replay timeline — TRAIN 2 208 431 / VALIDATION 492 904 |
+| PRIMARY loss / metric mask | TRAIN 2 143 599 / VALIDATION 473 897 |
+| Frozen parameter counts | GRU 59 521 · S4D 45 313 (ratio 0.7613) |
 | Input dimension | 146 |
 | TBPTT length | 256 windows |
 | Candidates | `causal_gru_longitudinal_v1`, `causal_s4d_longitudinal_v1` |
 | Optimizer | AdamW, lr 3e-4, wd 1e-4, ≤10 epochs, clip 1.0 |
 | Seed | 2026 |
-| Selection rule | pooled AUPRC → subject-macro AUPRC within 0.002 → smaller model |
+| Selection rule | pooled AUPRC (≥0.002) → subject-macro AUPRC (≥0.002) → lower parameter count → GRU |
 | TEST state | `test_accessed: false`, `sealed_test_state: unopened` |
 
 ## 31. Environment
