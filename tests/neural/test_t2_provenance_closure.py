@@ -39,6 +39,7 @@ from tests.neural.test_t2_canonical_training_route import (  # noqa: F401
     clean_git,
     environment,
     frozen_runtime,
+    outer_attempt_unchanged,
 )
 from tests.neural.test_t2_outer_validation_governance import (  # noqa: F401
     _train_checks,
@@ -413,14 +414,14 @@ def test_activation_true_still_opens_nothing_unauthorized(monkeypatch):
         EV, "_open_validation_timeline", lambda *a, **k: opened.append(a)
     )
     assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
-    for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
+    with outer_attempt_unchanged():
+        for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
+            with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
+                entry(GIT_SHA)
         with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
-            entry(GIT_SHA)
-    with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
-        RUN.execute_canonical_outer_validation(GIT_SHA)
-    assert RUN.main(["--execute-canonical-outer-validation"]) == 2
+            RUN.execute_canonical_outer_validation(GIT_SHA)
+        assert RUN.main(["--execute-canonical-outer-validation"]) == 2
     assert opened == []
-    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists()
 
 
 # --- 14-16. the outer failure receipt after row-evidence promotion ---------
