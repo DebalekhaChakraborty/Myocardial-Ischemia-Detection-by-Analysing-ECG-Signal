@@ -57,56 +57,39 @@ class T2EvaluationError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 
-def execute_canonical_outer_validation(
-    expected_git_sha: str | None = None,
-    *,
-    validation_root: Any = None,
-    corpus_manifest: Any = None,
-) -> dict[str, Any]:
-    """The one-shot outer-VALIDATION route. Refuses while unauthorized.
+def execute_canonical_outer_validation(expected_git_sha: str | None) -> dict[str, Any]:
+    """The one-shot canonical outer-VALIDATION route. Refuses while unauthorized.
 
     The activation gate is the first statement: no argument is inspected, no
-    path is resolved and no VALIDATION array is opened before it fires. Only
-    once the activation state is `True` does it reach the worker -- which then
-    proves the authorized merged commit, a clean tree and an unconsumed outer
-    attempt, and claims, all before any VALIDATION per-row artifact exists.
+    path is resolved and no VALIDATION array is opened before it fires.
 
-    `expected_git_sha` is not decorative and is not ignored after activation:
-    it is the same human-authorization mechanism the TRAIN route uses, and a
-    wrong one stops the attempt before the VALIDATION loader is invoked.
+    **This signature is the whole public scientific surface.** There is no
+    `run_root`, no `training_attempt_id`, no `validation_root`, no
+    `corpus_manifest`, no device, threshold, arm, retry or force. A function
+    named canonical that accepted a source override would not be canonical: it
+    would be a route by which the one-shot attempt could be pointed at
+    something other than the promoted artifacts. Fixture injection lives on the
+    private `_outer_validation_worker`, which the CLI cannot reach.
+
+    `expected_git_sha` is the human-authorization mechanism, the same one the
+    TRAIN route uses, and it is not ignored after activation: the worker proves
+    it, proves the tree clean, proves the outer attempt unconsumed and claims,
+    all before any VALIDATION per-row artifact is opened.
     """
     require_outer_validation_authorized()
     return _outer_validation_worker(  # pragma: no cover - gate is False
-        expected_git_sha,
-        validation_root=validation_root,
-        corpus_manifest=corpus_manifest,
+        expected_git_sha
     )
 
 
-def open_validation_timeline(*_args: Any, **kwargs: Any) -> Any:
-    """Would open the VALIDATION timeline. Refuses before touching the store."""
-    require_outer_validation_authorized()
-    return _open_validation_timeline(  # pragma: no cover - gate is False
-        kwargs.get("root")
-    )
-
-
-def load_validation_labels(*_args: Any, **kwargs: Any) -> Any:
-    """Would read VALIDATION labels. Refuses first."""
-    require_outer_validation_authorized()
-    timeline = _open_validation_timeline(  # pragma: no cover - gate is False
-        kwargs.get("root")
-    )
-    return _load_validation_targets(  # pragma: no cover - gate is False
-        timeline, manifest_path=kwargs.get("corpus_manifest")
-    )
-
-
-OUTER_VALIDATION_ENTRY_POINTS: Final = (
-    execute_canonical_outer_validation,
-    open_validation_timeline,
-    load_validation_labels,
-)
+# The public outer surface is exactly the claim-bearing canonical route.
+#
+# `open_validation_timeline` and `load_validation_labels` used to sit here.
+# They were raw loaders: flipping the single activation constant would have
+# unlocked a way to open VALIDATION with no claim, no authorized commit and no
+# attempt consumed. They are now private helpers reachable only from inside the
+# claim-bearing choreography.
+OUTER_VALIDATION_ENTRY_POINTS: Final = (execute_canonical_outer_validation,)
 
 
 # ---------------------------------------------------------------------------

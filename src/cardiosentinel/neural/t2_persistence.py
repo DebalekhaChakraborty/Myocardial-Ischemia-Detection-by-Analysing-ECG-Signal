@@ -685,6 +685,133 @@ def require_deterministic_execution(device: Any) -> dict[str, Any]:
     }
 
 
+def _require_sha256_like_git(value: Any) -> str:
+    if not isinstance(value, str) or not _GIT_SHA_PATTERN.match(value):
+        raise T2PersistenceError(f"Not a Git commit identity: {value!r}.")
+    return value
+
+
+def require_authorized_git_identity(authorized_git_sha: str) -> dict[str, Any]:
+    """Re-read HEAD and prove it is still the commit the human authorized.
+
+    A canonical attempt can run for hours. Preflight proved the checkout was
+    clean and at the authorized commit; nothing stopped HEAD moving afterwards,
+    and a result written at commit A beside a lock written at commit B would be
+    two independently well-formed artifacts describing different code. This is
+    called once, immediately before the claim-bearing promotion, and its result
+    is what both artifacts then carry.
+
+    A drift STOPS the attempt. The attempt is consumed, the normal additive
+    failure receipt is written, and nothing is retried.
+    """
+    expected = _require_sha256_like_git(authorized_git_sha)
+    git = git_provenance(REPOSITORY_ROOT)
+    if git["git_dirty"] is not False:
+        raise T2PersistenceError(
+            "The working tree became dirty during the canonical attempt. "
+            "Canonical T2 evidence requires a clean checkout at promotion as "
+            "well as at preflight; the attempt is consumed and nothing is "
+            "promoted, repaired or retried."
+        )
+    if git["git_sha"] != expected:
+        raise T2PersistenceError(
+            f"HEAD moved during the canonical attempt: it is now "
+            f"{git['git_sha']}, but the attempt was authorized for {expected}. "
+            "A result and a lock written at different commits would describe "
+            "different code; the attempt is consumed and nothing is promoted, "
+            "repaired or retried."
+        )
+    return {
+        "authorized_git_sha": expected,
+        "git_sha": str(git["git_sha"]),
+        "git_dirty": False,
+        "git_identity_reverified_before_promotion": True,
+    }
+
+
+def build_execution_device_proof(
+    per_arm_proof: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """One top-level device proof, derived only after both arms have passed.
+
+    The top-level claim is not a fresh reading: it is the agreement of the two
+    arms' own observed parameter devices. If they disagree, or if either
+    disagrees with the device it declared, there is no single device the
+    canonical comparison ran on and execution STOPS.
+    """
+    missing = [arm for arm in T2_ARMS if arm not in per_arm_proof]
+    if missing:
+        raise T2PersistenceError(
+            f"A top-level execution-device proof needs both frozen arms; "
+            f"missing {missing}."
+        )
+    declared = {str(per_arm_proof[arm]["declared_execution_device"]) for arm in T2_ARMS}
+    observed = {str(per_arm_proof[arm]["model_parameter_device"]) for arm in T2_ARMS}
+    for arm in T2_ARMS:
+        if per_arm_proof[arm].get("execution_device_agrees") is not True:
+            raise T2PersistenceError(
+                f"The {arm} execution-device proof does not agree; no top-level "
+                "proof can be derived from it."
+            )
+    first_declared = sorted(declared)[0]
+    first_observed = sorted(observed)[0]
+    if len(observed) != 1 or not all(
+        _same_device(first_observed, other) for other in observed
+    ):
+        raise T2PersistenceError(
+            f"The two T2 arms executed on different devices: {sorted(observed)}. "
+            "A mixed-device scientific comparison is not admissible."
+        )
+    if not all(_same_device(first_declared, other) for other in declared):
+        raise T2PersistenceError(
+            f"The two T2 arms declared different devices: {sorted(declared)}."
+        )
+    if not _same_device(first_declared, first_observed):
+        raise T2PersistenceError(
+            f"The arms declared {first_declared} but executed on {first_observed}."
+        )
+    return {
+        "declared_execution_device": first_declared,
+        "model_parameter_device": first_observed,
+        "execution_device_agrees": True,
+        "derived_from": "both_arm_observed_parameter_devices",
+    }
+
+
+def require_execution_device_cross_binding(
+    top_level: dict[str, Any], parts: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """Every artifact that names a device must name the same one.
+
+    The top-level lock, the top-level result, both arm results and both
+    checkpoint locks each carry a device proof. A rewritten top-level proof
+    with a repaired self-digest is still refused, because the arm artifacts
+    disagree with it.
+    """
+    declared = str(top_level["declared_execution_device"])
+    observed = str(top_level["model_parameter_device"])
+    require_execution_device_agreement(top_level, observed)
+    for name, proof in parts.items():
+        if proof.get("execution_device_agrees") is not True:
+            raise T2PersistenceError(f"{name} records a disagreeing device proof.")
+        if not _same_device(str(proof["declared_execution_device"]), declared):
+            raise T2PersistenceError(
+                f"{name} declares {proof['declared_execution_device']!r} but the "
+                f"canonical attempt declares {declared!r}."
+            )
+        if not _same_device(str(proof["model_parameter_device"]), observed):
+            raise T2PersistenceError(
+                f"{name} executed on {proof['model_parameter_device']!r} but the "
+                f"canonical attempt records {observed!r}."
+            )
+    return {
+        "declared_execution_device": declared,
+        "model_parameter_device": observed,
+        "execution_device_agrees": True,
+        "cross_bound_artifacts": sorted(parts),
+    }
+
+
 def require_single_runtime(first: dict[str, Any], second: dict[str, Any]) -> None:
     """Both arms must share one device and runtime. Otherwise STOP."""
     for field_ in (
@@ -706,8 +833,11 @@ def require_single_runtime(first: dict[str, Any], second: dict[str, Any]) -> Non
 
 
 REQUIRED_LOCK_FIELDS: Final = (
+    "authorized_git_sha",
     "git_sha",
     "git_dirty",
+    "execution_device_proof",
+    "per_arm_execution_device_proof",
     "interpreter",
     "package_count",
     "dependency_digest",
@@ -732,16 +862,35 @@ def build_t2_run_lock(
     completed_at: str,
     artifact_sha256: dict[str, str],
 ) -> dict[str, Any]:
-    """Construct the one canonical T2 training lock. The only identity assembly."""
-    git = git_provenance(REPOSITORY_ROOT)
-    environment = runtime_provenance()
+    """Construct the one canonical T2 training lock. The only identity assembly.
+
+    Two identities are supplied rather than re-observed here.
+
+    **Git.** `require_authorized_git_identity` has already re-read HEAD and
+    proved it is still the commit the human authorized at preflight. Re-reading
+    it independently a third time would let the lock attest to a commit the
+    result never named, so the proven pair travels in through `provenance`.
+
+    **Device.** The runtime record is the one both arms actually executed on,
+    complete with the observed `model_parameter_device`. A fresh
+    `runtime_provenance()` here would carry the declared device and no proof
+    that anything ran there, which is exactly the gap this closes.
+    """
+    authorized = _require_sha256_like_git(provenance["authorized_git_sha"])
+    git = dict(provenance["git_identity"])
+    environment = dict(provenance["runtime"])
     lock: dict[str, Any] = {
         "lock_class": LOCK_CLASS,
         "attempt_id": str(attempt_id),
         "experiment_identity": T2_EXPERIMENT_IDENTITY,
+        "authorized_git_sha": authorized,
         "git_sha": git["git_sha"],
         "git_dirty": git["git_dirty"],
         **environment,
+        "execution_device_proof": dict(provenance["execution_device_proof"]),
+        "per_arm_execution_device_proof": dict(
+            provenance["per_arm_execution_device_proof"]
+        ),
         "t2_protocol_sha256": T2_PROTOCOL_SHA256,
         "t2_execution_spec_sha256": T2_EXECUTION_SPEC_SHA256,
         "split_sha256": T2_SPLIT_SHA256,
@@ -810,6 +959,22 @@ def validate_t2_run_lock(
             "Canonical T2 evidence requires a clean Git checkout, matching the "
             "existing P1/M1/M2/U1 convention."
         )
+    # The commit the lock was written at must be the commit the human
+    # authorized. Two independently well-formed artifacts at different commits
+    # describe different code.
+    _require_sha256_like_git(lock["authorized_git_sha"])
+    if lock["git_sha"] != lock["authorized_git_sha"]:
+        raise T2PersistenceError(
+            f"The canonical T2 lock was written at {lock['git_sha']} but the "
+            f"attempt was authorized for {lock['authorized_git_sha']}."
+        )
+    require_execution_device_cross_binding(
+        dict(lock["execution_device_proof"]),
+        {
+            f"{arm} arm device proof": dict(proof)
+            for arm, proof in dict(lock["per_arm_execution_device_proof"]).items()
+        },
+    )
     for field_, expected in (
         ("t2_protocol_sha256", T2_PROTOCOL_SHA256),
         ("t2_execution_spec_sha256", T2_EXECUTION_SPEC_SHA256),
@@ -922,6 +1087,9 @@ def validate_t2_result_payload(result: dict[str, Any]) -> dict[str, Any]:
         name
         for name in (
             "attempt_id",
+            "authorized_git_sha",
+            "git_sha",
+            "execution_device_proof",
             "component_sha256",
             "checkpoint_sha256",
             "checkpoint_lock_sha256",
@@ -955,6 +1123,16 @@ def validate_t2_result_payload(result: dict[str, Any]) -> dict[str, Any]:
         raise T2PersistenceError("A T2 result must record test_accessed=false.")
     if result.get("sealed_test_state") != "unopened":
         raise T2PersistenceError("The B4 sealed test must remain unopened.")
+    _require_sha256_like_git(result["authorized_git_sha"])
+    if result["git_sha"] != result["authorized_git_sha"]:
+        raise T2PersistenceError(
+            f"The canonical T2 result was written at {result['git_sha']} but the "
+            f"attempt was authorized for {result['authorized_git_sha']}."
+        )
+    if result["execution_device_proof"].get("execution_device_agrees") is not True:
+        raise T2PersistenceError(
+            "A canonical T2 result must carry a passing execution-device proof."
+        )
     return result
 
 
@@ -993,6 +1171,33 @@ def validate_canonical_t2_attempt(run_root: Path, attempt_id: str) -> dict[str, 
                 f"The {arm} checkpoint lock was claimed by attempt "
                 f"{checkpoint_lock['attempt_id']!r}, not {attempt_id!r}."
             )
+
+    # ONE authorized commit across every artifact that names one.
+    authorized = _require_sha256_like_git(result["authorized_git_sha"])
+    for label, observed in (
+        ("result.git_sha", result["git_sha"]),
+        ("lock.authorized_git_sha", lock["authorized_git_sha"]),
+        ("lock.git_sha", lock["git_sha"]),
+    ):
+        if observed != authorized:
+            raise T2PersistenceError(
+                f"{label} is {observed!r}, but the attempt was authorized for "
+                f"{authorized!r}. Every canonical artifact names one commit."
+            )
+
+    # ONE execution device across every artifact that names one: the top-level
+    # result, the top-level lock, both arm results and both checkpoint locks.
+    parts: dict[str, dict[str, Any]] = {}
+    for arm in T2_ARMS:
+        arm_result = json.loads((run_dir / ARM_RESULT_NAME[arm]).read_text())
+        parts[f"{arm} arm result"] = dict(arm_result["execution_device_proof"])
+        parts[f"{arm} checkpoint lock"] = dict(
+            checkpoint_locks[arm]["execution_device_proof"]
+        )
+    parts["experiment lock"] = dict(lock["execution_device_proof"])
+    device = require_execution_device_cross_binding(
+        dict(result["execution_device_proof"]), parts
+    )
     return {
         "verification_class": "t2_canonical_attempt_verification",
         "attempt_id": str(attempt_id),
@@ -1002,6 +1207,9 @@ def validate_canonical_t2_attempt(run_root: Path, attempt_id: str) -> dict[str, 
         "checkpoint_sha256": dict(lock["checkpoint_sha256"]),
         "checkpoint_lock_sha256": dict(lock["checkpoint_lock_sha256"]),
         "checkpoint_locks_verified": True,
+        "authorized_git_sha": authorized,
+        "git_identity_verified": True,
+        "execution_device_proof": device,
         "arm_selection_status": ARM_SELECTION_PENDING,
         "verified": True,
     }
@@ -1089,6 +1297,16 @@ def finalize_and_promote_t2_result(
 ) -> dict[str, Any]:
     """Validate, gate, promote and lock the one canonical T2 training result."""
     require_frozen_runtime_record(runtime)
+    # BEFORE anything claim-bearing is written. A drift here consumes the
+    # attempt through the caller's failure receipt rather than promoting a
+    # result and a lock that name different commits.
+    git_identity = require_authorized_git_identity(provenance["authorized_git_sha"])
+    provenance = {**provenance, "git_identity": git_identity}
+    if result["authorized_git_sha"] != git_identity["authorized_git_sha"]:
+        raise T2PersistenceError(
+            "The canonical result names a different authorized commit than the "
+            "provenance the lock will be built from."
+        )
     validate_t2_result_payload(result)
     for name in COMPONENT_ARTIFACTS:
         if claimed.promoted.get(name) != result["component_sha256"].get(name):
@@ -1554,11 +1772,26 @@ def record_t2_outer_attempt_failure(
 ) -> dict[str, Any]:
     """One additive forensic receipt for a post-claim outer failure. No retry."""
     git = git_provenance(REPOSITORY_ROOT)
-    promoted = {
-        name: sha256_file(claimed.run_dir / name)
-        for name in (OUTER_RESULT_NAME, OUTER_LOCK_NAME)
-        if (claimed.run_dir / name).is_file()
-    }
+    # Start from what the attempt recorded as promoted -- which already
+    # includes the row-evidence manifest once it is written -- and then re-read
+    # the filesystem for anything claim-bearing that landed after that mapping
+    # was populated. Scanning only the result and the lock would silently omit
+    # row evidence that was promoted before the failure, and the receipt is the
+    # only record a consumed attempt leaves.
+    promoted: dict[str, str] = {}
+    for name, digest in dict(claimed.promoted).items():
+        path = claimed.run_dir / name
+        promoted[name] = sha256_file(path) if path.is_file() else str(digest)
+    from cardiosentinel.neural.t2_outer_evidence import T2_OUTER_STORE_MANIFEST_NAME
+
+    for name in (
+        OUTER_RESULT_NAME,
+        OUTER_LOCK_NAME,
+        f"{OUTER_EVIDENCE_DIRNAME}/{T2_OUTER_STORE_MANIFEST_NAME}",
+    ):
+        path = claimed.run_dir / name
+        if path.is_file():
+            promoted[name] = sha256_file(path)
     receipt = {
         "receipt_class": "t2_outer_validation_failure_receipt",
         "claim_bearing": False,
@@ -1575,8 +1808,11 @@ def record_t2_outer_attempt_failure(
         "git_sha": git["git_sha"],
         "git_dirty": git["git_dirty"],
         "exposure": dict(exposure),
-        "promotion_state_source": "filesystem",
+        "promotion_state_source": "claim_record_and_filesystem",
         "promoted_artifacts": promoted,
+        "row_evidence_manifest_sha256": promoted.get(
+            f"{OUTER_EVIDENCE_DIRNAME}/{T2_OUTER_STORE_MANIFEST_NAME}"
+        ),
         "runtime_identity_checks": runtime.as_dict() if runtime is not None else None,
         "automatic_retry_performed": False,
         "repeat_attempt_permitted": False,

@@ -47,6 +47,7 @@ def _train_checks():
         "experiment_identity": PS.T2_EXPERIMENT_IDENTITY,
         "attempt_id": PS.T2_TRAINING_ATTEMPT_ID,
         "git_sha": GIT_SHA,
+        "authorized_git_sha": GIT_SHA,
         "t2_protocol_sha256": PS.T2_PROTOCOL_SHA256,
         "t2_execution_spec_sha256": PS.T2_EXECUTION_SPEC_SHA256,
         "per_row_train_input_opened_before_claim": False,

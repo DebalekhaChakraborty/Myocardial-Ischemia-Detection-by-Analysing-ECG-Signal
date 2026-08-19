@@ -64,6 +64,7 @@ from cardiosentinel.neural.t2_persistence import (
     T2_TRAINING_ATTEMPT_ID,
     T2ActivationError,
     T2PersistenceError,
+    build_execution_device_proof,
     canonical_execution_device,
     claim_t2_run_directory,
     finalize_and_promote_t2_result,
@@ -162,6 +163,10 @@ def preflight(expected_git_sha: str | None) -> dict[str, Any]:
         "experiment_identity": T2_EXPERIMENT_IDENTITY,
         "attempt_id": T2_TRAINING_ATTEMPT_ID,
         "git_sha": git_sha,
+        # The one commit this attempt is authorized for. It travels through
+        # the result and the lock, and is re-proved against HEAD immediately
+        # before either is promoted.
+        "authorized_git_sha": git_sha,
         "t2_protocol_sha256": protocol_sha,
         "t2_execution_spec_sha256": execution_spec_sha,
         "arms": list(T2_ARMS),
@@ -463,6 +468,7 @@ def _train_both_arms(
     thresholds: dict[str, Any] = {}
     parameter_counts: dict[str, int] = {}
     runtimes: list[dict[str, Any]] = []
+    arm_device_proof: dict[str, Any] = {}
 
     for arm in T2_ARMS:
         exposure.stage = f"train_arm:{arm}"
@@ -503,6 +509,7 @@ def _train_both_arms(
         require_execution_device_agreement(
             observed_runtime, trained["model_parameter_device"]
         )
+        arm_device_proof[arm] = dict(device_proof)
         exposure.optimizer_stepped = True
         exposure.internal_dev_scored = True
         exposure.threshold_derived = True
@@ -580,11 +587,18 @@ def _train_both_arms(
 
     exposure.stage = "promote_canonical_result"
     require_capacity_envelope(parameter_counts)
+    # Derived only now, from the two arms' OWN observed parameter devices, so
+    # the top-level claim is their agreement rather than a fresh reading that
+    # proves nothing about where the science ran.
+    device_proof_top = build_execution_device_proof(arm_device_proof)
     result = {
         "artifact_class": RESULT_CLASS,
         "attempt_id": claimed.attempt_id,
         "experiment_identity": T2_EXPERIMENT_IDENTITY,
-        "git_sha": checks["git_sha"],
+        "git_sha": checks["authorized_git_sha"],
+        "authorized_git_sha": checks["authorized_git_sha"],
+        "execution_device_proof": device_proof_top,
+        "per_arm_execution_device_proof": dict(arm_device_proof),
         "t2_protocol_sha256": T2_PROTOCOL_SHA256,
         "t2_execution_spec_sha256": T2_EXECUTION_SPEC_SHA256,
         "internal_split_sha256": split["split_sha256"],
@@ -612,6 +626,10 @@ def _train_both_arms(
         "sealed_test_state": "unopened",
     }
     provenance = {
+        "authorized_git_sha": checks["authorized_git_sha"],
+        "runtime": dict(runtimes[0]),
+        "execution_device_proof": device_proof_top,
+        "per_arm_execution_device_proof": dict(arm_device_proof),
         "train_timeline_identity": timeline.identity(),
         "target_authority_identity": target_identity,
         "fit_subjects": list(fit_subjects),
@@ -624,7 +642,6 @@ def _train_both_arms(
         "checkpoint_lock_self_sha256": dict(checkpoint_lock_self_sha256),
         "internal_dev_thresholds": dict(thresholds),
         "execution_device": str(execution_device),
-        "runtime": dict(runtimes[0]),
     }
     promoted = finalize_and_promote_t2_result(
         claimed, result=result, provenance=provenance, runtime=runtime
@@ -632,6 +649,8 @@ def _train_both_arms(
     return {
         "report_class": "t2_canonical_training_completion",
         "execution_device": str(execution_device),
+        "execution_device_proof": device_proof_top,
+        "authorized_git_sha": checks["authorized_git_sha"],
         "attempt_id": claimed.attempt_id,
         "experiment_identity": T2_EXPERIMENT_IDENTITY,
         "run_dir": str(claimed.run_dir),

@@ -609,17 +609,24 @@ def test_challenge_and_latency_cannot_influence_selection():
 
 
 def test_every_outer_validation_entry_point_refuses():
+    assert EV.OUTER_VALIDATION_ENTRY_POINTS == (EV.execute_canonical_outer_validation,)
     for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
         with pytest.raises(PS.T2ActivationError, match="not authorized"):
-            entry(Path("/nonexistent"))
+            entry("0" * 40)
 
 
 def test_the_refusal_fires_before_any_validation_path_is_resolved():
-    """Called with nonsense arguments, it still refuses rather than resolving."""
+    """Called with a nonsense commit, it still refuses rather than resolving.
+
+    The raw loaders that used to sit on this surface are gone: the only public
+    outer route is the claim-bearing canonical one.
+    """
     with pytest.raises(PS.T2ActivationError):
-        EV.open_validation_timeline(Path("/nonexistent/validation"), labels="ignored")
+        EV.execute_canonical_outer_validation("0" * 40)
     with pytest.raises(PS.T2ActivationError):
-        EV.execute_canonical_outer_validation(Path("/nonexistent"))
+        EV.execute_canonical_outer_validation(None)
+    assert not hasattr(EV, "open_validation_timeline")
+    assert not hasattr(EV, "load_validation_labels")
 
 
 def test_activation_is_false_and_has_no_override():
@@ -719,6 +726,13 @@ def test_a_result_that_selects_an_arm_is_refused():
     payload = {
         "artifact_class": PS.RESULT_CLASS,
         "attempt_id": PS.T2_TRAINING_ATTEMPT_ID,
+        "authorized_git_sha": "a" * 40,
+        "git_sha": "a" * 40,
+        "execution_device_proof": {
+            "declared_execution_device": "cpu",
+            "model_parameter_device": "cpu",
+            "execution_device_agrees": True,
+        },
         "component_sha256": {name: "0" * 64 for name in PS.COMPONENT_ARTIFACTS},
         "checkpoint_sha256": {},
         "checkpoint_lock_sha256": {},
@@ -738,6 +752,13 @@ def test_a_result_recording_validation_or_test_access_is_refused():
     base = {
         "artifact_class": PS.RESULT_CLASS,
         "attempt_id": PS.T2_TRAINING_ATTEMPT_ID,
+        "authorized_git_sha": "a" * 40,
+        "git_sha": "a" * 40,
+        "execution_device_proof": {
+            "declared_execution_device": "cpu",
+            "model_parameter_device": "cpu",
+            "execution_device_agrees": True,
+        },
         "component_sha256": {name: "0" * 64 for name in PS.COMPONENT_ARTIFACTS},
         "checkpoint_sha256": {},
         "checkpoint_lock_sha256": {},
