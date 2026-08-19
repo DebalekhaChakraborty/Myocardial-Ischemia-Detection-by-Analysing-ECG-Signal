@@ -68,7 +68,19 @@ T2_EXECUTION_SPEC_SHA256: Final = (
 # ---------------------------------------------------------------------------
 T2_EXPERIMENT_IDENTITY: Final = "T2_temporal_v1"
 T2_TRAINING_ATTEMPT_ID: Final = "t2-v1-training"
-T2_RUN_ROOT: Final = Path("cardiosentinel-runs/phase8-t2-development-v1")
+T2_OUTER_VALIDATION_ATTEMPT_ID: Final = "t2-v1-outer-validation"
+
+# Repository-anchored, not cwd-relative. Git provenance is already evaluated
+# against REPOSITORY_ROOT, so a one-shot scientific claim must have exactly one
+# physical location too: a cwd-relative path would let the same attempt be
+# claimed twice from two shells, and would make "is this attempt consumed?"
+# depend on where the human happened to be standing.
+T2_RUN_ROOT: Final = (
+    REPOSITORY_ROOT / "cardiosentinel-runs" / "phase8-t2-development-v1"
+)
+
+# Both attempts are siblings under the one absolute run root.
+T2_ATTEMPT_IDS: Final = (T2_TRAINING_ATTEMPT_ID, T2_OUTER_VALIDATION_ATTEMPT_ID)
 
 STATUS_STARTED: Final = "STARTED"
 STATUS_COMPLETE: Final = "COMPLETE"
@@ -546,15 +558,39 @@ def load_checkpoint(path: Path, *, expected_sha256: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def runtime_provenance() -> dict[str, Any]:
-    """Interpreter, dependency and device facts, without importing Torch twice."""
+def canonical_execution_device() -> Any:
+    """The one host-supported device. No flag, no override, no fallback.
+
+    `cuda:0` when CUDA is available, `cpu` otherwise. This is selected exactly
+    once per canonical attempt and everything scientific then actually runs on
+    it -- parameters, inputs, masks, targets, carried states, internal-dev
+    scoring and the reloaded-checkpoint threshold pass.
+    """
+    import torch
+
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def runtime_provenance(device: Any | None = None) -> dict[str, Any]:
+    """Interpreter, dependency and device facts, without importing Torch twice.
+
+    `device_type` describes where the science will actually run, not merely
+    what the host could offer. Reporting `cuda` because CUDA happens to be
+    installed, while every tensor stays on the CPU, would be false provenance
+    on any CUDA-capable host; `require_execution_device_agreement` refuses that
+    by comparing this record against the model's real parameter device.
+    """
     import torch
 
     environment = dependency_environment()
-    device_type = "cuda" if torch.cuda.is_available() else "cpu"
+    selected = (
+        torch.device(device) if device is not None else (canonical_execution_device())
+    )
+    device_type = selected.type
+    device_index = selected.index
     device_name = None
     if device_type == "cuda":  # pragma: no cover - no CUDA in this runtime
-        device_name = torch.cuda.get_device_name(0)
+        device_name = torch.cuda.get_device_name(device_index or 0)
     return {
         "interpreter": sys.executable,
         "python_version": sys.version.split()[0],
@@ -562,8 +598,13 @@ def runtime_provenance() -> dict[str, Any]:
         "dependency_digest": str(environment["installed_packages_sha256"]),
         "torch_version": torch.__version__,
         "cuda_version": torch.version.cuda,
+        "declared_execution_device": str(selected),
         "device_type": device_type,
+        "device_index": device_index,
         "device_name": device_name,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "device_override_permitted": False,
+        "silent_cpu_fallback_permitted": False,
         "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
         "cudnn_deterministic": bool(torch.backends.cudnn.deterministic),
@@ -572,10 +613,84 @@ def runtime_provenance() -> dict[str, Any]:
     }
 
 
+def model_parameter_device(model: Any) -> str:
+    """Where the model's parameters actually live. One device or STOP."""
+    devices = {str(parameter.device) for parameter in model.parameters()}
+    if len(devices) != 1:
+        raise T2PersistenceError(
+            f"A T2 candidate's parameters span {sorted(devices)}. A split model "
+            "is not the specified model; execution STOPS."
+        )
+    return devices.pop()
+
+
+def require_execution_device_agreement(
+    provenance: dict[str, Any], observed_device: str
+) -> dict[str, Any]:
+    """The declared device and the observed parameter device must agree.
+
+    This is the check that makes `device_type: cuda` mean something. A record
+    claiming CUDA while the parameters sit on the CPU is refused rather than
+    promoted, so no artifact can attest to a device the computation never
+    touched.
+    """
+    declared = str(provenance.get("declared_execution_device"))
+    observed = str(observed_device)
+    if _same_device(declared, observed):
+        return {
+            "declared_execution_device": declared,
+            "model_parameter_device": observed,
+            "execution_device_agrees": True,
+        }
+    raise T2PersistenceError(
+        f"The runtime record declares execution on {declared!r}, but the model's "
+        f"parameters are on {observed!r}. Provenance may not claim a device the "
+        "computation did not run on; execution STOPS and nothing is promoted."
+    )
+
+
+def _same_device(first: str, second: str) -> bool:
+    """`cuda:0` and `cuda` name the same device; `cuda:0` and `cpu` do not."""
+    import torch
+
+    left = torch.device(first)
+    right = torch.device(second)
+    if left.type != right.type:
+        return False
+    return (left.index or 0) == (right.index or 0)
+
+
+def require_deterministic_execution(device: Any) -> dict[str, Any]:
+    """Determinism is required on the selected device, never traded away.
+
+    If the selected device cannot satisfy a required deterministic operation,
+    execution STOPS FOR HUMAN REVIEW. It does not quietly fall back to the CPU:
+    a silent fallback would produce evidence whose device provenance is a
+    guess, and it would change what was computed without saying so.
+    """
+    import torch
+
+    selected = torch.device(device)
+    if not torch.are_deterministic_algorithms_enabled():
+        raise T2PersistenceError(
+            f"Deterministic algorithms are not enabled for execution on "
+            f"{selected}. This is a STOP condition: canonical T2 evidence is "
+            "never produced with determinism silently disabled, nothing is "
+            "installed and there is no CPU fallback."
+        )
+    return {
+        "execution_device": str(selected),
+        "deterministic_algorithms": True,
+        "silent_cpu_fallback_performed": False,
+    }
+
+
 def require_single_runtime(first: dict[str, Any], second: dict[str, Any]) -> None:
     """Both arms must share one device and runtime. Otherwise STOP."""
     for field_ in (
+        "declared_execution_device",
         "device_type",
+        "device_index",
         "device_name",
         "torch_version",
         "cuda_version",
@@ -1035,3 +1150,556 @@ def finalize_and_promote_t2_result(
     }
     write_json_atomic(claimed.run_dir / RUN_STATUS_NAME, status)
     return {"result": result, "lock": lock, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# The one canonical outer-VALIDATION claim
+#
+# Written now, while the activation state is False, so a future activation
+# change set flips a switch rather than inventing persistence, failure
+# semantics or a validator once the TRAIN numbers are known.
+# ---------------------------------------------------------------------------
+
+OUTER_STATUS_NAME: Final = "T2_OUTER_VALIDATION_STATUS.json"
+OUTER_RESULT_NAME: Final = "T2_OUTER_VALIDATION_RESULT.json"
+OUTER_LOCK_NAME: Final = "T2_OUTER_VALIDATION_EXPERIMENT_LOCK.json"
+OUTER_FAILURE_RECEIPT_NAME: Final = "T2_OUTER_VALIDATION_FAILURE_RECEIPT.json"
+OUTER_EVIDENCE_DIRNAME: Final = "row_evidence"
+
+OUTER_RESULT_CLASS: Final = "t2_v1_outer_validation_result"
+OUTER_LOCK_CLASS: Final = "t2_v1_canonical_outer_validation_run_lock"
+
+STAGE_OUTER_START: Final = "t2_outer_validation_start"
+STAGE_OUTER_CLAIM: Final = "t2_outer_claim_directory"
+
+
+def stage_pre_checkpoint_load(arm: str) -> str:
+    return f"pre_checkpoint_load:{arm}"
+
+
+def required_outer_runtime_stage_order(arms: Sequence[str]) -> tuple[str, ...]:
+    """The frozen outer enforcement choreography, as `detail` labels in order."""
+    stages: list[str] = [STAGE_OUTER_START]
+    stages.extend(stage_pre_checkpoint_load(arm) for arm in arms)
+    stages.append(OUTER_EVIDENCE_DIRNAME)
+    stages.append(OUTER_RESULT_NAME)
+    return tuple(stages)
+
+
+def require_outer_runtime_stage_order(
+    runtime: RuntimeIntegrityRecord, arms: Sequence[str]
+) -> tuple[str, ...]:
+    """Prove the frozen outer stages were visited, in the frozen order."""
+    required = required_outer_runtime_stage_order(arms)
+    observed = observed_runtime_stages(runtime)
+    filtered = tuple(label for label in observed if label in set(required))
+    if filtered != required:
+        raise T2PersistenceError(
+            f"The outer runtime enforcement choreography was {list(filtered)}, "
+            f"not the frozen {list(required)}."
+        )
+    return required
+
+
+def require_unclaimed_outer_attempt(
+    run_root: Path = T2_RUN_ROOT, attempt_id: str = T2_OUTER_VALIDATION_ATTEMPT_ID
+) -> dict[str, Any]:
+    """Prove the one outer attempt is unconsumed. The directory IS the claim."""
+    return require_unclaimed_t2_attempt(run_root, attempt_id)
+
+
+def claim_t2_outer_directory(
+    run_root: Path = T2_RUN_ROOT,
+    attempt_id: str = T2_OUTER_VALIDATION_ATTEMPT_ID,
+    *,
+    runtime: RuntimeIntegrityRecord,
+) -> T2RunDirectory:
+    """Atomically claim the one canonical outer attempt.
+
+    A sibling of `t2-v1-training` under the same absolute run root. No
+    timestamp, no UUID, no random suffix, no automatic `recovery1`, no retry
+    name: once this directory exists the outer attempt is consumed.
+    """
+    require_frozen_runtime_record(runtime)
+    require_runtime_identity(
+        EnforcementPoint.PRE_PROMOTION, record=runtime, detail=STAGE_OUTER_CLAIM
+    )
+    run_dir = t2_run_directory(run_root, attempt_id)
+    run_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        run_dir.mkdir(exist_ok=False)
+    except FileExistsError as error:
+        raise T2PersistenceError(
+            f"Canonical T2 outer attempt {attempt_id} is already claimed at "
+            f"{run_dir}. There is exactly one outer VALIDATION attempt; "
+            "automatic rerun, retry, selective arm rerun and fresh-seed restart "
+            "are prohibited and require documented human review."
+        ) from error
+    claimed = T2RunDirectory(
+        run_dir=run_dir, attempt_id=str(attempt_id), started_at=_now()
+    )
+    write_json_atomic(
+        run_dir / OUTER_STATUS_NAME,
+        {
+            "attempt_id": claimed.attempt_id,
+            "experiment_identity": T2_EXPERIMENT_IDENTITY,
+            "status": STATUS_STARTED,
+            "claim_bearing_result_promoted": False,
+            "started_at": claimed.started_at,
+            "updated_at": claimed.started_at,
+            "validation_accessed": False,
+            "test_accessed": False,
+            "sealed_test_state": "unopened",
+        },
+    )
+    return claimed
+
+
+REQUIRED_OUTER_RESULT_FIELDS: Final = (
+    "artifact_class",
+    "attempt_id",
+    "git_sha",
+    "git_dirty",
+    "t2_protocol_sha256",
+    "t2_execution_spec_sha256",
+    "training_attempt_id",
+    "training_result_sha256",
+    "training_experiment_lock_sha256",
+    "checkpoint_sha256",
+    "checkpoint_lock_sha256",
+    "checkpoint_lock_self_sha256",
+    "internal_dev_thresholds",
+    "validation_timeline_identity",
+    "target_authority_identity",
+    "row_accounting",
+    "primary_population_identity",
+    "challenge_population_identity",
+    "unavailable_row_census",
+    "per_arm_evidence",
+    "row_evidence_store",
+    "subject_bootstrap",
+    "temporal_descriptors",
+    "selection_decision",
+    "selected_arm",
+    "runtime",
+    "latency_used_in_selection",
+    "challenge_used_in_selection",
+    "automatic_retry_performed",
+    "validation_accessed",
+    "test_accessed",
+    "sealed_test_state",
+)
+
+
+def validate_t2_outer_result_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """A complete outer result in its own right, before anything is hashed."""
+    if result.get("artifact_class") != OUTER_RESULT_CLASS:
+        raise T2PersistenceError(
+            f"Unknown T2 outer result class {result.get('artifact_class')!r}."
+        )
+    missing = [name for name in REQUIRED_OUTER_RESULT_FIELDS if name not in result]
+    if missing:
+        raise T2PersistenceError(f"The T2 outer result is missing {missing}.")
+    for arm in T2_ARMS:
+        if arm not in result["per_arm_evidence"]:
+            raise T2PersistenceError(f"No outer evidence for {arm}.")
+        for block in ("checkpoint_sha256", "checkpoint_lock_sha256"):
+            if arm not in result[block]:
+                raise T2PersistenceError(
+                    f"The outer result does not bind {block}[{arm}]."
+                )
+    if result["selected_arm"] not in T2_ARMS:
+        raise T2PersistenceError(
+            f"The outer result selects {result['selected_arm']!r}, which is not a "
+            f"frozen candidate."
+        )
+    if result.get("git_dirty") is not False:
+        raise T2PersistenceError(
+            "Canonical outer evidence requires a clean Git checkout."
+        )
+    for flag in (
+        "latency_used_in_selection",
+        "challenge_used_in_selection",
+        "automatic_retry_performed",
+        "test_accessed",
+    ):
+        if result.get(flag) is not False:
+            raise T2PersistenceError(
+                f"A canonical outer result must record {flag}=false."
+            )
+    if result.get("validation_accessed") is not True:
+        raise T2PersistenceError(
+            "An outer-VALIDATION result that did not access VALIDATION is not an "
+            "outer-VALIDATION result."
+        )
+    if result.get("sealed_test_state") != "unopened":
+        raise T2PersistenceError("The B4 sealed test must remain unopened.")
+    for field_, expected in (
+        ("t2_protocol_sha256", T2_PROTOCOL_SHA256),
+        ("t2_execution_spec_sha256", T2_EXECUTION_SPEC_SHA256),
+    ):
+        _require_sha256(field_, result[field_])
+        if result[field_] != expected:
+            raise T2PersistenceError(
+                f"{field_} is {result[field_]!r}, expected the frozen {expected!r}."
+            )
+    return result
+
+
+def build_t2_outer_lock(
+    *,
+    attempt_id: str,
+    runtime: RuntimeIntegrityRecord,
+    provenance: dict[str, Any],
+    started_at: str,
+    completed_at: str,
+    artifact_sha256: dict[str, str],
+) -> dict[str, Any]:
+    """Construct the one canonical outer lock. The only identity assembly."""
+    git = git_provenance(REPOSITORY_ROOT)
+    lock: dict[str, Any] = {
+        "lock_class": OUTER_LOCK_CLASS,
+        "attempt_id": str(attempt_id),
+        "experiment_identity": T2_EXPERIMENT_IDENTITY,
+        "git_sha": git["git_sha"],
+        "git_dirty": git["git_dirty"],
+        "authorized_git_sha": provenance["authorized_git_sha"],
+        "t2_protocol_sha256": T2_PROTOCOL_SHA256,
+        "t2_execution_spec_sha256": T2_EXECUTION_SPEC_SHA256,
+        "training_attempt_id": provenance["training_attempt_id"],
+        "training_result_sha256": provenance["training_result_sha256"],
+        "training_experiment_lock_sha256": (
+            provenance["training_experiment_lock_sha256"]
+        ),
+        "checkpoint_sha256": dict(provenance["checkpoint_sha256"]),
+        "checkpoint_lock_sha256": dict(provenance["checkpoint_lock_sha256"]),
+        "checkpoint_lock_self_sha256": dict(provenance["checkpoint_lock_self_sha256"]),
+        "internal_dev_thresholds": provenance["internal_dev_thresholds"],
+        "validation_timeline_identity": provenance["validation_timeline_identity"],
+        "target_authority_identity": provenance["target_authority_identity"],
+        "row_accounting": provenance["row_accounting"],
+        "row_evidence_store_sha256": provenance["row_evidence_store_sha256"],
+        "selected_arm": provenance["selected_arm"],
+        "selection_decision": provenance["selection_decision"],
+        "runtime": provenance["runtime"],
+        "runtime_identity_checks": runtime.as_dict(),
+        "runtime_enforcement_stages": list(observed_runtime_stages(runtime)),
+        "runtime_dependency_digest_start": runtime.digest_at(EnforcementPoint.START),
+        "runtime_dependency_digest_end": runtime.digest_at(EnforcementPoint.COMPLETION),
+        "latency_used_in_selection": False,
+        "challenge_used_in_selection": False,
+        "automatic_retry_performed": False,
+        "repeat_attempt_permitted": False,
+        "validation_accessed": True,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "started_at": started_at,
+        "completed_at": completed_at,
+        "artifact_sha256": dict(artifact_sha256),
+    }
+    lock["experiment_lock_sha256"] = canonical_sha256(lock)
+    return lock
+
+
+def validate_t2_outer_lock(
+    lock: dict[str, Any], *, run_dir: Path | None = None
+) -> dict[str, Any]:
+    """Validate the ACTUAL values of an outer lock, not merely its keys."""
+    recorded = lock.get("experiment_lock_sha256")
+    body = {k: v for k, v in lock.items() if k != "experiment_lock_sha256"}
+    if recorded is None or recorded != canonical_sha256(body):
+        raise T2PersistenceError(
+            "The T2 outer experiment lock failed digest validation."
+        )
+    if lock.get("lock_class") != OUTER_LOCK_CLASS:
+        raise T2PersistenceError(
+            f"Unknown outer lock class {lock.get('lock_class')!r}."
+        )
+    if lock["git_dirty"] is not False:
+        raise T2PersistenceError(
+            "Canonical outer evidence requires a clean Git checkout."
+        )
+    if not _GIT_SHA_PATTERN.match(str(lock["authorized_git_sha"])):
+        raise T2PersistenceError(
+            f"authorized_git_sha is malformed: {lock['authorized_git_sha']!r}."
+        )
+    if lock["git_sha"] != lock["authorized_git_sha"]:
+        raise T2PersistenceError(
+            f"The outer attempt ran at {lock['git_sha']} but was authorized for "
+            f"{lock['authorized_git_sha']}."
+        )
+    for field_, expected in (
+        ("t2_protocol_sha256", T2_PROTOCOL_SHA256),
+        ("t2_execution_spec_sha256", T2_EXECUTION_SPEC_SHA256),
+    ):
+        if lock[field_] != expected:
+            raise T2PersistenceError(
+                f"{field_} is {lock[field_]!r}, expected the frozen {expected!r}."
+            )
+    for flag in (
+        "latency_used_in_selection",
+        "challenge_used_in_selection",
+        "automatic_retry_performed",
+        "repeat_attempt_permitted",
+        "test_accessed",
+    ):
+        if lock[flag] is not False:
+            raise T2PersistenceError(
+                f"A canonical outer lock must record {flag}=false."
+            )
+    if lock["sealed_test_state"] != "unopened":
+        raise T2PersistenceError("The B4 sealed test must remain unopened.")
+    if lock["selected_arm"] not in T2_ARMS:
+        raise T2PersistenceError(
+            f"The outer lock selects {lock['selected_arm']!r}, not a frozen arm."
+        )
+    for label in ("start", "end"):
+        digest = lock[f"runtime_dependency_digest_{label}"]
+        _require_sha256(f"runtime_dependency_digest_{label}", digest)
+        if digest != FROZEN_DEPENDENCY_DIGEST:
+            raise T2PersistenceError(
+                f"runtime_dependency_digest_{label} is not the frozen identity."
+            )
+    if lock["runtime_identity_checks"].get("all_observations_matched") is not True:
+        raise T2PersistenceError(
+            "Canonical outer evidence requires every runtime observation to match."
+        )
+    require_execution_device_agreement(
+        lock["runtime"], lock["runtime"].get("model_parameter_device", "")
+    )
+    artifacts = dict(lock["artifact_sha256"])
+    if not artifacts:
+        raise T2PersistenceError("A canonical outer lock binds no artifact hash.")
+    for name, digest in artifacts.items():
+        _require_sha256(f"artifact_sha256[{name}]", digest)
+        if run_dir is not None:
+            path = Path(run_dir) / name
+            if not path.is_file() or sha256_file(path) != digest:
+                raise T2PersistenceError(
+                    f"Outer artifact {name} does not match its lock digest."
+                )
+    return lock
+
+
+def finalize_and_promote_t2_outer_result(
+    claimed: T2RunDirectory,
+    *,
+    result: dict[str, Any],
+    provenance: dict[str, Any],
+    runtime: RuntimeIntegrityRecord,
+) -> dict[str, Any]:
+    """Validate, gate, promote and lock the one canonical outer result."""
+    require_frozen_runtime_record(runtime)
+    validate_t2_outer_result_payload(result)
+    completion = observe_runtime_identity(
+        EnforcementPoint.COMPLETION,
+        expected_digest=runtime.expected_digest,
+        detail=OUTER_RESULT_NAME,
+    )
+    runtime.record(completion)
+    if not completion.matches:
+        raise RuntimeIntegrityError(
+            "Runtime identity differed at COMPLETION. Canonical outer promotion "
+            "is INVALIDATED: the result was NOT promoted, the environment was "
+            "NOT repaired and already-promoted evidence is retained as "
+            "non-claim-bearing forensic material."
+        )
+    require_outer_runtime_stage_order(runtime, T2_ARMS)
+    result_path = claimed.run_dir / OUTER_RESULT_NAME
+    write_json_atomic(result_path, result)
+    lock = build_t2_outer_lock(
+        attempt_id=claimed.attempt_id,
+        runtime=runtime,
+        provenance=provenance,
+        started_at=claimed.started_at,
+        completed_at=_now(),
+        artifact_sha256={
+            **claimed.promoted,
+            OUTER_RESULT_NAME: sha256_file(result_path),
+        },
+    )
+    validate_t2_outer_lock(lock)
+    write_json_atomic(claimed.run_dir / OUTER_LOCK_NAME, lock)
+    validate_t2_outer_lock(lock, run_dir=claimed.run_dir)
+    status = {
+        "attempt_id": claimed.attempt_id,
+        "experiment_identity": T2_EXPERIMENT_IDENTITY,
+        "status": STATUS_COMPLETE,
+        "claim_bearing_result_promoted": True,
+        "canonical": True,
+        "started_at": claimed.started_at,
+        "updated_at": _now(),
+        "experiment_lock_sha256": lock["experiment_lock_sha256"],
+        "artifact_sha256": dict(lock["artifact_sha256"]),
+        "selected_arm": lock["selected_arm"],
+        "human_review_required": True,
+        "validation_accessed": True,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "runtime_identity_checks": runtime.as_dict(),
+    }
+    write_json_atomic(claimed.run_dir / OUTER_STATUS_NAME, status)
+    return {"result": result, "lock": lock, "status": status}
+
+
+def record_t2_outer_attempt_failure(
+    run_root: Path,
+    claimed: T2RunDirectory,
+    *,
+    exception: BaseException,
+    stage: str,
+    arm: str | None,
+    exposure: dict[str, Any],
+    runtime: RuntimeIntegrityRecord | None = None,
+) -> dict[str, Any]:
+    """One additive forensic receipt for a post-claim outer failure. No retry."""
+    git = git_provenance(REPOSITORY_ROOT)
+    promoted = {
+        name: sha256_file(claimed.run_dir / name)
+        for name in (OUTER_RESULT_NAME, OUTER_LOCK_NAME)
+        if (claimed.run_dir / name).is_file()
+    }
+    receipt = {
+        "receipt_class": "t2_outer_validation_failure_receipt",
+        "claim_bearing": False,
+        "attempt_id": claimed.attempt_id,
+        "failed_stage": str(stage),
+        "arm": arm,
+        "exception_type": type(exception).__name__,
+        "exception_message": str(exception),
+        "traceback_tail": "".join(
+            traceback.format_exception(
+                type(exception), exception, exception.__traceback__
+            )
+        )[-4000:],
+        "git_sha": git["git_sha"],
+        "git_dirty": git["git_dirty"],
+        "exposure": dict(exposure),
+        "promotion_state_source": "filesystem",
+        "promoted_artifacts": promoted,
+        "runtime_identity_checks": runtime.as_dict() if runtime is not None else None,
+        "automatic_retry_performed": False,
+        "repeat_attempt_permitted": False,
+        "selective_arm_rerun_permitted": False,
+        "alternate_attempt_name_permitted": False,
+        "attempt_consumed": True,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+        "human_review_required": True,
+        "recorded_at": _now(),
+    }
+    receipt["receipt_sha256"] = canonical_sha256(receipt)
+    directory = t2_review_directory(run_root, claimed.attempt_id)
+    directory.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(directory / OUTER_FAILURE_RECEIPT_NAME, receipt)
+    write_json_atomic(
+        claimed.run_dir / OUTER_STATUS_NAME,
+        {
+            "attempt_id": claimed.attempt_id,
+            "status": STATUS_FAILED,
+            "claim_bearing_result_promoted": (
+                claimed.run_dir / OUTER_RESULT_NAME
+            ).is_file(),
+            "promotion_state_source": "filesystem",
+            "canonical": False,
+            "failed_stage": str(stage),
+            "arm": arm,
+            "failure_receipt_sha256": receipt["receipt_sha256"],
+            "started_at": claimed.started_at,
+            "updated_at": _now(),
+            "human_review_required": True,
+            "repeat_attempt_permitted": False,
+            "automatic_retry_performed": False,
+            "selective_arm_rerun_permitted": False,
+            "validation_accessed": bool(exposure.get("validation_accessed")),
+            "test_accessed": False,
+            "sealed_test_state": "unopened",
+        },
+    )
+    return receipt
+
+
+def validate_canonical_t2_outer_validation_attempt(
+    run_root: Path = T2_RUN_ROOT,
+    attempt_id: str = T2_OUTER_VALIDATION_ATTEMPT_ID,
+) -> dict[str, Any]:
+    """The one complete canonical verification of a promoted outer attempt.
+
+    Verifies actual bytes, not merely JSON values: the outer result, the outer
+    lock, the per-row evidence manifest and every per-row array, the referenced
+    TRAIN attempt in full, both checkpoints and both checkpoint locks. No caller
+    has to remember a second validator.
+    """
+    from cardiosentinel.neural.t2_outer_evidence import (
+        T2_OUTER_STORE_MANIFEST_NAME,
+        validate_t2_outer_evidence_store,
+    )
+
+    run_dir = t2_run_directory(run_root, attempt_id)
+    result_path = run_dir / OUTER_RESULT_NAME
+    lock_path = run_dir / OUTER_LOCK_NAME
+    for path in (result_path, lock_path):
+        if not path.is_file():
+            raise T2PersistenceError(f"No canonical outer artifact at {path}.")
+    result = json.loads(result_path.read_text())
+    validate_t2_outer_result_payload(result)
+    lock = validate_t2_outer_lock(json.loads(lock_path.read_text()), run_dir=run_dir)
+
+    # The referenced TRAIN attempt is re-verified in full, including both
+    # checkpoints and both checkpoint locks: an outer result bound to a mutated
+    # training attempt describes a model that no longer exists.
+    training = validate_canonical_t2_attempt(run_root, result["training_attempt_id"])
+    if training["result_sha256"] != result["training_result_sha256"]:
+        raise T2PersistenceError(
+            "The outer result binds a TRAIN result digest that no longer matches."
+        )
+    if training["experiment_lock_sha256"] != result["training_experiment_lock_sha256"]:
+        raise T2PersistenceError(
+            "The outer result binds a TRAIN lock digest that no longer matches."
+        )
+    for block in ("checkpoint_sha256", "checkpoint_lock_sha256"):
+        if dict(result[block]) != dict(training[block]):
+            raise T2PersistenceError(
+                f"The outer result and the TRAIN attempt disagree about {block}."
+            )
+        if dict(lock[block]) != dict(result[block]):
+            raise T2PersistenceError(
+                f"The outer result and the outer lock disagree about {block}."
+            )
+
+    evidence_root = run_dir / OUTER_EVIDENCE_DIRNAME
+    manifest_path = evidence_root / T2_OUTER_STORE_MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise T2PersistenceError(f"No per-row outer evidence store at {manifest_path}.")
+    manifest = json.loads(manifest_path.read_text())
+    try:
+        validate_t2_outer_evidence_store(manifest, root=evidence_root)
+    except Exception as error:
+        # One validator, one exception class for its callers. The store's own
+        # error text is preserved so the cause is not lost.
+        raise T2PersistenceError(
+            f"The per-row outer evidence store failed verification: {error}"
+        ) from error
+    if manifest["content_sha256"] != result["row_evidence_store"]["content_sha256"]:
+        raise T2PersistenceError(
+            "The outer result binds a row-evidence manifest digest that no longer "
+            "matches the persisted store."
+        )
+    if manifest["content_sha256"] != lock["row_evidence_store_sha256"]:
+        raise T2PersistenceError(
+            "The outer lock binds a row-evidence manifest digest that no longer "
+            "matches the persisted store."
+        )
+    return {
+        "verification_class": "t2_canonical_outer_validation_verification",
+        "attempt_id": str(attempt_id),
+        "result_sha256": sha256_file(result_path),
+        "experiment_lock_sha256": lock["experiment_lock_sha256"],
+        "row_evidence_store_sha256": manifest["content_sha256"],
+        "training_attempt_verification": training,
+        "checkpoint_sha256": dict(result["checkpoint_sha256"]),
+        "checkpoint_lock_sha256": dict(result["checkpoint_lock_sha256"]),
+        "selected_arm": result["selected_arm"],
+        "row_accounting": dict(result["row_accounting"]),
+        "verified": True,
+    }

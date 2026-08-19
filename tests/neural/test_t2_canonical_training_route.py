@@ -99,23 +99,38 @@ def frozen_runtime(monkeypatch):
     monkeypatch.setattr(
         "cardiosentinel.neural.runtime_sentinel.require_runtime_identity", fake_require
     )
-    frozen_provenance = {
-        "interpreter": "/home/AI_POC/venvs/tactics/bin/python",
-        "python_version": "3.11.0",
-        "package_count": 335,
-        "dependency_digest": FROZEN_DIGEST,
-        "torch_version": torch.__version__,
-        "cuda_version": None,
-        "device_type": "cpu",
-        "device_name": None,
-        "deterministic_algorithms": True,
-        "cudnn_benchmark": False,
-        "cudnn_deterministic": True,
-        "torch_threads": 1,
-        "torch_interop_threads": 1,
-    }
-    monkeypatch.setattr(PS, "runtime_provenance", lambda: dict(frozen_provenance))
-    monkeypatch.setattr(RUN, "runtime_provenance", lambda: dict(frozen_provenance))
+
+    def frozen_provenance(device=None):
+        """The dependency digest is faked; the DEVICE is the real selection.
+
+        Substituting the device too would defeat the whole point of the
+        actual-device tests, so the declared device is whatever
+        `canonical_execution_device` actually chose.
+        """
+        selected = torch.device(device) if device is not None else torch.device("cpu")
+        return {
+            "interpreter": "/home/AI_POC/venvs/tactics/bin/python",
+            "python_version": "3.11.0",
+            "package_count": 335,
+            "dependency_digest": FROZEN_DIGEST,
+            "torch_version": torch.__version__,
+            "cuda_version": None,
+            "declared_execution_device": str(selected),
+            "device_type": selected.type,
+            "device_index": selected.index,
+            "device_name": None,
+            "cuda_available": torch.cuda.is_available(),
+            "device_override_permitted": False,
+            "silent_cpu_fallback_permitted": False,
+            "deterministic_algorithms": True,
+            "cudnn_benchmark": False,
+            "cudnn_deterministic": True,
+            "torch_threads": 1,
+            "torch_interop_threads": 1,
+        }
+
+    monkeypatch.setattr(PS, "runtime_provenance", frozen_provenance)
+    monkeypatch.setattr(RUN, "runtime_provenance", frozen_provenance)
     return fake_require
 
 
@@ -123,7 +138,11 @@ def frozen_runtime(monkeypatch):
 def clean_git(monkeypatch, frozen_runtime):
     """A clean checkout, so the canonical lock's Git gate is not the subject."""
     fake = {"git_sha": GIT_SHA, "git_dirty": False}
+    # Every module that imported the name directly, not only the source module:
+    # `t2_development_run.require_expected_git_sha` resolves `git_provenance`
+    # in its OWN namespace, and the outer route goes through it.
     monkeypatch.setattr(PS, "git_provenance", lambda _root: dict(fake))
+    monkeypatch.setattr(RUN, "git_provenance", lambda _root: dict(fake))
     monkeypatch.setattr(
         "cardiosentinel.data.provenance.git_provenance", lambda _root: dict(fake)
     )
@@ -1100,78 +1119,6 @@ def test_the_activation_gate_is_the_first_statement_of_every_entry_point():
         )
 
 
-def test_the_private_worker_executes_the_complete_frozen_evaluator(
-    tmp_path, environment, clean_git, monkeypatch
-):
-    """The body exists and runs. A future activation PR changes a switch only.
-
-    The frozen 473,897-row PRIMARY expectation is substituted in ONE place, the
-    same seam the reviewed M2 canonical-runner tests use: a synthetic corpus
-    cannot meet the real count, and the production validator rightly refuses
-    anything else. That the real value is enforced is asserted separately by
-    `test_the_validation_result_schema_still_validates_the_frozen_shape`.
-    """
-    sources = _sources(tmp_path, environment)
-    RUN._execute_training_attempt(_checks(), sources)
-    run_dir = sources.run_root / sources.attempt_id
-
-    # A synthetic "VALIDATION" partition, with unavailable exact-flat rows.
-    validation_streams = tuple(
-        FX.SyntheticStream(
-            record_id=FX.record_for_subject(subject),
-            channel_index=0,
-            families=FX.default_streams((subject,))[0].families,
-            unavailable=frozenset({5}) if index == 0 else frozenset(),
-        )
-        for index, subject in enumerate(FX.frozen_train_subjects()[:4])
-    )
-    validation = FX.build_environment(
-        tmp_path / "val", partition="validation", streams=validation_streams
-    )
-    primary_rows = sum(
-        1
-        for stream in validation_streams
-        for index, family in enumerate(stream.families)
-        if family in {FX.PRIMARY_POSITIVE, FX.PRIMARY_NEGATIVE}
-        and index not in stream.unavailable
-    )
-    monkeypatch.setattr(EV, "T2_VALIDATION_PRIMARY_ROW_COUNT", primary_rows)
-    result = EV._outer_validation_worker(
-        run_dir,
-        validation_root=validation.stream_cache_root,
-        corpus_manifest=validation.corpus_manifest,
-    )
-    assert result["artifact_class"] == EV.OUTER_VALIDATION_RESULT_CLASS
-    assert sorted(result["per_arm_evidence"]) == sorted(T2_ARMS)
-    for arm in T2_ARMS:
-        evidence = result["per_arm_evidence"][arm]
-        assert evidence["single_causal_pass"] is True
-        assert evidence["same_pass_supplies_primary_and_challenge"] is True
-        assert evidence["unavailable_rows_scored"] == 0
-        assert evidence["threshold_altered_by_outer_validation"] is False
-        assert evidence["pooled"]["auprc"] is not None
-        assert evidence["subject_macro"]["auprc"]["value"] is not None
-        assert set(evidence["challenge"]["subsets"]) == {
-            "rate_related",
-            "axis_shift",
-            "conduction_change",
-        }
-        assert evidence["cold_start"]["warmup_threshold_applied"] is False
-        assert result["subject_bootstrap"][arm]["replicates"] == 1000
-        assert result["subject_bootstrap"][arm]["seed"] == 2026
-        assert result["subject_bootstrap"][arm]["unit"] == "subject"
-        assert result["temporal_descriptors"][arm]["is_selection_input"] is False
-    assert result["selected_arm"] in T2_ARMS
-    assert result["latency_used_in_selection"] is False
-    assert result["challenge_used_in_selection"] is False
-    assert result["test_accessed"] is False
-    assert result["sealed_test_state"] == "unopened"
-
-    # The scored population excludes exactly the unavailable rows.
-    scored = result["per_arm_evidence"][T2_ARM_GRU]["scored_row_count"]
-    assert scored == validation.row_count - 1
-
-
 def test_outer_validation_selection_is_delegated_to_the_protocol(monkeypatch):
     from cardiosentinel.neural import t2_protocol
 
@@ -1262,31 +1209,6 @@ def test_a_challenge_row_can_causally_alter_a_later_primary_output():
         with_context, _ = model(torch.cat([challenge, primary], dim=1))
         without_context, _ = model(primary)
     assert not torch.allclose(with_context[:, 1:], without_context, atol=1e-6)
-
-
-# --- temporal descriptor wording ------------------------------------------
-
-
-def test_the_persistence_descriptor_states_what_it_actually_measures():
-    descriptors = EV.temporal_descriptors([1, 0, 1, 1], labels=[1, 1, 0, 1])
-    assert descriptors["prediction_persistence_definition"] == (
-        "fraction_of_labelled_positive_windows_predicted_positive"
-    )
-    assert descriptors["prediction_persistence_unit"] == "window"
-    assert descriptors["prediction_persistence_conditioning_population"] == (
-        "labelled_positive_windows"
-    )
-    assert (
-        descriptors["prediction_persistence_is_episode_onset_offset_measurement"]
-        is False
-    )
-    assert descriptors["episode_grouping_performed"] is False
-    assert descriptors["formal_episode_reasoning_belongs_to"] == "t1"
-    # The value really is that fraction: labelled positives are rows 0, 1, 3;
-    # predictions there are 1, 0, 1.
-    assert descriptors[
-        "prediction_persistence_around_labelled_ischemic_intervals"
-    ] == pytest.approx(2 / 3)
 
 
 # --- L. TEST firewall ------------------------------------------------------

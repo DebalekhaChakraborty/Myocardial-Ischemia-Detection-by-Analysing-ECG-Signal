@@ -211,6 +211,18 @@ def initial_states(model: nn.Module, count: int, *, device: Any = None) -> list[
     return [model.initial_state(1, device=device) for _ in range(count)]
 
 
+def _resolve_device(model: nn.Module, device: Any = None) -> Any:
+    """The device the science runs on: the one asked for, or the model's own.
+
+    Falling back to the model's parameter device rather than to a hardcoded
+    CPU means a caller that has already moved the model cannot accidentally
+    feed it inputs from somewhere else.
+    """
+    if device is not None:
+        return torch.device(device)
+    return next(model.parameters()).device
+
+
 # ---------------------------------------------------------------------------
 # Bounded timeline reads
 # ---------------------------------------------------------------------------
@@ -425,6 +437,7 @@ def train_one_epoch(
     streams: Sequence[T2Stream],
     *,
     pos_weight: float,
+    device: Any = None,
     tbptt: int = T2_TBPTT_LENGTH,
 ) -> T2FrontierStats:
     """One complete chronological pass over every FIT stream.
@@ -452,8 +465,9 @@ def train_one_epoch(
     if not streams:
         raise T2TrainingError("An epoch needs at least one fitting stream.")
     model.train()
+    execution_device = _resolve_device(model, device)
     stats = T2FrontierStats()
-    states = initial_states(model, len(streams))
+    states = initial_states(model, len(streams), device=execution_device)
     frontiers = synchronized_frontiers(reader.stream_row_counts(streams), tbptt=tbptt)
 
     for frontier in frontiers:
@@ -485,14 +499,19 @@ def train_one_epoch(
         for length in sorted(grouped):
             group = grouped[length]
             indices = [view.stream_index for view in group]
-            values = torch.from_numpy(np.stack([view.values for view in group], axis=0))
+            values = torch.from_numpy(
+                np.stack([view.values for view in group], axis=0)
+            ).to(execution_device)
             logits, _ = run_stream_group(model, values, states, indices)
+            # Masks and targets follow the inputs onto the execution device;
+            # a CPU mask indexing a CUDA logit tensor would silently move the
+            # computation back and make the device provenance a fiction.
             mask = torch.from_numpy(
                 np.stack([view.direct_loss for view in group], axis=0)
-            )
+            ).to(execution_device)
             targets = torch.from_numpy(
                 np.stack([view.labels for view in group], axis=0)
-            )
+            ).to(execution_device)
             partial, count = direct_loss_sum(
                 logits, targets, mask, pos_weight=pos_weight
             )
@@ -565,6 +584,7 @@ def score_streams(
     reader: T2TimelineReader,
     streams: Sequence[T2Stream],
     *,
+    device: Any = None,
     tbptt: int = T2_TBPTT_LENGTH,
 ) -> T2ScorePass:
     """One complete causal timeline pass. No loss, no optimiser, no gradient.
@@ -578,6 +598,7 @@ def score_streams(
     the state untouched -- exactly the frozen no-op semantics.
     """
     model.eval()
+    execution_device = _resolve_device(model, device)
     scores: list[np.ndarray] = []
     labels: list[np.ndarray] = []
     direct: list[np.ndarray] = []
@@ -585,13 +606,13 @@ def score_streams(
     positions: list[np.ndarray] = []
     with torch.no_grad():
         for stream in streams:
-            state = model.initial_state(1)
+            state = model.initial_state(1, device=execution_device)
             for local_start in range(0, stream.row_count, int(tbptt)):
                 local_stop = min(local_start + int(tbptt), stream.row_count)
                 view = reader.slice_view(0, stream, local_start, local_stop)
                 if view.length == 0:
                     continue
-                values = torch.from_numpy(view.values[None, ...])
+                values = torch.from_numpy(view.values[None, ...]).to(execution_device)
                 logits, state = model(values, state)
                 scores.append(
                     torch.sigmoid(logits[0]).to(torch.float64).cpu().numpy().copy()
@@ -620,6 +641,7 @@ def evaluate_internal_development(
     streams: Sequence[T2Stream],
     *,
     internal_dev_subjects: Sequence[str],
+    device: Any = None,
     tbptt: int = T2_TBPTT_LENGTH,
 ) -> tuple[float, T2ScorePass]:
     """Pooled internal-dev PRIMARY AUPRC -- the one checkpoint criterion.
@@ -637,7 +659,7 @@ def evaluate_internal_development(
         )
     if not streams:
         raise T2TrainingError("Internal-dev evaluation needs at least one stream.")
-    scored = score_streams(model, reader, streams, tbptt=tbptt)
+    scored = score_streams(model, reader, streams, device=device, tbptt=tbptt)
     return pooled_auprc(scored.primary_labels, scored.primary_scores), scored
 
 
@@ -763,8 +785,15 @@ def capture_model_state(model: nn.Module) -> dict[str, Tensor]:
     }
 
 
-def restore_model_state(arm: str, state_dict: dict[str, Tensor]) -> nn.Module:
-    """Rebuild the frozen architecture and load the retained state into it."""
+def restore_model_state(
+    arm: str, state_dict: dict[str, Tensor], *, device: Any = None
+) -> nn.Module:
+    """Rebuild the frozen architecture and load the retained state into it.
+
+    The checkpoint itself is CPU tensors by design, so it can be promoted and
+    reloaded anywhere; the rebuilt model is then moved onto the canonical
+    execution device before it scores anything.
+    """
     model = build_candidate(arm)
     missing, unexpected = model.load_state_dict(state_dict, strict=True)
     if missing or unexpected:  # pragma: no cover - strict=True already raises
@@ -772,6 +801,8 @@ def restore_model_state(arm: str, state_dict: dict[str, Tensor]) -> nn.Module:
             f"The retained {arm} state does not match the frozen architecture: "
             f"missing {list(missing)}, unexpected {list(unexpected)}."
         )
+    if device is not None:
+        model.to(torch.device(device))
     model.eval()
     return model
 
@@ -910,7 +941,9 @@ def train_arm(
     internal_dev_streams: Sequence[T2Stream],
     internal_dev_subjects: Sequence[str],
     pos_weight: float,
+    device: Any = None,
     before_model_construction: Any = None,
+    on_model_constructed: Any = None,
     max_epochs: int = T2_MAX_EPOCHS,
     tbptt: int = T2_TBPTT_LENGTH,
 ) -> dict[str, Any]:
@@ -937,6 +970,15 @@ def train_arm(
     if before_model_construction is not None:
         before_model_construction(arm)
     model = build_candidate(arm)
+    execution_device = (
+        torch.device(device) if device is not None else next(model.parameters()).device
+    )
+    model.to(execution_device)
+    if on_model_constructed is not None:
+        # The caller observes the model's REAL parameter device here, so a
+        # provenance record claiming another one is refused before any
+        # optimiser step rather than after promotion.
+        on_model_constructed(arm, model)
     optimizer = build_optimizer(model)
     selector = T2CheckpointSelector()
     retained: T2RetainedCheckpoint | None = None
@@ -949,6 +991,7 @@ def train_arm(
             reader,
             fit_streams,
             pos_weight=pos_weight,
+            device=execution_device,
             tbptt=tbptt,
         )
         auprc, scored = evaluate_internal_development(
@@ -956,6 +999,7 @@ def train_arm(
             reader,
             internal_dev_streams,
             internal_dev_subjects=internal_dev_subjects,
+            device=execution_device,
             tbptt=tbptt,
         )
         result = T2EpochResult.from_stats(epoch, stats, auprc)
@@ -979,9 +1023,9 @@ def train_arm(
             f"the selector chose {selector.best_epoch}."
         )
 
-    reloaded = restore_model_state(arm, retained.state_dict)
+    reloaded = restore_model_state(arm, retained.state_dict, device=execution_device)
     threshold_scored = score_streams(
-        reloaded, reader, internal_dev_streams, tbptt=tbptt
+        reloaded, reader, internal_dev_streams, device=execution_device, tbptt=tbptt
     )
     if threshold_scored.score_sha256() != retained.internal_dev_score_sha256:
         raise T2TrainingError(
@@ -1009,6 +1053,8 @@ def train_arm(
         "threshold_derived_during_epoch_selection": False,
         "threshold_derived_from_outer_validation": False,
         "positive_class_weight": float(pos_weight),
+        "execution_device": str(execution_device),
+        "model_parameter_device": str(next(reloaded.parameters()).device),
         "fit_stream_count": len(fit_streams),
         "internal_dev_stream_count": len(internal_dev_streams),
     }

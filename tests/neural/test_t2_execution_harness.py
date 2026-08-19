@@ -703,8 +703,16 @@ def test_claim_refuses_a_consumed_attempt(tmp_path):
 
 def test_claim_identity_has_no_timestamp_or_random_suffix():
     assert PS.T2_TRAINING_ATTEMPT_ID == "t2-v1-training"
+    assert PS.T2_OUTER_VALIDATION_ATTEMPT_ID == "t2-v1-outer-validation"
     assert PS.T2_EXPERIMENT_IDENTITY == "T2_temporal_v1"
-    assert str(PS.T2_RUN_ROOT) == "cardiosentinel-runs/phase8-t2-development-v1"
+    # Absolute, and anchored to the repository rather than to the shell's cwd.
+    assert PS.T2_RUN_ROOT.is_absolute()
+    assert PS.T2_RUN_ROOT.parts[-2:] == (
+        "cardiosentinel-runs",
+        "phase8-t2-development-v1",
+    )
+    for attempt in PS.T2_ATTEMPT_IDS:
+        assert not any(character.isdigit() for character in attempt.split("-")[-1])
 
 
 def test_a_result_that_selects_an_arm_is_refused():
@@ -793,13 +801,36 @@ def test_outer_validation_result_schema_requires_both_arms():
 # --- descriptive metrics, cold start, challenge, bootstrap ---------------
 
 
+def _descriptor_stream(
+    predictions, *, record="s20011", channel=0, present=None, primary=None, labels=None
+):
+    size = len(predictions)
+    return EV.T2DescriptorStream(
+        record_id=record,
+        channel_index=channel,
+        predictions=np.asarray(predictions, dtype=bool),
+        score_present=np.asarray(
+            [True] * size if present is None else present, dtype=bool
+        ),
+        primary_mask=np.asarray(
+            [True] * size if primary is None else primary, dtype=bool
+        ),
+        labels=np.asarray([0] * size if labels is None else labels, dtype=np.int64),
+    )
+
+
 def test_temporal_descriptors_are_descriptive_only():
-    descriptors = EV.temporal_descriptors([0, 1, 1, 0, 1, 0], labels=[0, 1, 1, 0, 0, 0])
+    descriptors = EV.temporal_descriptors(
+        [_descriptor_stream([0, 1, 1, 0, 1, 0], labels=[0, 1, 1, 0, 0, 0])]
+    )
     assert descriptors["is_selection_input"] is False
     assert descriptors["may_alter_threshold"] is False
     assert descriptors["positive_prediction_run_count"] == 2
     assert descriptors["isolated_single_window_positive_fraction"] == 0.5
     assert descriptors["median_positive_run_duration_seconds"] == 7.5
+    # Physical exposure counts every raw position, not just the scored ones.
+    assert descriptors["physical_exposure_seconds"] == 30.0
+    assert descriptors["stream_count"] == 1
 
 
 def test_cold_start_reports_the_inherited_strata_without_repair():

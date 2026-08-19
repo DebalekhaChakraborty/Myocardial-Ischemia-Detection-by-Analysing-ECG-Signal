@@ -64,12 +64,16 @@ from cardiosentinel.neural.t2_persistence import (
     T2_TRAINING_ATTEMPT_ID,
     T2ActivationError,
     T2PersistenceError,
+    canonical_execution_device,
     claim_t2_run_directory,
     finalize_and_promote_t2_result,
+    model_parameter_device,
     observe_t2_runtime_stage,
     promote_checkpoint,
     promote_component,
     record_t2_attempt_failure,
+    require_deterministic_execution,
+    require_execution_device_agreement,
     require_outer_validation_authorized,
     require_single_runtime,
     require_unclaimed_t2_attempt,
@@ -214,7 +218,21 @@ class _Exposure:
     optimizer_stepped: bool = False
     internal_dev_scored: bool = False
     threshold_derived: bool = False
+    execution_device: str | None = None
+    # The arm currently executing, which is NOT `arms_completed[-1]`: if the
+    # GRU completes and the S4D then fails, the last completed arm is the GRU
+    # and naming it in the receipt would attribute the failure to the arm that
+    # worked. This is set before an arm's scientific execution begins and
+    # cleared only after that arm completes.
+    current_arm: str | None = None
     arms_completed: list[str] = field(default_factory=list)
+
+    def begin_arm(self, arm: str) -> None:
+        self.current_arm = arm
+
+    def complete_arm(self, arm: str) -> None:
+        self.arms_completed.append(arm)
+        self.current_arm = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -224,6 +242,8 @@ class _Exposure:
             "optimizer_stepped": self.optimizer_stepped,
             "internal_dev_scored": self.internal_dev_scored,
             "threshold_derived": self.threshold_derived,
+            "execution_device": self.execution_device,
+            "current_arm": self.current_arm,
             "arms_completed": list(self.arms_completed),
             "arm_selection_performed": False,
             "outer_validation_accessed": False,
@@ -287,7 +307,7 @@ def _execute_training_attempt(
             claimed,
             exception=error,
             stage=exposure.stage,
-            arm=(exposure.arms_completed[-1] if exposure.arms_completed else None),
+            arm=exposure.current_arm,
             exposure=exposure.as_dict(),
             runtime=runtime,
         )
@@ -371,6 +391,12 @@ def _train_both_arms(
     # never actually mixed. Each arm still reseeds from the same fresh origin.
     exposure.stage = "establish_deterministic_runtime"
     determinism = seed_everything()
+    # ONE device, selected once, before any arm exists. There is no flag and
+    # no override; if determinism cannot be satisfied on it, execution STOPS
+    # rather than falling back to the CPU behind the provenance's back.
+    execution_device = canonical_execution_device()
+    determinism.update(require_deterministic_execution(execution_device))
+    exposure.execution_device = str(execution_device)
 
     exposure.stage = "derive_fit_class_weight"
     class_weight = fit_class_weight_evidence(
@@ -408,6 +434,7 @@ def _train_both_arms(
         "internal_dev_availability": reader.availability_census(internal_dev_streams),
         "class_weight": class_weight,
         "deterministic_runtime": determinism,
+        "execution_device": str(execution_device),
         "internal_dev_contributes_optimizer_gradient": False,
         "negative_sampling_applied": False,
         "outer_validation_accessed": False,
@@ -439,16 +466,27 @@ def _train_both_arms(
 
     for arm in T2_ARMS:
         exposure.stage = f"train_arm:{arm}"
-        observed_runtime = runtime_provenance()
+        exposure.begin_arm(arm)
+        observed_runtime = runtime_provenance(execution_device)
         if runtimes:
             require_single_runtime(runtimes[0], observed_runtime)
         runtimes.append(observed_runtime)
+        device_proof: dict[str, Any] = {}
 
         def _before_model_construction(name: str) -> None:
             observe_t2_runtime_stage(
                 runtime,
                 point=EnforcementPoint.PRE_PROMOTION,
                 detail=stage_pre_model_construction(name),
+            )
+
+        def _on_model_constructed(
+            _name: str, model: Any, _runtime: dict[str, Any] = observed_runtime
+        ) -> None:
+            device_proof.update(
+                require_execution_device_agreement(
+                    _runtime, model_parameter_device(model)
+                )
             )
 
         trained = train_arm(
@@ -458,7 +496,12 @@ def _train_both_arms(
             internal_dev_streams=internal_dev_streams,
             internal_dev_subjects=internal_dev_subjects,
             pos_weight=class_weight["positive_class_weight"],
+            device=execution_device,
             before_model_construction=_before_model_construction,
+            on_model_constructed=_on_model_constructed,
+        )
+        require_execution_device_agreement(
+            observed_runtime, trained["model_parameter_device"]
         )
         exposure.optimizer_stepped = True
         exposure.internal_dev_scored = True
@@ -467,7 +510,9 @@ def _train_both_arms(
         exposure.stage = f"promote_checkpoint:{arm}"
         # The identity is read off a model rebuilt from the retained state, not
         # off the live trainer: what is attested is what will be promoted.
-        identity = model_identity(restore_model_state(arm, trained["state_dict"]))
+        identity = model_identity(
+            restore_model_state(arm, trained["state_dict"], device=execution_device)
+        )
         parameter_counts[arm] = int(identity["trainable_parameters"])
         checkpoint_lock = promote_checkpoint(
             claimed,
@@ -484,6 +529,7 @@ def _train_both_arms(
                     "threshold"
                 ],
                 "runtime": observed_runtime,
+                "execution_device_proof": dict(device_proof),
             },
             runtime=runtime,
         )
@@ -519,6 +565,9 @@ def _train_both_arms(
             "threshold_derived_from_outer_validation": False,
             "positive_class_weight": trained["positive_class_weight"],
             "runtime": observed_runtime,
+            "execution_device": trained["execution_device"],
+            "model_parameter_device": trained["model_parameter_device"],
+            "execution_device_proof": dict(device_proof),
             "arm_selection_status": ARM_SELECTION_PENDING,
             "arm_selected": None,
             "outer_validation_accessed": False,
@@ -527,7 +576,7 @@ def _train_both_arms(
         }
         promote_component(claimed, ARM_RESULT_NAME[arm], arm_payload, runtime=runtime)
         arm_results[arm] = arm_payload
-        exposure.arms_completed.append(arm)
+        exposure.complete_arm(arm)
 
     exposure.stage = "promote_canonical_result"
     require_capacity_envelope(parameter_counts)
@@ -551,6 +600,8 @@ def _train_both_arms(
         "checkpoint_lock_sha256": dict(checkpoint_lock_sha256),
         "internal_dev_thresholds": dict(thresholds),
         "trainable_parameters": dict(parameter_counts),
+        "execution_device": str(execution_device),
+        "runtime": dict(runtimes[0]),
         "arms": list(T2_ARMS),
         "arm_selection_status": ARM_SELECTION_PENDING,
         "arm_selected": None,
@@ -572,12 +623,15 @@ def _train_both_arms(
         "checkpoint_lock_sha256": dict(checkpoint_lock_sha256),
         "checkpoint_lock_self_sha256": dict(checkpoint_lock_self_sha256),
         "internal_dev_thresholds": dict(thresholds),
+        "execution_device": str(execution_device),
+        "runtime": dict(runtimes[0]),
     }
     promoted = finalize_and_promote_t2_result(
         claimed, result=result, provenance=provenance, runtime=runtime
     )
     return {
         "report_class": "t2_canonical_training_completion",
+        "execution_device": str(execution_device),
         "attempt_id": claimed.attempt_id,
         "experiment_identity": T2_EXPERIMENT_IDENTITY,
         "run_dir": str(claimed.run_dir),
@@ -626,15 +680,20 @@ def _file_sha256(path: Path) -> str:
     return sha256_file(Path(path))
 
 
-def execute_canonical_outer_validation(_expected_git_sha: str | None) -> dict[str, Any]:
-    """Refuses before any VALIDATION path, array or label is touched."""
+def execute_canonical_outer_validation(expected_git_sha: str | None) -> dict[str, Any]:
+    """Refuses before any VALIDATION path, array or label is touched.
+
+    After activation this forwards the human-authorized merged commit through
+    to the outer worker, which proves it -- and a clean tree, and an unconsumed
+    outer attempt -- before claiming and before opening anything.
+    """
     require_outer_validation_authorized()
     from cardiosentinel.neural.t2_evaluation import (  # pragma: no cover
         execute_canonical_outer_validation as run_outer_validation,
     )
 
     return run_outer_validation(  # pragma: no cover - unreachable while gated
-        T2_RUN_ROOT / T2_TRAINING_ATTEMPT_ID
+        expected_git_sha
     )
 
 
