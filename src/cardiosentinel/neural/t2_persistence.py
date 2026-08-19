@@ -151,7 +151,43 @@ ARM_SELECTION_PENDING: Final = "pending_one_shot_outer_validation"
 
 # The single activation switch. There is deliberately no setter, no environment
 # variable and no CLI flag: flipping it is a reviewed change set.
-T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED: Final = False
+#
+# Flipped to True by the activation change set recorded in
+# `docs/T2_TRAIN_ARTIFACT_REVIEW_AND_OUTER_ACTIVATION_V1.md`, after the canonical
+# TRAIN attempt completed, verified and was reviewed. Activation authorizes the
+# one-shot route to *run when a human invokes it*; it executes nothing by
+# itself, and it does not weaken any gate the route already applies. The
+# reviewed-TRAIN binding below is what stops activation from being a blank
+# cheque: the outer preflight refuses unless the TRAIN attempt it verifies is
+# byte-for-byte the reviewed one.
+T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED: Final = True
+
+# ---------------------------------------------------------------------------
+# The reviewed TRAIN attempt the activation is bound to
+#
+# These are read from the immutable promoted artifacts of `t2-v1-training`, not
+# invented. `T2_REVIEWED_TRAIN_RESULT_SHA256` is the top-level result's file
+# digest; `T2_REVIEWED_TRAIN_EXPERIMENT_LOCK_SELF_SHA256` is the experiment
+# lock's *self*-digest, which is a different quantity from the lock file's byte
+# digest and is the one the canonical verifier reports.
+# ---------------------------------------------------------------------------
+T2_TRAIN_ARTIFACT_REVIEW_NAME: Final = (
+    "T2_TRAIN_ARTIFACT_REVIEW_AND_OUTER_ACTIVATION_V1"
+)
+T2_TRAIN_ARTIFACT_REVIEW_PATH: Final = (
+    REPOSITORY_ROOT / "docs" / f"{T2_TRAIN_ARTIFACT_REVIEW_NAME}.md"
+)
+T2_TRAIN_ARTIFACT_REVIEW_SHA256: Final = (
+    "d2065deaef173fd76681c5babcd1a6f16b51e2edd29b0436a24d4853fb7a479c"
+)
+
+T2_REVIEWED_TRAIN_RESULT_SHA256: Final = (
+    "ff9258f95631405b6705811d638d754400a067be4c1a43bb9d52021bb246adb8"
+)
+T2_REVIEWED_TRAIN_EXPERIMENT_LOCK_SELF_SHA256: Final = (
+    "d8de03554931fe65a6f1c1242d80c1c95f1a6a26f93b8013cff5bc221a92202f"
+)
+T2_REVIEWED_TRAIN_AUTHORIZED_GIT_SHA: Final = "f4759e2a97d17db26cb6a6b7c0e9b6207eb0b045"
 
 _SHA256_PATTERN: Final = re.compile(r"^[0-9a-f]{64}$")
 _GIT_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}$")
@@ -209,6 +245,124 @@ def require_outer_validation_authorized() -> None:
             "reviewed; there is no flag, argument or environment variable that "
             "bypasses this."
         )
+
+
+def validate_t2_train_artifact_review_document(
+    path: Path = T2_TRAIN_ARTIFACT_REVIEW_PATH,
+) -> str:
+    """Verify the activation-decision record byte-for-byte.
+
+    Activation is only meaningful alongside the review that justified it. If the
+    record can drift after the switch is flipped, the switch stops meaning
+    anything, so its digest is frozen exactly like the protocol and the spec.
+    """
+    document = Path(path)
+    if not document.is_file():
+        raise T2PersistenceError(
+            f"The T2 TRAIN-artifact review record is missing at {document}."
+        )
+    digest = sha256_file(document)
+    if digest != T2_TRAIN_ARTIFACT_REVIEW_SHA256:
+        raise T2PersistenceError(
+            f"T2 TRAIN-artifact review digest {digest} differs from the frozen "
+            f"{T2_TRAIN_ARTIFACT_REVIEW_SHA256}. The activation decision record "
+            "is immutable."
+        )
+    return digest
+
+
+def require_reviewed_t2_training_attempt(
+    training_verification: dict[str, Any],
+) -> dict[str, Any]:
+    """Require the verified TRAIN attempt to be the exact human-reviewed one.
+
+    `validate_canonical_t2_attempt` has already proved this attempt internally
+    consistent from its immutable bytes -- component digests, checkpoint locks,
+    Git identity. That proof is reused rather than re-derived here; a weaker
+    parallel validator alongside it would be a second, softer truth.
+
+    What this adds is the one thing byte-level self-consistency cannot show: that
+    the self-consistent attempt is the attempt a human actually reviewed. A
+    perfectly valid *different* TRAIN attempt -- a re-run, a relocated run root,
+    a recovery -- would satisfy the verifier and must not silently inherit the
+    review that authorized outer VALIDATION.
+
+    Called after canonical verification and BEFORE the outer claim, so a
+    mismatch consumes nothing and opens nothing.
+    """
+    if training_verification.get("verified") is not True:
+        raise T2ActivationError(
+            "The canonical TRAIN attempt did not verify, so outer VALIDATION "
+            "cannot be authorized against it. No outer attempt is claimed."
+        )
+
+    for label, key, expected in (
+        (
+            "top-level result digest",
+            "result_sha256",
+            T2_REVIEWED_TRAIN_RESULT_SHA256,
+        ),
+        (
+            "experiment-lock self-digest",
+            "experiment_lock_sha256",
+            T2_REVIEWED_TRAIN_EXPERIMENT_LOCK_SELF_SHA256,
+        ),
+        (
+            "authorized TRAIN commit",
+            "authorized_git_sha",
+            T2_REVIEWED_TRAIN_AUTHORIZED_GIT_SHA,
+        ),
+    ):
+        observed = training_verification.get(key)
+        if observed != expected:
+            raise T2ActivationError(
+                f"The verified TRAIN attempt's {label} is {observed!r}, but the "
+                f"reviewed activation record binds {expected!r}. Outer "
+                "VALIDATION is authorized only against the reviewed TRAIN "
+                "artifacts. Nothing is claimed and no VALIDATION artifact is "
+                "opened."
+            )
+
+    status = training_verification.get("arm_selection_status")
+    if status != ARM_SELECTION_PENDING:
+        raise T2ActivationError(
+            f"The reviewed TRAIN attempt reports arm_selection_status {status!r} "
+            f"rather than {ARM_SELECTION_PENDING!r}. Outer VALIDATION is the "
+            "selection evidence; an attempt that already carries a selection "
+            "cannot be the input to it."
+        )
+    if training_verification.get("arm_selected") not in (None, ""):
+        raise T2ActivationError(
+            "The reviewed TRAIN attempt already names a selected arm. Outer "
+            "VALIDATION is the one-shot selection evidence and cannot ratify a "
+            "selection that predates it."
+        )
+    if training_verification.get("test_accessed") is True:
+        raise T2ActivationError(
+            "The reviewed TRAIN attempt reports TEST as accessed. TEST is "
+            "sealed; no outer attempt is claimed."
+        )
+    sealed = training_verification.get("sealed_test_state")
+    if sealed not in (None, "unopened"):
+        raise T2ActivationError(
+            f"The reviewed TRAIN attempt reports sealed_test_state {sealed!r} "
+            "rather than 'unopened'. TEST is sealed; no outer attempt is claimed."
+        )
+
+    return {
+        "binding_class": "t2_reviewed_training_attempt_binding",
+        "review_document": f"docs/{T2_TRAIN_ARTIFACT_REVIEW_NAME}.md",
+        "review_document_sha256": validate_t2_train_artifact_review_document(),
+        "reviewed_train_result_sha256": T2_REVIEWED_TRAIN_RESULT_SHA256,
+        "reviewed_train_experiment_lock_self_sha256": (
+            T2_REVIEWED_TRAIN_EXPERIMENT_LOCK_SELF_SHA256
+        ),
+        "reviewed_train_authorized_git_sha": T2_REVIEWED_TRAIN_AUTHORIZED_GIT_SHA,
+        "arm_selection_status": status,
+        "arm_selected": None,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -990,12 +1144,28 @@ def validate_t2_run_lock(
         "validation_accessed",
         "test_accessed",
         "outer_validation_accessed",
-        "outer_validation_execution_authorized",
         "automatic_retry_performed",
         "repeat_attempt_permitted",
     ):
         if lock[flag] is not False:
             raise T2PersistenceError(f"A canonical T2 lock must record {flag}=false.")
+    # `outer_validation_execution_authorized` is a factual snapshot of the global
+    # activation state at the moment the lock was written -- not a statement
+    # about what this TRAIN run did. It is False in the promoted `t2-v1-training`
+    # lock, which was written before the reviewed activation change set, and
+    # True for anything written after it. Requiring the snapshot to be False
+    # would have made the flag mean "activation has never happened", which is a
+    # property of the repository rather than of the attempt.
+    #
+    # The guarantee that actually matters is the conduct above: a TRAIN lock
+    # recording `outer_validation_accessed` or `validation_accessed` is a
+    # contradiction whatever the global switch says, and those stay strict.
+    if not isinstance(lock["outer_validation_execution_authorized"], bool):
+        raise T2PersistenceError(
+            "A canonical T2 lock must record "
+            "outer_validation_execution_authorized as a boolean snapshot of the "
+            "activation state."
+        )
     if lock["sealed_test_state"] != "unopened":
         raise T2PersistenceError("The B4 sealed test must remain unopened.")
     if lock["arm_selection_status"] != ARM_SELECTION_PENDING:

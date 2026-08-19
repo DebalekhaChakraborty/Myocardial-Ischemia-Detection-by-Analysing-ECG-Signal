@@ -63,6 +63,12 @@ from tests.neural import t2_fixtures as FX
 GIT_SHA = "a" * 40
 FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
 
+# Both are pre-claim refusals from `require_expected_git_sha`, and which one
+# fires depends on whether the checkout happens to be clean -- dirty in a
+# working tree, clean in CI. The property under test is that the route refuses
+# and opens nothing, not which of the two identity gates spoke first.
+_PRE_CLAIM_REFUSAL = "but the run expects|working tree is dirty"
+
 
 def _frozen_check(point, detail="test"):
     return RuntimeCheck(
@@ -1082,19 +1088,22 @@ def test_no_retry_force_or_recovery_vocabulary_exists_in_the_route():
 
 
 def test_the_public_gate_refuses_before_any_loader_access(monkeypatch):
-    """No path is resolved, no timeline is opened, no label is read."""
+    """No path is resolved, no timeline is opened, no label is read.
+
+    Activation is now True, so the refusal comes from the authorized-commit
+    gate rather than the activation gate. The argument is a nonsense value the
+    checkout cannot be at, and the loader spy proves nothing was opened.
+    """
     opened: list[object] = []
     monkeypatch.setattr(
         EV, "_open_validation_timeline", lambda *a, **k: opened.append(a) or None
     )
-    monkeypatch.setattr(
-        EV, "_outer_validation_worker", lambda *a, **k: opened.append(a) or {}
-    )
     for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
-        with pytest.raises(PS.T2ActivationError, match="not authorized"):
+        with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
             entry(Path("/nonexistent"))
     assert opened == [], "the refusal fired before anything was opened"
-    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is False
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
+    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists()
 
 
 def test_the_activation_gate_is_the_first_statement_of_every_entry_point():
