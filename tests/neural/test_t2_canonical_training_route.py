@@ -16,9 +16,15 @@ following the reviewed M2 canonical-runner convention:
 
 * `git_provenance` is replaced with a clean fake, because a canonical lock
   refuses a dirty checkout and a developer's working tree is dirty by nature;
-* nothing else. The split, the target join, the frontier loop, the checkpoint
-  choreography, the threshold pass, the promotion and the lock are the real
-  ones.
+* the runtime-integrity observation is replaced with a frozen one, because the
+  only interpreter that carries the frozen 335-package digest is
+  `venvs/tactics` -- CI and a developer shell do not, and the sentinel is
+  right to refuse them. Its real refusal behaviour is proved by its own tests
+  and by `test_a_missing_enforcement_stage_is_refused` here; what this file
+  tests is that the canonical body *visits* the enforcement points, in order.
+
+Nothing else. The split, the target join, the frontier loop, the checkpoint
+choreography, the threshold pass, the promotion and the lock are the real ones.
 """
 
 from __future__ import annotations
@@ -42,6 +48,7 @@ from cardiosentinel.neural.m1_store import (
     START_SAMPLE_FILE,
 )
 from cardiosentinel.neural.patient_memory import M1MemoryError
+from cardiosentinel.neural.runtime_sentinel import EnforcementPoint, RuntimeCheck
 from cardiosentinel.neural.t2_models import build_t2_model
 from cardiosentinel.neural.t2_protocol import (
     T2_ARM_GRU,
@@ -54,10 +61,66 @@ from cardiosentinel.neural.t2_protocol import (
 from tests.neural import t2_fixtures as FX
 
 GIT_SHA = "a" * 40
+FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
+
+
+def _frozen_check(point, detail="test"):
+    return RuntimeCheck(
+        enforcement_point=EnforcementPoint(point).value,
+        observed_digest=FROZEN_DIGEST,
+        expected_digest=FROZEN_DIGEST,
+        matches=True,
+        package_count=335,
+        observed_at="2026-01-01T00:00:00Z",
+        detail=detail,
+    )
 
 
 @pytest.fixture()
-def clean_git(monkeypatch):
+def frozen_runtime(monkeypatch):
+    """Drive the real production path with synthetic frozen observations.
+
+    Identical convention to the reviewed M2 canonical-runner tests. The
+    observation is faked; the choreography, the ordering requirement and every
+    refusal built on the record are the real ones.
+    """
+
+    def fake_observe(point, *, expected_digest=FROZEN_DIGEST, detail=None):
+        return _frozen_check(point, detail or "test")
+
+    def fake_require(point, *, record=None, detail=None):
+        check = _frozen_check(point, detail or "test")
+        if record is not None:
+            record.record(check)
+        return check
+
+    monkeypatch.setattr(PS, "observe_runtime_identity", fake_observe)
+    monkeypatch.setattr(PS, "require_runtime_identity", fake_require)
+    monkeypatch.setattr(
+        "cardiosentinel.neural.runtime_sentinel.require_runtime_identity", fake_require
+    )
+    frozen_provenance = {
+        "interpreter": "/home/AI_POC/venvs/tactics/bin/python",
+        "python_version": "3.11.0",
+        "package_count": 335,
+        "dependency_digest": FROZEN_DIGEST,
+        "torch_version": torch.__version__,
+        "cuda_version": None,
+        "device_type": "cpu",
+        "device_name": None,
+        "deterministic_algorithms": True,
+        "cudnn_benchmark": False,
+        "cudnn_deterministic": True,
+        "torch_threads": 1,
+        "torch_interop_threads": 1,
+    }
+    monkeypatch.setattr(PS, "runtime_provenance", lambda: dict(frozen_provenance))
+    monkeypatch.setattr(RUN, "runtime_provenance", lambda: dict(frozen_provenance))
+    return fake_require
+
+
+@pytest.fixture()
+def clean_git(monkeypatch, frozen_runtime):
     """A clean checkout, so the canonical lock's Git gate is not the subject."""
     fake = {"git_sha": GIT_SHA, "git_dirty": False}
     monkeypatch.setattr(PS, "git_provenance", lambda _root: dict(fake))
@@ -852,10 +915,7 @@ def test_the_enforcement_points_were_visited_in_the_frozen_order(completed_attem
 
 
 def test_a_missing_enforcement_stage_is_refused():
-    from cardiosentinel.neural.runtime_sentinel import (
-        RuntimeCheck,
-        RuntimeIntegrityRecord,
-    )
+    from cardiosentinel.neural.runtime_sentinel import RuntimeIntegrityRecord
 
     record = RuntimeIntegrityRecord()
     for detail in (PS.STAGE_TRAINING_START, PS.RESULT_NAME):
@@ -872,6 +932,24 @@ def test_a_missing_enforcement_stage_is_refused():
         )
     with pytest.raises(PS.T2PersistenceError, match="enforcement choreography"):
         PS.require_runtime_stage_order(record, T2_ARMS)
+
+
+def test_determinism_is_established_before_the_first_runtime_reading():
+    """The real reading, not the frozen fake.
+
+    Establishing determinism lazily inside the first arm's construction made
+    arm A observe `deterministic_algorithms: False` and arm B `True`, and the
+    same-runtime check then correctly refused a comparison that was never
+    actually mixed. This is that defect, pinned.
+    """
+    from cardiosentinel.neural.t2_models import seed_everything
+
+    seed_everything()
+    first = PS.runtime_provenance()
+    seed_everything()
+    second = PS.runtime_provenance()
+    assert first["deterministic_algorithms"] is True
+    PS.require_single_runtime(first, second)
 
 
 def test_both_arms_observed_the_same_runtime(completed_attempt):
