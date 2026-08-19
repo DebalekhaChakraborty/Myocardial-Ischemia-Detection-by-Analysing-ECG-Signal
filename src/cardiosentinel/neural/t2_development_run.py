@@ -13,33 +13,93 @@ There is deliberately no `--arm`, `--epoch`, `--lr`, `--batch-size`, `--tbptt`,
 `--test`. Every one of those would be a scientific choice the frozen protocol
 has already made, or a firewall bypass.
 
+**There is no activation switch for training.** The human authorization
+mechanism is the exact merged Git SHA supplied through `--expected-git-sha`,
+matching the reviewed one-shot pattern P1, M1, M2 and U1 already use. The route
+is complete; it simply remains unexecuted until a human runs it against a merged
+commit.
+
 `--execute-canonical-outer-validation` exists so the route can be reviewed, and
 it refuses: the activation state is `False`, and the refusal fires before any
 VALIDATION path, array or label is touched.
+
+**The choreography, and why it is in this order.** Preflight proves Git, the
+protocol bytes, the execution-spec bytes and that the claim is unconsumed --
+all of it small immutable identity material. Only then is the runtime observed
+at START and the attempt claimed. The real TRAIN store and the real target
+authority are opened **after** the claim, so a corrupted input discovered there
+consumes the attempt and is recorded honestly as an input-lineage failure
+rather than being quietly discovered by a pre-run scan that leaves no trace.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Final
 
 from cardiosentinel.data.provenance import git_provenance
 from cardiosentinel.neural.patient_memory import REPOSITORY_ROOT
+from cardiosentinel.neural.runtime_sentinel import (
+    EnforcementPoint,
+    RuntimeIntegrityRecord,
+)
+from cardiosentinel.neural.t2_models import model_identity, seed_everything
 from cardiosentinel.neural.t2_persistence import (
+    ARM_RESULT_NAME,
+    ARM_SELECTION_PENDING,
+    CHECKPOINT_LOCK_NAME,
+    CHECKPOINT_NAME,
+    INTERNAL_SPLIT_NAME,
+    POPULATION_NAME,
+    PREFLIGHT_NAME,
+    RESULT_CLASS,
+    STAGE_TRAINING_START,
+    T2_EXECUTION_SPEC_SHA256,
     T2_EXPERIMENT_IDENTITY,
     T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED,
     T2_RUN_ROOT,
     T2_TRAINING_ATTEMPT_ID,
     T2ActivationError,
     T2PersistenceError,
+    claim_t2_run_directory,
+    finalize_and_promote_t2_result,
+    observe_t2_runtime_stage,
+    promote_checkpoint,
+    promote_component,
+    record_t2_attempt_failure,
     require_outer_validation_authorized,
+    require_single_runtime,
     require_unclaimed_t2_attempt,
+    runtime_provenance,
+    stage_pre_model_construction,
     validate_t2_execution_spec,
 )
 from cardiosentinel.neural.t2_protocol import (
     T2_ARMS,
+    T2_INTERNAL_DEV_SUBJECTS,
+    T2_INTERNAL_SPLIT_SHA256,
+    T2_PROTOCOL_SHA256,
+    T2_SPLIT_PATH,
+    assign_internal_split,
+    require_capacity_envelope,
+    require_full_chronological_population,
+    validate_internal_split,
     validate_t2_protocol_document,
+)
+from cardiosentinel.neural.t2_timeline import (
+    CORPUS_MANIFEST,
+    T2Timeline,
+    ordered_stable_id_digest_for_rows,
+    resolve_timeline_target_families,
+)
+from cardiosentinel.neural.t2_training import (
+    T2TimelineReader,
+    fit_class_weight_evidence,
+    restore_model_state,
+    train_arm,
 )
 
 FORBIDDEN_OPTIONS: Final = (
@@ -58,6 +118,8 @@ FORBIDDEN_OPTIONS: Final = (
     "--validation",
     "--test",
 )
+
+TRAIN_PARTITION: Final = "train"
 
 
 class T2RunError(RuntimeError):
@@ -107,32 +169,472 @@ def preflight(expected_git_sha: str | None) -> dict[str, Any]:
         "validation_accessed": False,
         "test_accessed": False,
         "sealed_test_state": "unopened",
+        "per_row_train_input_opened_before_claim": False,
+    }
+
+
+# ---------------------------------------------------------------------------
+# The private execution seam
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class T2TrainingSources:
+    """Where the canonical body reads from. Private; never a CLI option.
+
+    The public route constructs exactly one of these, with every field at its
+    canonical default. Tests construct one pointing at a synthetic on-disk
+    timeline, a synthetic target authority and a temporary run root -- and then
+    drive the *same* orchestration function, so a defect in the assembly itself
+    cannot hide behind passing unit tests of its parts.
+
+    Note what is NOT here: epochs, learning rate, TBPTT length, seed, device,
+    threshold rule, split rule. Those are frozen science and are read from the
+    protocol, not injected.
+    """
+
+    run_root: Path = T2_RUN_ROOT
+    attempt_id: str = T2_TRAINING_ATTEMPT_ID
+    stream_cache_root: Path | None = None
+    corpus_manifest: Path = CORPUS_MANIFEST
+    split_manifest: Path = T2_SPLIT_PATH
+    canonical: bool = True
+
+    def open_timeline(self) -> T2Timeline:
+        return T2Timeline(TRAIN_PARTITION, root=self.stream_cache_root)
+
+
+@dataclass(slots=True)
+class _Exposure:
+    """What the attempt has actually touched, for an honest failure receipt."""
+
+    stage: str = "claim_canonical_attempt"
+    train_store_opened: bool = False
+    target_authority_opened: bool = False
+    optimizer_stepped: bool = False
+    internal_dev_scored: bool = False
+    threshold_derived: bool = False
+    arms_completed: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "stage": self.stage,
+            "train_store_opened": self.train_store_opened,
+            "target_authority_opened": self.target_authority_opened,
+            "optimizer_stepped": self.optimizer_stepped,
+            "internal_dev_scored": self.internal_dev_scored,
+            "threshold_derived": self.threshold_derived,
+            "arms_completed": list(self.arms_completed),
+            "arm_selection_performed": False,
+            "outer_validation_accessed": False,
+            "test_accessed": False,
+        }
+
+
+def _partition_subjects(split_manifest: Path) -> dict[str, tuple[str, ...]]:
+    import json
+
+    payload = json.loads(Path(split_manifest).read_text())
+    return {
+        name: tuple(str(value) for value in block["subjects"])
+        for name, block in payload["partitions"].items()
     }
 
 
 def execute_canonical_training(expected_git_sha: str | None) -> dict[str, Any]:
-    """The one TRAIN-only canonical route.
+    """The one TRAIN-only canonical route, complete and executable.
 
-    The training body is intentionally not wired to real data in this change
-    set: implementing the science and executing it are separate authorizations.
-    Preflight runs, proves the claim is unconsumed, and stops before claiming.
+    Preflight proves the commit, the frozen protocol, the frozen execution spec
+    and that the attempt is unconsumed. Then the runtime is observed at START,
+    the claim directory is created, and everything the claim authorises runs to
+    completion: real store validation, the real target join, the deterministic
+    48/8 split, the FIT-only class weight, both arms in frozen order, one
+    retained checkpoint and one frozen internal-dev threshold each, the
+    canonical result, and the canonical lock.
+
+    No arm is selected. No retry is ever performed.
     """
     checks = preflight(expected_git_sha)
-    raise T2RunError(
-        "T2 canonical training is implemented but not authorized to execute in "
-        "this change set. Preflight passed at git "
-        f"{checks['git_sha']}, protocol {checks['t2_protocol_sha256'][:12]}..., "
-        f"execution spec {checks['t2_execution_spec_sha256'][:12]}...; the "
-        "attempt directory was NOT claimed and no timeline row was opened. A "
-        "separate human authorization executes the one canonical training run."
+    return _execute_training_attempt(checks, T2TrainingSources())
+
+
+def _execute_training_attempt(
+    checks: dict[str, Any], sources: T2TrainingSources
+) -> dict[str, Any]:
+    """Claim the attempt, then run the frozen body under one failure receipt."""
+    runtime = RuntimeIntegrityRecord()
+    observe_t2_runtime_stage(
+        runtime, point=EnforcementPoint.START, detail=STAGE_TRAINING_START
     )
+    claimed = claim_t2_run_directory(
+        sources.run_root, sources.attempt_id, runtime=runtime
+    )
+    exposure = _Exposure()
+    try:
+        return _run_after_claim(
+            checks=checks,
+            sources=sources,
+            claimed=claimed,
+            runtime=runtime,
+            exposure=exposure,
+        )
+    except BaseException as error:
+        # One arm failing fails the WHOLE attempt. Completed evidence is left
+        # exactly where it is as forensic material, the receipt is additive and
+        # lives outside the claim, and nothing is rerun, reseeded or renamed.
+        record_t2_attempt_failure(
+            sources.run_root,
+            claimed,
+            exception=error,
+            stage=exposure.stage,
+            arm=(exposure.arms_completed[-1] if exposure.arms_completed else None),
+            exposure=exposure.as_dict(),
+            runtime=runtime,
+        )
+        raise
+
+
+def _run_after_claim(
+    *,
+    checks: dict[str, Any],
+    sources: T2TrainingSources,
+    claimed: Any,
+    runtime: RuntimeIntegrityRecord,
+    exposure: _Exposure,
+) -> dict[str, Any]:
+    """Everything the claim authorises, in the frozen order."""
+    exposure.stage = "validate_train_store"
+    timeline = sources.open_timeline()
+    exposure.train_store_opened = True
+    try:
+        return _train_both_arms(
+            checks=checks,
+            sources=sources,
+            claimed=claimed,
+            runtime=runtime,
+            exposure=exposure,
+            timeline=timeline,
+        )
+    finally:
+        timeline.close()
+
+
+def _train_both_arms(
+    *,
+    checks: dict[str, Any],
+    sources: T2TrainingSources,
+    claimed: Any,
+    runtime: RuntimeIntegrityRecord,
+    exposure: _Exposure,
+    timeline: T2Timeline,
+) -> dict[str, Any]:
+    exposure.stage = "resolve_target_authority"
+    family_codes, target_identity = resolve_timeline_target_families(
+        timeline, manifest_path=sources.corpus_manifest
+    )
+    exposure.target_authority_opened = True
+    reader = T2TimelineReader(timeline, family_codes)
+
+    exposure.stage = "construct_internal_split"
+    subjects_by_partition = _partition_subjects(sources.split_manifest)
+    split = assign_internal_split(timeline.subjects())
+    validate_internal_split(
+        split,
+        validation_subjects=subjects_by_partition["validation"],
+        test_subjects=subjects_by_partition["test"],
+    )
+    if split["split_sha256"] != T2_INTERNAL_SPLIT_SHA256:
+        raise T2RunError(
+            f"The internal split digests to {split['split_sha256']}, not the "
+            f"frozen {T2_INTERNAL_SPLIT_SHA256}. The 48/8 partition is frozen "
+            "and is never re-derived differently."
+        )
+    if tuple(split["internal_dev_subjects"]) != T2_INTERNAL_DEV_SUBJECTS:
+        raise T2RunError(
+            "The internal-dev subject set is not the frozen one; nothing proceeds."
+        )
+    fit_subjects = tuple(split["fit_subjects"])
+    internal_dev_subjects = tuple(split["internal_dev_subjects"])
+    fit_streams = timeline.streams_for_subjects(set(fit_subjects))
+    internal_dev_streams = timeline.streams_for_subjects(set(internal_dev_subjects))
+    if not fit_streams or not internal_dev_streams:
+        raise T2RunError("The internal split produced an empty stream selection.")
+    require_full_chronological_population(
+        offered_row_count=sum(stream.row_count for stream in timeline.streams()),
+        full_stream_row_count=timeline.row_count,
+    )
+
+    # Determinism is established ONCE, before the first runtime reading. Doing
+    # it lazily inside the first arm's construction would make arm A observe
+    # `deterministic_algorithms: False` and arm B observe `True`, and the
+    # same-runtime check would then correctly refuse a comparison that was
+    # never actually mixed. Each arm still reseeds from the same fresh origin.
+    exposure.stage = "establish_deterministic_runtime"
+    determinism = seed_everything()
+
+    exposure.stage = "derive_fit_class_weight"
+    class_weight = fit_class_weight_evidence(
+        reader,
+        fit_streams,
+        fit_subjects=fit_subjects,
+        internal_dev_subjects=internal_dev_subjects,
+    )
+
+    population = {
+        "artifact_class": "t2_training_population",
+        "partition": TRAIN_PARTITION,
+        "train_timeline_identity": timeline.identity(),
+        "target_authority_identity": target_identity,
+        # Re-derived from the persisted stable_id.npy, not copied from the
+        # manifest: this is what proves the replayed population is the one M1
+        # promoted, and not merely one of the same length.
+        "rederived_ordered_stable_id_sha256": ordered_stable_id_digest_for_rows(
+            timeline
+        ),
+        "population_identity_proves": [
+            "same_rows",
+            "same_ordering",
+            "same_physical_timeline",
+            "same_category_authority",
+        ],
+        "row_count": timeline.row_count,
+        "stream_count": len(timeline.streams()),
+        "subject_count": len(timeline.subjects()),
+        "fit_subjects": list(fit_subjects),
+        "internal_dev_subjects": list(internal_dev_subjects),
+        "fit_stream_count": len(fit_streams),
+        "internal_dev_stream_count": len(internal_dev_streams),
+        "fit_availability": reader.availability_census(fit_streams),
+        "internal_dev_availability": reader.availability_census(internal_dev_streams),
+        "class_weight": class_weight,
+        "deterministic_runtime": determinism,
+        "internal_dev_contributes_optimizer_gradient": False,
+        "negative_sampling_applied": False,
+        "outer_validation_accessed": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+    }
+    if (
+        population["rederived_ordered_stable_id_sha256"]
+        != (timeline.manifest["ordered_stable_id_sha256"])
+    ):
+        raise T2RunError(
+            "The ordered stable-id digest re-derived from the persisted store "
+            "does not match the M1 manifest. The replayed population is not the "
+            "promoted one."
+        )
+
+    exposure.stage = "promote_preflight_and_population"
+    promote_component(claimed, PREFLIGHT_NAME, dict(checks), runtime=runtime)
+    promote_component(claimed, INTERNAL_SPLIT_NAME, dict(split), runtime=runtime)
+    promote_component(claimed, POPULATION_NAME, population, runtime=runtime)
+
+    arm_results: dict[str, Any] = {}
+    checkpoint_sha256: dict[str, str] = {}
+    checkpoint_lock_sha256: dict[str, str] = {}
+    checkpoint_lock_self_sha256: dict[str, str] = {}
+    thresholds: dict[str, Any] = {}
+    parameter_counts: dict[str, int] = {}
+    runtimes: list[dict[str, Any]] = []
+
+    for arm in T2_ARMS:
+        exposure.stage = f"train_arm:{arm}"
+        observed_runtime = runtime_provenance()
+        if runtimes:
+            require_single_runtime(runtimes[0], observed_runtime)
+        runtimes.append(observed_runtime)
+
+        def _before_model_construction(name: str) -> None:
+            observe_t2_runtime_stage(
+                runtime,
+                point=EnforcementPoint.PRE_PROMOTION,
+                detail=stage_pre_model_construction(name),
+            )
+
+        trained = train_arm(
+            arm,
+            reader,
+            fit_streams=fit_streams,
+            internal_dev_streams=internal_dev_streams,
+            internal_dev_subjects=internal_dev_subjects,
+            pos_weight=class_weight["positive_class_weight"],
+            before_model_construction=_before_model_construction,
+        )
+        exposure.optimizer_stepped = True
+        exposure.internal_dev_scored = True
+        exposure.threshold_derived = True
+
+        exposure.stage = f"promote_checkpoint:{arm}"
+        # The identity is read off a model rebuilt from the retained state, not
+        # off the live trainer: what is attested is what will be promoted.
+        identity = model_identity(restore_model_state(arm, trained["state_dict"]))
+        parameter_counts[arm] = int(identity["trainable_parameters"])
+        checkpoint_lock = promote_checkpoint(
+            claimed,
+            arm,
+            trained["state_dict"],
+            identity={
+                "model_identity": identity,
+                "best_epoch": trained["best_epoch"],
+                "best_internal_dev_pooled_auprc": (
+                    trained["best_internal_dev_pooled_auprc"]
+                ),
+                "internal_dev_score_sha256": trained["internal_dev_score_sha256"],
+                "internal_dev_threshold": trained["internal_dev_threshold"][
+                    "threshold"
+                ],
+                "runtime": observed_runtime,
+            },
+            runtime=runtime,
+        )
+        checkpoint_sha256[arm] = checkpoint_lock["checkpoint_sha256"]
+        checkpoint_lock_self_sha256[arm] = checkpoint_lock["checkpoint_lock_sha256"]
+        checkpoint_lock_sha256[arm] = _file_sha256(
+            claimed.run_dir / CHECKPOINT_LOCK_NAME[arm]
+        )
+        thresholds[arm] = trained["internal_dev_threshold"]
+
+        arm_payload = {
+            "artifact_class": "t2_arm_training_result",
+            "arm": arm,
+            "model_identity": identity,
+            "checkpoint_file": CHECKPOINT_NAME[arm],
+            "checkpoint_sha256": checkpoint_sha256[arm],
+            "checkpoint_lock_sha256": checkpoint_lock_self_sha256[arm],
+            "best_epoch": trained["best_epoch"],
+            "best_internal_dev_pooled_auprc": (
+                trained["best_internal_dev_pooled_auprc"]
+            ),
+            "internal_dev_score_sha256": trained["internal_dev_score_sha256"],
+            "internal_dev_primary_row_count": (
+                trained["internal_dev_primary_row_count"]
+            ),
+            "epochs": trained["epochs"],
+            "epochs_completed": trained["epochs_completed"],
+            "early_stopped": trained["early_stopped"],
+            "checkpoint_selection": trained["checkpoint_selection"],
+            "internal_dev_threshold": trained["internal_dev_threshold"],
+            "threshold_derived_from_best_checkpoint": True,
+            "threshold_derived_during_epoch_selection": False,
+            "threshold_derived_from_outer_validation": False,
+            "positive_class_weight": trained["positive_class_weight"],
+            "runtime": observed_runtime,
+            "arm_selection_status": ARM_SELECTION_PENDING,
+            "arm_selected": None,
+            "outer_validation_accessed": False,
+            "test_accessed": False,
+            "sealed_test_state": "unopened",
+        }
+        promote_component(claimed, ARM_RESULT_NAME[arm], arm_payload, runtime=runtime)
+        arm_results[arm] = arm_payload
+        exposure.arms_completed.append(arm)
+
+    exposure.stage = "promote_canonical_result"
+    require_capacity_envelope(parameter_counts)
+    result = {
+        "artifact_class": RESULT_CLASS,
+        "attempt_id": claimed.attempt_id,
+        "experiment_identity": T2_EXPERIMENT_IDENTITY,
+        "git_sha": checks["git_sha"],
+        "t2_protocol_sha256": T2_PROTOCOL_SHA256,
+        "t2_execution_spec_sha256": T2_EXECUTION_SPEC_SHA256,
+        "internal_split_sha256": split["split_sha256"],
+        "train_timeline_identity": timeline.identity(),
+        "target_authority_identity": target_identity,
+        "fit_subjects": list(fit_subjects),
+        "internal_dev_subjects": list(internal_dev_subjects),
+        "fit_positive_count": class_weight["fit_positive_count"],
+        "fit_negative_count": class_weight["fit_negative_count"],
+        "positive_class_weight": class_weight["positive_class_weight"],
+        "component_sha256": dict(claimed.promoted),
+        "checkpoint_sha256": dict(checkpoint_sha256),
+        "checkpoint_lock_sha256": dict(checkpoint_lock_sha256),
+        "internal_dev_thresholds": dict(thresholds),
+        "trainable_parameters": dict(parameter_counts),
+        "arms": list(T2_ARMS),
+        "arm_selection_status": ARM_SELECTION_PENDING,
+        "arm_selected": None,
+        "arm_compared_on_train_evidence": False,
+        "outer_validation_accessed": False,
+        "automatic_retry_performed": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+    }
+    provenance = {
+        "train_timeline_identity": timeline.identity(),
+        "target_authority_identity": target_identity,
+        "fit_subjects": list(fit_subjects),
+        "internal_dev_subjects": list(internal_dev_subjects),
+        "fit_positive_count": class_weight["fit_positive_count"],
+        "fit_negative_count": class_weight["fit_negative_count"],
+        "positive_class_weight": class_weight["positive_class_weight"],
+        "checkpoint_sha256": dict(checkpoint_sha256),
+        "checkpoint_lock_sha256": dict(checkpoint_lock_sha256),
+        "checkpoint_lock_self_sha256": dict(checkpoint_lock_self_sha256),
+        "internal_dev_thresholds": dict(thresholds),
+    }
+    promoted = finalize_and_promote_t2_result(
+        claimed, result=result, provenance=provenance, runtime=runtime
+    )
+    return {
+        "report_class": "t2_canonical_training_completion",
+        "attempt_id": claimed.attempt_id,
+        "experiment_identity": T2_EXPERIMENT_IDENTITY,
+        "run_dir": str(claimed.run_dir),
+        "status": promoted["status"]["status"],
+        "git_sha": checks["git_sha"],
+        "t2_protocol_sha256": T2_PROTOCOL_SHA256,
+        "t2_execution_spec_sha256": T2_EXECUTION_SPEC_SHA256,
+        "internal_split_sha256": split["split_sha256"],
+        "fit_subject_count": len(fit_subjects),
+        "internal_dev_subject_count": len(internal_dev_subjects),
+        "fit_positive_count": class_weight["fit_positive_count"],
+        "fit_negative_count": class_weight["fit_negative_count"],
+        "positive_class_weight": class_weight["positive_class_weight"],
+        "arm_results": {
+            arm: {
+                "best_epoch": payload["best_epoch"],
+                "epochs_completed": payload["epochs_completed"],
+                "early_stopped": payload["early_stopped"],
+                "internal_dev_threshold": payload["internal_dev_threshold"][
+                    "threshold"
+                ],
+                "checkpoint_sha256": payload["checkpoint_sha256"],
+            }
+            for arm, payload in arm_results.items()
+        },
+        "experiment_lock_sha256": promoted["lock"]["experiment_lock_sha256"],
+        "artifact_sha256": dict(promoted["lock"]["artifact_sha256"]),
+        "checkpoint_sha256": dict(checkpoint_sha256),
+        "checkpoint_lock_sha256": dict(checkpoint_lock_sha256),
+        "runtime_enforcement_stages": list(
+            promoted["lock"]["runtime_enforcement_stages"]
+        ),
+        "arm_selection_status": ARM_SELECTION_PENDING,
+        "arm_selected": None,
+        "human_review_required": True,
+        "automatic_retry_performed": False,
+        "outer_validation_accessed": False,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+    }
+
+
+def _file_sha256(path: Path) -> str:
+    from cardiosentinel.data.provenance import sha256_file
+
+    return sha256_file(Path(path))
 
 
 def execute_canonical_outer_validation(_expected_git_sha: str | None) -> dict[str, Any]:
     """Refuses before any VALIDATION path, array or label is touched."""
     require_outer_validation_authorized()
-    raise T2RunError(  # pragma: no cover - unreachable while unauthorized
-        "Outer VALIDATION was authorized but no execution body exists yet."
+    from cardiosentinel.neural.t2_evaluation import (  # pragma: no cover
+        execute_canonical_outer_validation as run_outer_validation,
+    )
+
+    return run_outer_validation(  # pragma: no cover - unreachable while gated
+        T2_RUN_ROOT / T2_TRAINING_ATTEMPT_ID
     )
 
 
@@ -174,7 +676,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not args.execute_canonical_training:
             parser.error("--execute-canonical-training is required.")
-        execute_canonical_training(args.expected_git_sha)
+        report = execute_canonical_training(args.expected_git_sha)
+        print(report["experiment_lock_sha256"])
         return 0
     except T2ActivationError as error:
         print(f"REFUSED: {error}", file=sys.stderr)
@@ -182,6 +685,19 @@ def main(argv: list[str] | None = None) -> int:
     except (T2RunError, T2PersistenceError) as error:
         print(f"STOP: {error}", file=sys.stderr)
         return 2
+
+
+__all__ = [
+    "FORBIDDEN_OPTIONS",
+    "T2RunError",
+    "T2TrainingSources",
+    "build_parser",
+    "execute_canonical_outer_validation",
+    "execute_canonical_training",
+    "main",
+    "preflight",
+    "require_expected_git_sha",
+]
 
 
 if __name__ == "__main__":  # pragma: no cover - console entry point

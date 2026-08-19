@@ -2,8 +2,13 @@
 
 No real TRAIN optimisation, no real internal-dev scoring, no real outer
 VALIDATION scoring and no TEST access happens anywhere in this file. Every
-timeline is a synthetic on-disk fixture built in `tmp_path`, every tensor is
-random, and the one real artifact ever read is a frozen manifest digest.
+timeline is a **genuinely valid** synthetic M1 stream cache built in `tmp_path`
+by `t2_fixtures`, every tensor is random, and the one real artifact ever read is
+a frozen manifest digest.
+
+The fixture being genuinely valid is what gives these tests their force: the
+loader is `m1_experiment.load_stream_store`, so a fixture that merely looked
+right would have forced a weaker check into the production path.
 """
 
 from __future__ import annotations
@@ -28,98 +33,47 @@ from cardiosentinel.neural.t2_protocol import (
     T2_ARM_GRU,
     T2_ARM_S4D,
     T2_INPUT_DIM,
-    T2_OBSERVATION_AVAILABLE,
     T2_OBSERVATION_UNAVAILABLE_EXACT_FLAT,
     T2_TBPTT_LENGTH,
 )
-
-# --------------------------------------------------------------------------
-# Synthetic on-disk timeline fixture
-# --------------------------------------------------------------------------
+from tests.neural.t2_fixtures import (
+    PRIMARY_NEGATIVE,
+    SyntheticStream,
+    build_environment,
+)
 
 WINDOW = 2500
 STRIDE = 1250
 
 
-def _write_timeline(
+def _timeline_environment(
     root: Path,
-    partition: str,
-    streams: list[tuple[str, int, int]],
+    layout: list[tuple[str, int, int]],
     *,
-    manifest_overrides: dict | None = None,
-    unavailable: set[int] | None = None,
-) -> Path:
-    """Build a synthetic M1-shaped stream cache. Never the real corpus."""
-    directory = root / partition
-    directory.mkdir(parents=True, exist_ok=True)
-    total = sum(count for _, _, count in streams)
-    rows = {
-        "stable_id": [],
-        "record_id": [],
-        "channel_index": [],
-        "start_sample": [],
-        "cold_start_bin": [],
-        "observation_state": [],
-        "recording_age_seconds": [],
-    }
-    for record, channel, count in streams:
-        for index in range(count):
-            start = index * STRIDE
-            rows["stable_id"].append(
-                f"ltstdb:{record}:{channel}:{start}:{start + WINDOW}"
+    unavailable: dict[tuple[str, int], set[int]] | None = None,
+):
+    """A synthetic environment from a `(record, channel, rows)` layout.
+
+    Repeated keys are given a start offset so their stable ids stay unique: the
+    interleaving under test is a re-appearing stream key, not a duplicated row.
+    """
+    gaps = unavailable or {}
+    offsets: dict[tuple[str, int], int] = {}
+    streams: list[SyntheticStream] = []
+    for record, channel, count in layout:
+        key = (record, channel)
+        offset = offsets.get(key, 0)
+        offsets[key] = offset + count
+        streams.append(
+            SyntheticStream(
+                record_id=record,
+                channel_index=channel,
+                families=tuple(PRIMARY_NEGATIVE for _ in range(count)),
+                unavailable=frozenset(gaps.get(key, set())),
+                start_offset=offset,
             )
-            rows["record_id"].append(record)
-            rows["channel_index"].append(channel)
-            rows["start_sample"].append(start)
-            rows["cold_start_bin"].append("0_5_minutes")
-            rows["recording_age_seconds"].append(float(index * 5))
-    unavailable = unavailable or set()
-    rows["observation_state"] = [
-        T2_OBSERVATION_UNAVAILABLE_EXACT_FLAT
-        if position in unavailable
-        else T2_OBSERVATION_AVAILABLE
-        for position in range(total)
-    ]
-
-    generator = np.random.default_rng(5)
-    np.save(
-        directory / "representation.npy",
-        generator.standard_normal((total, T2_INPUT_DIM), dtype=np.float32),
-    )
-    for name, dtype in (
-        ("stable_id", "<U64"),
-        ("record_id", "<U64"),
-        ("channel_index", "int64"),
-        ("start_sample", "int64"),
-        ("cold_start_bin", "<U32"),
-        ("observation_state", "uint8"),
-        ("recording_age_seconds", "float64"),
-    ):
-        np.save(directory / f"{name}.npy", np.asarray(rows[name], dtype=dtype))
-    for name in (
-        "d_short",
-        "d_long",
-        "prototype_disagreement",
-    ):
-        np.save(directory / f"{name}.npy", np.zeros(total, dtype="float64"))
-    for name in ("past_observed_count", "past_update_count"):
-        np.save(directory / f"{name}.npy", np.zeros(total, dtype="int64"))
-
-    manifest = {
-        "artifact_class": "m1_full_stream_memory_cache",
-        "partition": partition,
-        "representation_dim": T2_INPUT_DIM,
-        "full_stream_row_count": total,
-        "stream_cache_sha256": TL.EXPECTED_STREAM_CACHE_SHA256[partition],
-        "representation_content_sha256": TL.EXPECTED_REPRESENTATION_SHA256[partition],
-        "ordered_stable_id_sha256": "0" * 64,
-        "ordered_chronology_sha256": "1" * 64,
-        "test_accessed": False,
-        "sealed_test_state": "unopened",
-    }
-    manifest.update(manifest_overrides or {})
-    (directory / "M1_STREAM_CACHE_MANIFEST.json").write_text(json.dumps(manifest))
-    return directory
+        )
+    return build_environment(root, streams=tuple(streams))
 
 
 @pytest.fixture()
@@ -132,11 +86,11 @@ def synthetic_train(tmp_path):
     `frozen_row_count_enforced: False` so it can never be mistaken for corpus
     evidence.
     """
-    root = tmp_path / "streams"
-    _write_timeline(
-        root, "train", [("s20011", 0, 600), ("s20011", 1, 300), ("s20021", 0, 120)]
+    environment = _timeline_environment(
+        tmp_path / "env",
+        [("s20011", 0, 600), ("s20011", 1, 300), ("s20021", 0, 120)],
     )
-    return root
+    return environment.stream_cache_root
 
 
 # --- D. full timeline -----------------------------------------------------
@@ -171,28 +125,22 @@ def test_the_three_to_one_selection_count_is_refused_as_a_train_timeline():
         TL.require_frozen_row_count("train", 374_452)
 
 
-def test_a_wrong_stream_cache_digest_is_refused(tmp_path):
-    root = tmp_path / "streams"
-    _write_timeline(
-        root,
-        "train",
-        [("s20011", 0, 40)],
-        manifest_overrides={"stream_cache_sha256": "0" * 64},
-    )
+def test_a_wrong_stream_cache_digest_is_refused():
+    manifest = {
+        "stream_cache_sha256": "0" * 64,
+        "representation_content_sha256": TL.EXPECTED_REPRESENTATION_SHA256["train"],
+    }
     with pytest.raises(TL.T2TimelineError, match="stream cache digests to"):
-        TL.T2Timeline("train", root=root)
+        TL.require_frozen_stream_identity("train", manifest)
 
 
-def test_a_wrong_representation_digest_is_refused(tmp_path):
-    root = tmp_path / "streams"
-    _write_timeline(
-        root,
-        "train",
-        [("s20011", 0, 40)],
-        manifest_overrides={"representation_content_sha256": "0" * 64},
-    )
+def test_a_wrong_representation_digest_is_refused():
+    manifest = {
+        "stream_cache_sha256": TL.EXPECTED_STREAM_CACHE_SHA256["train"],
+        "representation_content_sha256": "0" * 64,
+    }
     with pytest.raises(TL.T2TimelineError, match="representation content digests"):
-        TL.T2Timeline("train", root=root)
+        TL.require_frozen_stream_identity("train", manifest)
 
 
 def test_the_p1_three_to_one_cache_is_refused_as_a_timeline_source():
@@ -218,12 +166,13 @@ def test_streams_are_contiguous_and_chronological(synthetic_train):
 
 
 def test_an_interleaved_stream_is_refused(tmp_path):
-    root = tmp_path / "streams"
-    _write_timeline(
-        root, "train", [("s20011", 0, 5), ("s20021", 0, 5), ("s20011", 0, 30)]
+    """A key that reappears after another stream is not one causal stream."""
+    environment = _timeline_environment(
+        tmp_path / "env",
+        [("s20011", 0, 5), ("s20021", 0, 5), ("s20011", 0, 30)],
     )
     with pytest.raises(TL.T2TimelineError, match="more than one span"):
-        TL.T2Timeline("train", root=root).streams()
+        TL.T2Timeline("train", root=environment.stream_cache_root).streams()
 
 
 def test_primary_only_and_challenge_only_replays_are_refused_by_role_semantics():
@@ -245,9 +194,10 @@ def test_primary_only_and_challenge_only_replays_are_refused_by_role_semantics()
 
 
 def test_unavailable_row_is_a_state_no_op(tmp_path):
-    root = tmp_path / "streams"
-    _write_timeline(root, "train", [("s20011", 0, 40)], unavailable={3})
-    with TL.T2Timeline("train", root=root) as timeline:
+    environment = _timeline_environment(
+        tmp_path / "env", [("s20011", 0, 40)], unavailable={("s20011", 0): {3}}
+    )
+    with TL.T2Timeline("train", root=environment.stream_cache_root) as timeline:
         states = timeline.observation_state(0, 6)
         assert states[3] == T2_OBSERVATION_UNAVAILABLE_EXACT_FLAT
         roles = TL.assign_row_roles(
@@ -492,10 +442,11 @@ def test_internal_split_is_48_8_and_touches_no_outer_partition():
 def _epoch(number: int, auprc: float) -> TR.T2EpochResult:
     return TR.T2EpochResult(
         epoch=number,
-        optimizer_steps=10,
-        zero_direct_loss_chunks=0,
-        direct_loss_rows=100,
-        mean_training_loss=1.0,
+        optimizer_step_count=10,
+        zero_direct_loss_frontier_count=0,
+        direct_loss_row_count=100,
+        weighted_loss_sum=100.0,
+        mean_weighted_loss_per_direct_row=1.0,
         internal_dev_pooled_auprc=auprc,
     )
 
@@ -660,7 +611,7 @@ def test_challenge_and_latency_cannot_influence_selection():
 def test_every_outer_validation_entry_point_refuses():
     for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
         with pytest.raises(PS.T2ActivationError, match="not authorized"):
-            entry()
+            entry(Path("/nonexistent"))
 
 
 def test_the_refusal_fires_before_any_validation_path_is_resolved():
@@ -668,7 +619,7 @@ def test_the_refusal_fires_before_any_validation_path_is_resolved():
     with pytest.raises(PS.T2ActivationError):
         EV.open_validation_timeline(Path("/nonexistent/validation"), labels="ignored")
     with pytest.raises(PS.T2ActivationError):
-        EV.execute_canonical_outer_validation(run_root=Path("/nonexistent"))
+        EV.execute_canonical_outer_validation(Path("/nonexistent"))
 
 
 def test_activation_is_false_and_has_no_override():
@@ -762,7 +713,9 @@ def test_a_result_that_selects_an_arm_is_refused():
         "attempt_id": PS.T2_TRAINING_ATTEMPT_ID,
         "component_sha256": {name: "0" * 64 for name in PS.COMPONENT_ARTIFACTS},
         "checkpoint_sha256": {},
+        "checkpoint_lock_sha256": {},
         "internal_dev_thresholds": {},
+        "target_authority_identity": {},
         "arm_selection_status": PS.ARM_SELECTION_PENDING,
         "arm_selected": T2_ARM_GRU,
         "outer_validation_accessed": False,
@@ -779,7 +732,9 @@ def test_a_result_recording_validation_or_test_access_is_refused():
         "attempt_id": PS.T2_TRAINING_ATTEMPT_ID,
         "component_sha256": {name: "0" * 64 for name in PS.COMPONENT_ARTIFACTS},
         "checkpoint_sha256": {},
+        "checkpoint_lock_sha256": {},
         "internal_dev_thresholds": {},
+        "target_authority_identity": {},
         "arm_selection_status": PS.ARM_SELECTION_PENDING,
         "arm_selected": None,
         "outer_validation_accessed": False,
