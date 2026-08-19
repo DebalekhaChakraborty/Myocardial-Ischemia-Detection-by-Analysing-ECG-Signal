@@ -966,16 +966,23 @@ def test_both_arms_observed_the_same_runtime(completed_attempt):
 # --- I. failure semantics --------------------------------------------------
 
 
-def _fail_on_arm(monkeypatch, arm: str) -> None:
-    """Fail at a real boundary: constructing that arm's model."""
+def _fail_on_arm(monkeypatch, arm: str) -> dict[str, bool]:
+    """Fail at a real boundary: constructing that arm's model.
+
+    Returns an `armed` switch rather than relying on `monkeypatch.undo()`,
+    which would also tear down the frozen-runtime and clean-Git seams and
+    leave the second attempt asking the wrong environment to be canonical.
+    """
     original = TR.build_candidate
+    armed = {"armed": True}
 
     def failing(name: str):
-        if name == arm:
+        if armed["armed"] and name == arm:
             raise RuntimeError(f"synthetic {name} construction failure")
         return original(name)
 
     monkeypatch.setattr(TR, "build_candidate", failing)
+    return armed
 
 
 @pytest.mark.parametrize("arm", [T2_ARM_GRU, T2_ARM_S4D])
@@ -1034,11 +1041,13 @@ def test_a_failure_during_the_second_arm_promotes_no_complete_result(
 def test_no_selective_rerun_of_the_failed_arm_is_possible(
     tmp_path, environment, clean_git, monkeypatch
 ):
-    _fail_on_arm(monkeypatch, T2_ARM_S4D)
+    armed = _fail_on_arm(monkeypatch, T2_ARM_S4D)
     sources = _sources(tmp_path, environment)
     with pytest.raises(RuntimeError):
         RUN._execute_training_attempt(_checks(), sources)
-    monkeypatch.undo()
+    # Repair the cause. The attempt is still consumed: there is no route back
+    # in for the failed arm alone, and none for the whole attempt either.
+    armed["armed"] = False
     with pytest.raises(PS.T2PersistenceError, match="already claimed"):
         RUN._execute_training_attempt(_checks(), sources)
 
