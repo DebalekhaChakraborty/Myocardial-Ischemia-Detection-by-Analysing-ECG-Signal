@@ -23,12 +23,14 @@ from pathlib import Path
 
 import pytest
 
+from cardiosentinel.neural import t2_persistence as PS
 from cardiosentinel.neural import t2_selection as S
 from cardiosentinel.neural.t2_selection import (
     T2SelectionError,
     validate_retained_t2_arm,
     validate_t2_retention_decision,
 )
+from tests.neural.test_t2_canonical_training_route import attempt_content_snapshot
 
 CANONICAL_RUN_ROOT = Path("cardiosentinel-runs/phase8-t2-development-v1")
 _ABSENT = "canonical T2 outer-validation run directory is not on this filesystem"
@@ -336,3 +338,174 @@ def test_t1_state_vocabulary_is_not_defined_here():
         assert state not in source, state
     for policy in ("hysteresis", "onset_confirmation", "recovery_confirmation"):
         assert policy not in source, policy
+
+
+# --- A. the one-shot attempt guard is byte-safe -----------------------------
+#
+# Every case below runs against a synthetic temporary tree. The real canonical
+# attempt is never mutated to prove a guard works.
+
+
+def _synthetic_attempt(root):
+    """A miniature attempt tree with the same shape as the real one."""
+    attempt = root / "t2-v1-outer-validation"
+    (attempt / "row_evidence").mkdir(parents=True)
+    (attempt / "T2_OUTER_VALIDATION_STATUS.json").write_text('{"status": "COMPLETE"}')
+    (attempt / "T2_OUTER_VALIDATION_RESULT.json").write_text('{"selected_arm": "s4d"}')
+    (attempt / "T2_OUTER_VALIDATION_EXPERIMENT_LOCK.json").write_text('{"lock": 1}')
+    (attempt / "row_evidence" / "T2_OUTER_ROW_EVIDENCE.json").write_text('{"rows": 3}')
+    (attempt / "row_evidence" / "t2_outer_scores_s4d.npz").write_bytes(b"\x00scores")
+    return attempt
+
+
+def test_the_snapshot_detects_a_same_name_status_rewrite(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    # Same filename, same length, different bytes: invisible to a name listing.
+    (attempt / "T2_OUTER_VALIDATION_STATUS.json").write_text('{"status": "TAMPERED"}')
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_detects_a_same_name_result_rewrite(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    (attempt / "T2_OUTER_VALIDATION_RESULT.json").write_text('{"selected_arm": "gru"}')
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_detects_a_nested_row_evidence_array_rewrite(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    (attempt / "row_evidence" / "t2_outer_scores_s4d.npz").write_bytes(b"\x00forged")
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_detects_a_nested_manifest_rewrite(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    (attempt / "row_evidence" / "T2_OUTER_ROW_EVIDENCE.json").write_text('{"rows": 4}')
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_detects_a_new_nested_file(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    (attempt / "row_evidence" / "t2_outer_scores_gru.npz").write_bytes(b"added")
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_detects_a_new_nested_directory(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    (attempt / "recovery1").mkdir()
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_detects_a_deletion(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    (attempt / "row_evidence" / "t2_outer_scores_s4d.npz").unlink()
+    assert attempt_content_snapshot(attempt) != before
+
+
+def test_the_snapshot_accepts_an_unchanged_tree(tmp_path):
+    attempt = _synthetic_attempt(tmp_path)
+    assert attempt_content_snapshot(attempt) == attempt_content_snapshot(attempt)
+
+
+def test_the_snapshot_treats_an_absent_attempt_as_none(tmp_path):
+    absent = tmp_path / "t2-v1-outer-validation"
+    assert attempt_content_snapshot(absent) is None
+    assert attempt_content_snapshot(absent) == attempt_content_snapshot(absent)
+
+
+def test_the_snapshot_binds_content_not_merely_names(tmp_path):
+    """The explicit statement of the property the earlier guard lacked."""
+    attempt = _synthetic_attempt(tmp_path)
+    before = attempt_content_snapshot(attempt)
+    names_before = sorted(p.name for p in attempt.iterdir())
+    (attempt / "T2_OUTER_VALIDATION_STATUS.json").write_text('{"status": "OTHER"}')
+    assert sorted(p.name for p in attempt.iterdir()) == names_before
+    assert attempt_content_snapshot(attempt) != before
+
+
+# --- C. the binder's explicit identities are load-bearing -------------------
+
+
+@pytest.mark.parametrize(
+    "constant, replacement, match",
+    [
+        (
+            "T2_RETAINED_CHECKPOINT_LOCK_SELF_SHA256",
+            "c" * 64,
+            "checkpoint-lock self-digest",
+        ),
+        (
+            "T2_COMPARATOR_CHECKPOINT_LOCK_SELF_SHA256",
+            "d" * 64,
+            "checkpoint-lock self-digest",
+        ),
+    ],
+)
+def test_a_drifted_checkpoint_lock_self_digest_is_refused(
+    monkeypatch, constant, replacement, match
+):
+    root = _require_canonical()
+    monkeypatch.setattr(S, constant, replacement)
+    with pytest.raises(T2SelectionError, match=match):
+        validate_retained_t2_arm(root)
+
+
+def test_a_mutated_train_artifact_review_document_is_refused(monkeypatch):
+    root = _require_canonical()
+    monkeypatch.setattr(PS, "T2_TRAIN_ARTIFACT_REVIEW_SHA256", "e" * 64)
+    with pytest.raises(PS.T2PersistenceError, match="review digest"):
+        validate_retained_t2_arm(root)
+
+
+def test_a_mutated_execution_spec_document_is_refused(monkeypatch):
+    """The retention proof runs the spec's own validator, and it can refuse.
+
+    The drift is injected on the *expected* digest rather than by rewriting the
+    frozen document, for the same reason as everywhere else here: the real
+    artifacts are never mutated to prove a guard works. `path` is a default
+    argument bound at definition time, so patching it would not reach the
+    validator at all -- patching what it compares against does.
+    """
+    root = _require_canonical()
+    monkeypatch.setattr(PS, "T2_EXECUTION_SPEC_SHA256", "f" * 64)
+    # The refusal arrives even earlier than the binder's own spec validation:
+    # the canonical verifier's lock invariants already bind this identity, and
+    # that transitive proof is exactly what the retention layer sits on top of.
+    with pytest.raises(PS.T2PersistenceError, match="t2_execution_spec_sha256"):
+        validate_retained_t2_arm(root)
+
+
+def test_a_mutated_t2_protocol_document_is_refused(monkeypatch):
+    from cardiosentinel.neural import t2_protocol as PR
+
+    root = _require_canonical()
+    monkeypatch.setattr(PR, "T2_PROTOCOL_SHA256", "0" * 64)
+    with pytest.raises(PR.T2ProtocolError, match="protocol digest"):
+        validate_retained_t2_arm(root)
+
+
+def test_the_retention_proof_surfaces_the_documents_it_verified():
+    proof = validate_retained_t2_arm(_require_canonical())
+    assert proof["protocol_document_sha256"] == S.T2_PROTOCOL_SHA256
+    assert proof["execution_spec_document_sha256"] == S.T2_EXECUTION_SPEC_SHA256
+    assert proof["train_artifact_review_document_sha256"] == (
+        S.T2_TRAIN_ARTIFACT_REVIEW_SHA256
+    )
+    assert proof["checkpoint_lock_self_sha256"] == {
+        S.T2_RETAINED_ARM: S.T2_RETAINED_CHECKPOINT_LOCK_SELF_SHA256,
+        S.T2_COMPARATOR_ARM: S.T2_COMPARATOR_CHECKPOINT_LOCK_SELF_SHA256,
+    }
+
+
+def test_the_binder_still_begins_from_the_canonical_outer_verifier():
+    """The retention layer must not replace the transitive proof beneath it."""
+    import inspect
+
+    source = inspect.getsource(S.validate_retained_t2_arm)
+    assert "validate_canonical_t2_outer_validation_attempt(" in source

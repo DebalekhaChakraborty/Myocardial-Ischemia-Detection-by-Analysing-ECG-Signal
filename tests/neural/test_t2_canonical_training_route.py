@@ -37,6 +37,7 @@ import numpy as np
 import pytest
 import torch
 
+from cardiosentinel.data.provenance import sha256_file
 from cardiosentinel.neural import t2_development_run as RUN
 from cardiosentinel.neural import t2_evaluation as EV
 from cardiosentinel.neural import t2_persistence as PS
@@ -71,31 +72,65 @@ FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297
 _PRE_CLAIM_REFUSAL = "but the run expects|working tree is dirty"
 
 
+def attempt_content_snapshot(path: Path) -> dict[str, object] | None:
+    """A recursive, content-addressed snapshot of one attempt tree.
+
+    `None` means the attempt does not exist, which is itself the state to
+    preserve in a fresh checkout.
+
+    Listing immediate child *names* is not enough and was the earlier defect
+    here: rewriting a promoted file in place keeps its name, so a name-only
+    snapshot cannot see a mutated STATUS, RESULT, row-evidence manifest or
+    row-evidence array. Every file beneath the attempt is therefore digested by
+    content, keyed by its path relative to the attempt root, so a same-name
+    rewrite anywhere in the tree changes the snapshot.
+
+    Directories are captured separately as well. A directory that appears or
+    vanishes while holding no files contributes no digest, and would otherwise
+    be invisible.
+
+    `sha256_file` is the repository's existing digest routine; this deliberately
+    does not introduce a second one.
+    """
+    if not path.exists():
+        return None
+    entries = sorted(path.rglob("*"))
+    return {
+        "files": {
+            str(entry.relative_to(path)): sha256_file(entry)
+            for entry in entries
+            if entry.is_file()
+        },
+        "directories": sorted(
+            str(entry.relative_to(path)) for entry in entries if entry.is_dir()
+        ),
+    }
+
+
 @contextmanager
 def outer_attempt_unchanged():
     """Prove the guarded block claims nothing in the real one-shot run root.
 
     The canonical outer attempt is a legitimately consumable artifact: it is
     absent in a fresh checkout and present on a machine that has executed the
-    authorized one-shot run. Asserting it is *absent* would therefore assert a
-    property of the filesystem rather than of the code under test, and would
-    fail for exactly the people holding the real evidence.
+    authorized one-shot run. Asserting it is *absent* would assert a property of
+    the filesystem rather than of the code under test, and would fail for
+    exactly the people holding the real evidence.
 
-    What must hold in both worlds is stronger and is what this checks: a refused
-    route neither creates the attempt nor writes into an existing one.
+    What must hold in both worlds is that a refused route leaves the attempt
+    byte-identical -- created, deleted, added to, or rewritten in place all
+    count as a violation.
+
+    This guard is strictly read-only over the real artifacts: it digests them
+    and compares. The adversarial mutation cases are proven against synthetic
+    temporary trees in `test_t2_selection.py`, never by touching real evidence.
     """
     path = PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID
-
-    def snapshot():
-        if not path.exists():
-            return None
-        return sorted(entry.name for entry in path.iterdir())
-
-    before = snapshot()
+    before = attempt_content_snapshot(path)
     yield
-    assert snapshot() == before, (
-        "a refused route must not create, remove or write into the one-shot "
-        "outer attempt"
+    assert attempt_content_snapshot(path) == before, (
+        "a refused route must not create, remove, extend or rewrite any byte of "
+        "the one-shot outer attempt"
     )
 
 

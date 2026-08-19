@@ -609,23 +609,86 @@ def test_no_test_can_consume_the_real_one_shot_outer_attempt():
     )
 
 
-def test_the_outer_attempt_has_exactly_one_frozen_name():
-    """No recovery1, no retry name, no alternate sibling beside the two.
+def permitted_run_root_directories() -> frozenset[str]:
+    """The only directory names the T2 run root may ever hold.
+
+    Two are claim-bearing: the attempts themselves, whose existence *is* the
+    claim. Two are additive forensic siblings carrying failure receipts outside
+    a consumed claim, and they are legitimate by design -- an earlier version of
+    this test wrongly forbade them.
+
+    The review names are derived through `t2_review_directory` rather than
+    rebuilt from a hard-coded suffix, so this cannot drift away from the
+    persistence layer's own naming.
+    """
+    names = set(PS.T2_ATTEMPT_IDS)
+    names.update(
+        PS.t2_review_directory(PS.T2_RUN_ROOT, attempt).name
+        for attempt in PS.T2_ATTEMPT_IDS
+    )
+    return frozenset(names)
+
+
+def test_the_run_root_permits_only_the_frozen_attempt_and_review_names():
+    """No recovery1, no retry, no numbered sibling, no invented attempt.
 
     This replaces an earlier assertion that the outer attempt did not exist.
-    That was true while the gate was closed and is deliberately no longer true:
-    the authorized one-shot run has since consumed it. What remains invariant --
-    and is the property that actually protects the science -- is that the run
-    root can only ever hold these two frozen names.
+    That held while the gate was closed and is deliberately no longer true: the
+    authorized one-shot run has since consumed it. What remains invariant -- and
+    is the property that actually protects the science -- is which names may
+    appear beside it.
     """
     assert PS.T2_OUTER_VALIDATION_ATTEMPT_ID == "t2-v1-outer-validation"
     assert PS.T2_ATTEMPT_IDS == (
         PS.T2_TRAINING_ATTEMPT_ID,
         PS.T2_OUTER_VALIDATION_ATTEMPT_ID,
     )
+    permitted = permitted_run_root_directories()
+    assert permitted == {
+        "t2-v1-training",
+        "t2-v1-outer-validation",
+        "t2-v1-training__review",
+        "t2-v1-outer-validation__review",
+    }
+    # The claim-bearing pair and the forensic pair are disjoint, and a review
+    # directory is never itself a claim.
+    assert set(PS.T2_ATTEMPT_IDS) < permitted
+    for attempt in PS.T2_ATTEMPT_IDS:
+        review = PS.t2_review_directory(PS.T2_RUN_ROOT, attempt)
+        assert review.name.endswith(PS.REVIEW_SUFFIX)
+        assert review.name not in PS.T2_ATTEMPT_IDS
+
     if PS.T2_RUN_ROOT.is_dir():
-        present = sorted(p.name for p in PS.T2_RUN_ROOT.iterdir() if p.is_dir())
-        assert set(present) <= set(PS.T2_ATTEMPT_IDS), present
+        present = {p.name for p in PS.T2_RUN_ROOT.iterdir() if p.is_dir()}
+        assert present <= permitted, sorted(present - permitted)
+
+
+@pytest.mark.parametrize(
+    "sibling",
+    [
+        "t2-v1-outer-validation-recovery1",
+        "t2-v1-outer-validation-retry",
+        "t2-v1-outer-validation-2",
+        "t2-v1-outer-validation__retry",
+        "t2-v1-training-recovery1",
+        "some-random-attempt",
+    ],
+)
+def test_an_invented_sibling_name_is_not_permitted(sibling):
+    assert sibling not in permitted_run_root_directories()
+
+
+@pytest.mark.parametrize(
+    "permitted",
+    [
+        "t2-v1-training",
+        "t2-v1-outer-validation",
+        "t2-v1-training__review",
+        "t2-v1-outer-validation__review",
+    ],
+)
+def test_the_frozen_attempt_and_review_names_are_permitted(permitted):
+    assert permitted in permitted_run_root_directories()
 
 
 # --- 9-10. the outer claim is one-shot -------------------------------------

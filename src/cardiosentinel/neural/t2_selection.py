@@ -42,11 +42,14 @@ from cardiosentinel.neural.t2_persistence import (
     T2_OUTER_VALIDATION_ATTEMPT_ID,
     T2_TRAIN_ARTIFACT_REVIEW_SHA256,
     validate_canonical_t2_outer_validation_attempt,
+    validate_t2_execution_spec,
+    validate_t2_train_artifact_review_document,
 )
 from cardiosentinel.neural.t2_protocol import (
     T2_ARM_GRU,
     T2_ARM_S4D,
     T2_PROTOCOL_SHA256,
+    validate_t2_protocol_document,
 )
 
 T2_RETENTION_DECISION_NAME: Final = "T2_LONGITUDINAL_TEMPORAL_RETENTION_DECISION_V1"
@@ -265,6 +268,47 @@ def validate_retained_t2_arm(run_root: Path) -> dict[str, Any]:
         T2_ROW_EVIDENCE_MANIFEST_SHA256,
     )
 
+    result = json.loads((attempt / OUTER_RESULT_NAME).read_text())
+
+    # A checkpoint lock has two distinct digests: the bytes of the lock file,
+    # already bound above through the canonical verifier, and the lock's own
+    # self-digest computed over its content. Binding only the first would leave
+    # the second free to drift, so the promoted result's record of it is
+    # compared directly rather than left as a decorative constant.
+    lock_self = dict(result.get("checkpoint_lock_self_sha256") or {})
+    for arm, expected_self in (
+        (T2_RETAINED_ARM, T2_RETAINED_CHECKPOINT_LOCK_SELF_SHA256),
+        (T2_COMPARATOR_ARM, T2_COMPARATOR_CHECKPOINT_LOCK_SELF_SHA256),
+    ):
+        if arm not in lock_self:
+            raise T2SelectionError(
+                f"The outer result records no checkpoint-lock self-digest for {arm!r}."
+            )
+        _require_identity(
+            f"The {arm} checkpoint-lock self-digest", lock_self[arm], expected_self
+        )
+
+    # The frozen governing documents are verified through their own existing
+    # validators, so this module never re-derives a digest rule of its own.
+    protocol_sha = validate_t2_protocol_document()
+    execution_spec_sha = validate_t2_execution_spec()
+    train_review_sha = validate_t2_train_artifact_review_document()
+    _require_identity(
+        "The outer result's protocol identity",
+        result.get("t2_protocol_sha256"),
+        protocol_sha,
+    )
+    _require_identity(
+        "The outer result's execution-spec identity",
+        result.get("t2_execution_spec_sha256"),
+        execution_spec_sha,
+    )
+    _require_identity(
+        "The bound TRAIN-artifact review identity",
+        train_review_sha,
+        T2_TRAIN_ARTIFACT_REVIEW_SHA256,
+    )
+
     manifest = json.loads(manifest_path.read_text())
     persisted = list(manifest.get("arms_persisted") or [])
     for arm in (T2_RETAINED_ARM, T2_COMPARATOR_ARM):
@@ -289,7 +333,6 @@ def validate_retained_t2_arm(run_root: Path) -> dict[str, Any]:
                 "object is an uncalibrated temporal model score."
             )
 
-    result = json.loads((attempt / OUTER_RESULT_NAME).read_text())
     if result.get("test_accessed") is not False:
         raise T2SelectionError("The outer result records TEST access.")
     if result.get("sealed_test_state") != T2_SEALED_TEST_STATE:
@@ -334,6 +377,13 @@ def validate_retained_t2_arm(run_root: Path) -> dict[str, Any]:
         "t2_protocol_sha256": T2_PROTOCOL_SHA256,
         "t2_execution_spec_sha256": T2_EXECUTION_SPEC_SHA256,
         "t2_train_artifact_review_sha256": T2_TRAIN_ARTIFACT_REVIEW_SHA256,
+        "protocol_document_sha256": protocol_sha,
+        "execution_spec_document_sha256": execution_spec_sha,
+        "train_artifact_review_document_sha256": train_review_sha,
+        "checkpoint_lock_self_sha256": {
+            T2_RETAINED_ARM: T2_RETAINED_CHECKPOINT_LOCK_SELF_SHA256,
+            T2_COMPARATOR_ARM: T2_COMPARATOR_CHECKPOINT_LOCK_SELF_SHA256,
+        },
         "outer_authorized_git_sha": T2_OUTER_AUTHORIZED_GIT_SHA,
         "test_accessed": False,
         "sealed_test_state": T2_SEALED_TEST_STATE,
