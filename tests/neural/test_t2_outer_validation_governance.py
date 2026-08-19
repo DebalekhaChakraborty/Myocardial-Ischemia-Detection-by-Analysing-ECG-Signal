@@ -49,6 +49,7 @@ from tests.neural.test_t2_canonical_training_route import (  # noqa: F401
     clean_git,
     environment,
     frozen_runtime,
+    outer_attempt_unchanged,
 )
 
 
@@ -329,17 +330,15 @@ def test_the_public_outer_route_opens_nothing_without_the_authorized_commit(
         EV, "_open_validation_timeline", lambda *a, **k: opened.append(a)
     )
     assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
-    for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
+    with outer_attempt_unchanged():
+        for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
+            with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
+                entry(GIT_SHA)
         with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
-            entry(GIT_SHA)
-    with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
-        RUN.execute_canonical_outer_validation(GIT_SHA)
-    # The bare CLI flag names no commit, so it stops rather than claiming.
-    assert RUN.main(["--execute-canonical-outer-validation"]) == 2
+            RUN.execute_canonical_outer_validation(GIT_SHA)
+        # The bare CLI flag names no commit, so it stops rather than claiming.
+        assert RUN.main(["--execute-canonical-outer-validation"]) == 2
     assert opened == [], "nothing was resolved or opened before the refusal"
-    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists(), (
-        "a refused route claims nothing in the real run root"
-    )
 
 
 def test_a_wrong_expected_git_sha_opens_nothing(
@@ -610,9 +609,23 @@ def test_no_test_can_consume_the_real_one_shot_outer_attempt():
     )
 
 
-def test_the_real_outer_attempt_is_still_unclaimed():
-    """The activation change set must not have created the outer attempt."""
-    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists()
+def test_the_outer_attempt_has_exactly_one_frozen_name():
+    """No recovery1, no retry name, no alternate sibling beside the two.
+
+    This replaces an earlier assertion that the outer attempt did not exist.
+    That was true while the gate was closed and is deliberately no longer true:
+    the authorized one-shot run has since consumed it. What remains invariant --
+    and is the property that actually protects the science -- is that the run
+    root can only ever hold these two frozen names.
+    """
+    assert PS.T2_OUTER_VALIDATION_ATTEMPT_ID == "t2-v1-outer-validation"
+    assert PS.T2_ATTEMPT_IDS == (
+        PS.T2_TRAINING_ATTEMPT_ID,
+        PS.T2_OUTER_VALIDATION_ATTEMPT_ID,
+    )
+    if PS.T2_RUN_ROOT.is_dir():
+        present = sorted(p.name for p in PS.T2_RUN_ROOT.iterdir() if p.is_dir())
+        assert set(present) <= set(PS.T2_ATTEMPT_IDS), present
 
 
 # --- 9-10. the outer claim is one-shot -------------------------------------

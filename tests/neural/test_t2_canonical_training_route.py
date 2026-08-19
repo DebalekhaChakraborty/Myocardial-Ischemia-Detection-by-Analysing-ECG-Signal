@@ -30,6 +30,7 @@ choreography, the threshold pass, the promotion and the lock are the real ones.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +69,34 @@ FROZEN_DIGEST = "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297
 # working tree, clean in CI. The property under test is that the route refuses
 # and opens nothing, not which of the two identity gates spoke first.
 _PRE_CLAIM_REFUSAL = "but the run expects|working tree is dirty"
+
+
+@contextmanager
+def outer_attempt_unchanged():
+    """Prove the guarded block claims nothing in the real one-shot run root.
+
+    The canonical outer attempt is a legitimately consumable artifact: it is
+    absent in a fresh checkout and present on a machine that has executed the
+    authorized one-shot run. Asserting it is *absent* would therefore assert a
+    property of the filesystem rather than of the code under test, and would
+    fail for exactly the people holding the real evidence.
+
+    What must hold in both worlds is stronger and is what this checks: a refused
+    route neither creates the attempt nor writes into an existing one.
+    """
+    path = PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID
+
+    def snapshot():
+        if not path.exists():
+            return None
+        return sorted(entry.name for entry in path.iterdir())
+
+    before = snapshot()
+    yield
+    assert snapshot() == before, (
+        "a refused route must not create, remove or write into the one-shot "
+        "outer attempt"
+    )
 
 
 def _frozen_check(point, detail="test"):
@@ -1098,12 +1127,12 @@ def test_the_public_gate_refuses_before_any_loader_access(monkeypatch):
     monkeypatch.setattr(
         EV, "_open_validation_timeline", lambda *a, **k: opened.append(a) or None
     )
-    for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
-        with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
-            entry(Path("/nonexistent"))
+    with outer_attempt_unchanged():
+        for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
+            with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
+                entry(Path("/nonexistent"))
     assert opened == [], "the refusal fired before anything was opened"
     assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
-    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists()
 
 
 def test_the_activation_gate_is_the_first_statement_of_every_entry_point():
