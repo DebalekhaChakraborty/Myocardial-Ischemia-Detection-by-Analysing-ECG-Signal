@@ -34,6 +34,7 @@ from cardiosentinel.neural import t2_timeline as TL
 from cardiosentinel.neural.integrity import canonical_sha256
 from cardiosentinel.neural.t2_protocol import T2_ARM_GRU, T2_ARM_S4D, T2_ARMS
 from tests.neural.test_t2_canonical_training_route import (  # noqa: F401
+    _PRE_CLAIM_REFUSAL,
     GIT_SHA,
     clean_git,
     environment,
@@ -399,22 +400,27 @@ def test_flipping_activation_alone_unlocks_no_raw_loader():
     assert public == [], public
 
 
-def test_activation_false_still_opens_nothing(monkeypatch):
+def test_activation_true_still_opens_nothing_unauthorized(monkeypatch):
+    """Activation is open, so the authorized commit is what refuses.
+
+    `GIT_SHA` is synthetic and `git_provenance` is not patched here, so the
+    checkout provably is not at it and the route stops in
+    `require_expected_git_sha` -- before the outer claim, before any VALIDATION
+    path is resolved.
+    """
     opened: list[object] = []
     monkeypatch.setattr(
         EV, "_open_validation_timeline", lambda *a, **k: opened.append(a)
     )
-    monkeypatch.setattr(
-        EV, "_outer_validation_worker", lambda *a, **k: opened.append(a)
-    )
-    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is False
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
     for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
-        with pytest.raises(PS.T2ActivationError, match="not authorized"):
+        with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
             entry(GIT_SHA)
-    with pytest.raises(PS.T2ActivationError):
+    with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
         RUN.execute_canonical_outer_validation(GIT_SHA)
-    assert RUN.main(["--execute-canonical-outer-validation"]) == 3
+    assert RUN.main(["--execute-canonical-outer-validation"]) == 2
     assert opened == []
+    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists()
 
 
 # --- 14-16. the outer failure receipt after row-evidence promotion ---------
@@ -538,7 +544,7 @@ def test_nothing_previously_closed_was_reopened():
     )
     assert PS.T2_TRAINING_ATTEMPT_ID == "t2-v1-training"
     assert PS.T2_OUTER_VALIDATION_ATTEMPT_ID == "t2-v1-outer-validation"
-    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is False
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
     assert ES.T2_SCORE_SEMANTICS == "uncalibrated_temporal_model_score"
     assert ES.T2_SCORE_DEFINITION == "sigmoid(current_window_t2_logit)"
     assert list(ES.T2_OUTER_IDENTITY_COLUMNS).count("score_present") == 1

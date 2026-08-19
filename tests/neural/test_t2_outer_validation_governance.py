@@ -1,16 +1,26 @@
-"""The one-shot outer-VALIDATION attempt, proven while its gate stays False.
+"""The one-shot outer-VALIDATION attempt, and the activated gate around it.
 
-The public route still refuses: `T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED` is
-unchanged, and every public entry point refuses as its first statement before
-resolving a path or opening anything. What this file proves is that the body
-behind the gate is *already complete* -- claim, per-row evidence, accounting,
-stream-aware descriptors, failure semantics, canonical validator -- so the
-future activation change set changes a switch and not the science.
+`T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED` is now True. That changes what these
+tests may safely do, and the change is deliberate in both directions:
 
-**No real science happens here.** No canonical CLI invocation, no real TRAIN
-optimiser step, no real internal-dev score, no real threshold, no real
-VALIDATION per-row access, no real challenge evidence, no TEST. Every timeline
-is a synthetic on-disk fixture in `tmp_path`.
+* The body behind the gate is unchanged -- claim, per-row evidence, accounting,
+  stream-aware descriptors, failure semantics, canonical validator -- and is
+  still exercised only against synthetic on-disk fixtures.
+* The gate tests no longer assert "activation refuses". They assert what refuses
+  *instead*, now that activation does not: the authorized commit, and the
+  reviewed-TRAIN binding. Both refuse before the outer claim and before any
+  VALIDATION path is resolved, and the loader is spied to prove it.
+
+**No real science happens here.** No canonical CLI invocation against the real
+authorized commit, no real TRAIN optimiser step, no real internal-dev score, no
+real threshold, no real VALIDATION per-row access, no real challenge evidence,
+no TEST. Every timeline is a synthetic on-disk fixture in `tmp_path`.
+
+**The one thing this file must never do**, now that the gate is open, is drive
+the claim-bearing canonical route with the repository's actual authorized commit
+against the real run root: that combination is capable of consuming the one-shot
+outer attempt. `test_no_test_can_consume_the_real_one_shot_outer_attempt` is a
+structural guard that fails if any test in this suite grows that shape.
 
 The same two environmental substitutions as the training-route tests, and no
 others: a clean `git_provenance`, and a frozen runtime observation, because the
@@ -34,6 +44,7 @@ from cardiosentinel.neural import t2_timeline as TL
 from cardiosentinel.neural.t2_protocol import T2_ARM_GRU, T2_ARM_S4D, T2_ARMS
 from tests.neural import t2_fixtures as FX
 from tests.neural.test_t2_canonical_training_route import (  # noqa: F401
+    _PRE_CLAIM_REFUSAL,
     GIT_SHA,
     clean_git,
     environment,
@@ -303,25 +314,32 @@ def test_the_failure_receipt_names_the_arm_that_actually_failed(
 # --- 7-8. the public outer gate --------------------------------------------
 
 
-def test_the_public_outer_route_opens_nothing_while_the_gate_is_false(monkeypatch):
+def test_the_public_outer_route_opens_nothing_without_the_authorized_commit(
+    monkeypatch,
+):
+    """Activation is open; the authorized commit is what refuses now.
+
+    `GIT_SHA` is the synthetic "a"*40 and `git_provenance` is deliberately NOT
+    patched here, so the real checkout provably is not at it. The refusal
+    therefore comes from `require_expected_git_sha`, which runs before the outer
+    claim and before any VALIDATION path is resolved.
+    """
     opened: list[object] = []
     monkeypatch.setattr(
         EV, "_open_validation_timeline", lambda *a, **k: opened.append(a)
     )
-    monkeypatch.setattr(
-        EV, "_outer_validation_worker", lambda *a, **k: opened.append(a)
-    )
-    monkeypatch.setattr(
-        EV, "_outer_validation_preflight", lambda *a, **k: opened.append(a)
-    )
-    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is False
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
     for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
-        with pytest.raises(PS.T2ActivationError, match="not authorized"):
+        with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
             entry(GIT_SHA)
-    with pytest.raises(PS.T2ActivationError):
+    with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
         RUN.execute_canonical_outer_validation(GIT_SHA)
-    assert RUN.main(["--execute-canonical-outer-validation"]) == 3
-    assert opened == [], "the gate fired before anything was resolved or opened"
+    # The bare CLI flag names no commit, so it stops rather than claiming.
+    assert RUN.main(["--execute-canonical-outer-validation"]) == 2
+    assert opened == [], "nothing was resolved or opened before the refusal"
+    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists(), (
+        "a refused route claims nothing in the real run root"
+    )
 
 
 def test_a_wrong_expected_git_sha_opens_nothing(
@@ -363,11 +381,16 @@ def test_a_missing_expected_git_sha_opens_nothing(trained, validation):
 
 
 def test_the_activation_gate_is_still_the_first_statement():
+    """Activation is True, but the gate call stays where it is.
+
+    A flipped constant is reviewable; a deleted gate is not. If activation is
+    ever reverted, the refusal must still fire before anything is resolved.
+    """
     import ast
     import inspect
     import textwrap
 
-    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is False
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
     entries = [
         *EV.OUTER_VALIDATION_ENTRY_POINTS,
         RUN.execute_canonical_outer_validation,
@@ -385,6 +408,211 @@ def test_the_activation_gate_is_still_the_first_statement():
         assert "require_outer_validation_authorized" in ast.dump(body[0]), (
             entry.__name__
         )
+
+
+# --- 8b. the activation change set itself ----------------------------------
+
+
+def _reviewed_verification(**overrides):
+    """Exactly what the canonical verifier reports for the reviewed attempt."""
+    base = {
+        "verified": True,
+        "result_sha256": PS.T2_REVIEWED_TRAIN_RESULT_SHA256,
+        "experiment_lock_sha256": PS.T2_REVIEWED_TRAIN_EXPERIMENT_LOCK_SELF_SHA256,
+        "authorized_git_sha": PS.T2_REVIEWED_TRAIN_AUTHORIZED_GIT_SHA,
+        "arm_selection_status": PS.ARM_SELECTION_PENDING,
+        "arm_selected": None,
+        "test_accessed": False,
+        "sealed_test_state": "unopened",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_the_activation_constant_is_exactly_true():
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
+
+
+def test_the_activation_decision_document_validates_to_its_frozen_sha():
+    digest = PS.validate_t2_train_artifact_review_document()
+    assert digest == PS.T2_TRAIN_ARTIFACT_REVIEW_SHA256
+    assert PS.T2_TRAIN_ARTIFACT_REVIEW_PATH.is_file()
+
+
+def test_a_mutated_activation_decision_document_is_refused(tmp_path):
+    forged = tmp_path / "forged_review.md"
+    forged.write_text(
+        PS.T2_TRAIN_ARTIFACT_REVIEW_PATH.read_text() + "\nan added line\n"
+    )
+    with pytest.raises(PS.T2PersistenceError, match="immutable"):
+        PS.validate_t2_train_artifact_review_document(forged)
+
+
+def test_the_reviewed_train_constants_are_the_canonical_ones():
+    assert PS.T2_REVIEWED_TRAIN_RESULT_SHA256 == (
+        "ff9258f95631405b6705811d638d754400a067be4c1a43bb9d52021bb246adb8"
+    )
+    assert PS.T2_REVIEWED_TRAIN_EXPERIMENT_LOCK_SELF_SHA256 == (
+        "d8de03554931fe65a6f1c1242d80c1c95f1a6a26f93b8013cff5bc221a92202f"
+    )
+    assert PS.T2_REVIEWED_TRAIN_AUTHORIZED_GIT_SHA == (
+        "f4759e2a97d17db26cb6a6b7c0e9b6207eb0b045"
+    )
+
+
+def test_the_reviewed_binding_accepts_the_exact_reviewed_attempt():
+    binding = PS.require_reviewed_t2_training_attempt(_reviewed_verification())
+    assert binding["binding_class"] == "t2_reviewed_training_attempt_binding"
+    assert binding["review_document_sha256"] == PS.T2_TRAIN_ARTIFACT_REVIEW_SHA256
+    assert binding["arm_selected"] is None
+    assert binding["arm_selection_status"] == PS.ARM_SELECTION_PENDING
+    assert binding["test_accessed"] is False
+    assert binding["sealed_test_state"] == "unopened"
+
+
+def test_an_unverified_train_attempt_is_refused():
+    with pytest.raises(PS.T2ActivationError, match="did not verify"):
+        PS.require_reviewed_t2_training_attempt(_reviewed_verification(verified=False))
+
+
+def test_a_mismatched_train_result_digest_is_refused():
+    with pytest.raises(PS.T2ActivationError, match="top-level result digest"):
+        PS.require_reviewed_t2_training_attempt(
+            _reviewed_verification(result_sha256="c" * 64)
+        )
+
+
+def test_a_mismatched_train_experiment_lock_identity_is_refused():
+    with pytest.raises(PS.T2ActivationError, match="experiment-lock self-digest"):
+        PS.require_reviewed_t2_training_attempt(
+            _reviewed_verification(experiment_lock_sha256="d" * 64)
+        )
+
+
+def test_a_wrong_authorized_train_commit_is_refused():
+    with pytest.raises(PS.T2ActivationError, match="authorized TRAIN commit"):
+        PS.require_reviewed_t2_training_attempt(
+            _reviewed_verification(authorized_git_sha="e" * 40)
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"arm_selection_status": "selected"}, "arm_selection_status"),
+        ({"arm_selected": T2_ARM_GRU}, "already names a selected arm"),
+        ({"test_accessed": True}, "TEST as accessed"),
+        ({"sealed_test_state": "opened"}, "sealed_test_state"),
+    ],
+)
+def test_a_non_pending_or_test_opened_train_state_is_refused(overrides, match):
+    with pytest.raises(PS.T2ActivationError, match=match):
+        PS.require_reviewed_t2_training_attempt(_reviewed_verification(**overrides))
+
+
+def test_the_canonical_outer_preflight_binds_the_reviewed_attempt():
+    """The binding is wired into the canonical path, not merely available."""
+    import ast
+    import inspect
+    import textwrap
+
+    source = textwrap.dedent(inspect.getsource(EV._outer_validation_preflight))
+    tree = ast.parse(source)
+    calls = [
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert "validate_canonical_t2_attempt" in calls
+    assert "require_reviewed_t2_training_attempt" in calls
+    # ... and it is bound after canonical verification, never before it.
+    assert calls.index("validate_canonical_t2_attempt") < calls.index(
+        "require_reviewed_t2_training_attempt"
+    )
+
+
+def test_activation_added_no_alternate_mechanism():
+    import ast
+
+    source = Path(PS.__file__).read_text()
+    for bypass in ("os.environ", "getenv", "setattr(", "--force", "--retry"):
+        assert bypass not in source, bypass
+    tree = ast.parse(source)
+    assignments = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.AnnAssign | ast.Assign)
+        for target in (
+            [node.target] if isinstance(node, ast.AnnAssign) else node.targets
+        )
+        if getattr(target, "id", None) == "T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED"
+    ]
+    assert len(assignments) == 1
+    # Registered options, not a source scan: `--force` and `--retry` appear in
+    # this module as a *denylist* and in prose explaining why they are refused,
+    # and a substring test would read those as the very thing they prevent.
+    options = {
+        option
+        for action in RUN.build_parser()._actions
+        for option in action.option_strings
+    }
+    for flag in ("--activate", "--authorize", "--force", "--retry", "--reset"):
+        assert flag not in options, flag
+    assert options == {
+        "-h",
+        "--help",
+        "--execute-canonical-training",
+        "--execute-canonical-outer-validation",
+        "--expected-git-sha",
+    }
+
+
+def test_no_test_can_consume_the_real_one_shot_outer_attempt():
+    """Structural guard: no test may drive the claim-bearing route for real.
+
+    After activation the dangerous shape is a claim-bearing outer call whose
+    commit argument is the repository's actual authorized SHA and whose run root
+    is the real one. Every legitimate test either injects a synthetic root
+    through the private worker or passes a commit the checkout is not at. This
+    walks the suite's own source and fails if that shape ever appears.
+    """
+    import ast
+
+    authorized = PS.T2_REVIEWED_TRAIN_AUTHORIZED_GIT_SHA
+    suite = Path(__file__).parent
+    offenders: list[str] = []
+    for path in sorted(suite.glob("test_t2_*.py")):
+        text = path.read_text()
+        # The real authorized commit must not appear as a call argument at all
+        # in the test suite; the reviewed-constant assertions use the literal
+        # only in comparisons, which carry no execution risk.
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = ""
+            if isinstance(node.func, ast.Attribute):
+                name = node.func.attr
+            elif isinstance(node.func, ast.Name):
+                name = node.func.id
+            if name not in {
+                "execute_canonical_outer_validation",
+                "_outer_validation_worker",
+                "_outer_validation_preflight",
+            }:
+                continue
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                if isinstance(arg, ast.Constant) and arg.value == authorized:
+                    offenders.append(f"{path.name}:{node.lineno} {name}")
+    assert offenders == [], (
+        "a test drives the claim-bearing outer route with the real authorized "
+        f"commit and could consume the one-shot attempt: {offenders}"
+    )
+
+
+def test_the_real_outer_attempt_is_still_unclaimed():
+    """The activation change set must not have created the outer attempt."""
+    assert not (PS.T2_RUN_ROOT / PS.T2_OUTER_VALIDATION_ATTEMPT_ID).exists()
 
 
 # --- 9-10. the outer claim is one-shot -------------------------------------

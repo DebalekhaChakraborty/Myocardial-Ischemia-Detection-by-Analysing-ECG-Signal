@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 import torch
 
+from cardiosentinel.neural import t2_development_run as RUN
 from cardiosentinel.neural import t2_evaluation as EV
 from cardiosentinel.neural import t2_persistence as PS
 from cardiosentinel.neural import t2_timeline as TL
@@ -44,6 +45,10 @@ from tests.neural.t2_fixtures import (
 
 WINDOW = 2500
 STRIDE = 1250
+
+# Either pre-claim identity refusal is acceptable; which fires depends only on
+# whether the checkout is clean (dirty in a working tree, clean in CI).
+_PRE_CLAIM_REFUSAL = "but the run expects|working tree is dirty"
 
 
 def _timeline_environment(
@@ -608,31 +613,38 @@ def test_challenge_and_latency_cannot_influence_selection():
 # --- M. outer-validation firewall -----------------------------------------
 
 
-def test_every_outer_validation_entry_point_refuses():
+def test_the_outer_entry_point_surface_is_still_exactly_one_route():
     assert EV.OUTER_VALIDATION_ENTRY_POINTS == (EV.execute_canonical_outer_validation,)
-    for entry in EV.OUTER_VALIDATION_ENTRY_POINTS:
-        with pytest.raises(PS.T2ActivationError, match="not authorized"):
-            entry("0" * 40)
 
 
-def test_the_refusal_fires_before_any_validation_path_is_resolved():
+def test_the_refusal_fires_before_any_validation_path_is_resolved(monkeypatch):
     """Called with a nonsense commit, it still refuses rather than resolving.
+
+    Activation is no longer what refuses here -- the authorized commit is. The
+    route is driven with a commit the checkout provably is not at, so it refuses
+    in `require_expected_git_sha`, which runs before the outer claim and before
+    any VALIDATION path is resolved. The loader is spied to prove exactly that.
 
     The raw loaders that used to sit on this surface are gone: the only public
     outer route is the claim-bearing canonical one.
     """
-    with pytest.raises(PS.T2ActivationError):
+    opened: list[object] = []
+    monkeypatch.setattr(
+        EV, "_open_validation_timeline", lambda *a, **k: opened.append(a)
+    )
+    with pytest.raises(RUN.T2RunError, match=_PRE_CLAIM_REFUSAL):
         EV.execute_canonical_outer_validation("0" * 40)
-    with pytest.raises(PS.T2ActivationError):
+    with pytest.raises(RUN.T2RunError, match="--expected-git-sha is required"):
         EV.execute_canonical_outer_validation(None)
+    assert opened == []
     assert not hasattr(EV, "open_validation_timeline")
     assert not hasattr(EV, "load_validation_labels")
 
 
-def test_activation_is_false_and_has_no_override():
+def test_activation_is_true_and_has_no_override():
     import ast
 
-    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is False
+    assert PS.T2_OUTER_VALIDATION_EXECUTION_AUTHORIZED is True
     source = Path(PS.__file__).read_text()
     assert "os.environ" not in source, "no environment-variable bypass"
     tree = ast.parse(source)
@@ -648,10 +660,15 @@ def test_activation_is_false_and_has_no_override():
     assert len(assignments) == 1, "exactly one place defines the activation state"
 
 
-def test_the_cli_outer_validation_route_refuses():
+def test_the_cli_outer_validation_route_still_requires_the_authorized_commit():
+    """Activation did not turn the bare CLI flag into an executable run.
+
+    Exit 2 is the STOP path, not the old activation refusal: the flag alone
+    names no commit, so the route stops before claiming anything.
+    """
     from cardiosentinel.neural.t2_development_run import main
 
-    assert main(["--execute-canonical-outer-validation"]) == 3
+    assert main(["--execute-canonical-outer-validation"]) == 2
 
 
 def test_the_cli_exposes_no_scientific_option():

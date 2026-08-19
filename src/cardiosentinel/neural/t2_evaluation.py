@@ -138,6 +138,10 @@ def _outer_validation_preflight(
     git_sha = require_expected_git_sha(expected_git_sha)
     protocol_sha = validate_t2_protocol_document()
     execution_spec_sha = persistence.validate_t2_execution_spec()
+    # The canonical route injects no source. A fixture-injected root is by
+    # definition a different attempt, exactly as `T2Timeline` treats an injected
+    # store, and the reviewed-TRAIN binding below applies to the canonical route.
+    canonical_source = run_root is None and training_attempt_id is None
     root = persistence.T2_RUN_ROOT if run_root is None else Path(run_root)
     attempt = training_attempt_id or persistence.T2_TRAINING_ATTEMPT_ID
     unclaimed = persistence.require_unclaimed_outer_attempt(
@@ -147,6 +151,14 @@ def _outer_validation_preflight(
     # outer attempt bound to a mutated training result would be consumed for
     # nothing.
     training = persistence.validate_canonical_t2_attempt(root, attempt)
+    # ... and then proved to be the attempt a human actually reviewed. Byte-level
+    # self-consistency cannot distinguish the reviewed attempt from a different
+    # but equally valid one, and only the reviewed one carries authorization.
+    reviewed = (
+        persistence.require_reviewed_t2_training_attempt(training)
+        if canonical_source
+        else None
+    )
     return {
         "preflight_class": "t2_outer_validation_preflight",
         "experiment_identity": persistence.T2_EXPERIMENT_IDENTITY,
@@ -156,6 +168,8 @@ def _outer_validation_preflight(
         "t2_protocol_sha256": protocol_sha,
         "t2_execution_spec_sha256": execution_spec_sha,
         "training_attempt_verification": training,
+        "canonical_source": canonical_source,
+        "reviewed_training_binding": reviewed,
         "claim_state": unclaimed,
         "validation_accessed": False,
         "validation_path_resolved": False,
