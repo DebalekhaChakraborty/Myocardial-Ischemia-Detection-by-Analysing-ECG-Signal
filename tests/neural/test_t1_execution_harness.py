@@ -869,11 +869,12 @@ def test_the_run_manifest_binds_the_execution_specification(run_config):
 # ---------------------------------------------------------------------------
 
 
-def test_the_specification_exists_and_the_harness_does_not():
+def test_the_three_authorization_facts_stay_separate():
+    """Specification, capability and permission are three different things."""
     from cardiosentinel.neural import t1_config as C
 
     assert C.T1_EXECUTION_SPECIFICATION_EXISTS is True
-    assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is False
+    assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is True
     assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
     assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE == (
         "cardiosentinel.neural.t1_development_run"
@@ -891,20 +892,26 @@ def test_the_canonical_refusal_no_longer_claims_the_specification_is_missing():
         build_t1_episode_config(raw)
     message = str(caught.value)
     assert "exists and is merged" in message
-    assert "has not been implemented" in message
-    assert "not been authorized" in message
+    assert "is implemented but has NOT been authorized" in message
+    assert "neither is a permission" in message
     assert "none exists" not in message
 
 
-def test_the_canonical_development_harness_module_really_is_absent():
-    """The gate's stated reason must match the repository, not just sound right."""
+def test_the_canonical_development_harness_exists_but_is_not_authorized():
+    """The gate's stated reason must match the repository, not just sound right.
+
+    This test previously asserted the harness was absent. It now exists, so the
+    tripwire it was fired to protect has done its job: the constant tracks
+    reality, and the authorization constant is deliberately unchanged. A module
+    existing is a capability, never a permission.
+    """
     import importlib.util
 
     from cardiosentinel.neural import t1_config as C
 
     found = importlib.util.find_spec(C.T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE)
-    assert found is None, (
-        "the canonical development harness now exists; the authorization gate's "
-        "reasoning needs revisiting by a human, and execution is still not "
-        "authorized by its mere existence"
+    assert found is not None, "the harness module went missing"
+    assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is True
+    assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False, (
+        "implementing the harness must not authorize execution"
     )
