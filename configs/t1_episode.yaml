@@ -1,0 +1,159 @@
+# T1 episode-state execution configuration.
+#
+# This file drives the T1 execution harness. Nothing the harness needs is
+# hardcoded in Python: the stream geometry, the detector operating point, the
+# threshold rule, the persistence profile, the cold-start rule, the alerting
+# policy and the availability contract all come from here.
+#
+# Config-driven does NOT mean freely tunable. The T1 protocol
+# (docs/T1_CAUSAL_EPISODE_STATE_PROTOCOL_V1.md, frozen) fixes most of these
+# values, and the harness REFUSES to run a canonical development attempt whose
+# config disagrees with the frozen protocol. What the config genuinely chooses
+# is which frozen option applies to this run -- which quantile pair, which
+# persistence profile -- plus the operational alerting layer that sits outside
+# the protocol entirely.
+#
+# See docs/t1_episode_reasoning.md, section "Configuration is selection, not
+# tuning".
+
+t1_episode:
+
+  # ----------------------------------------------------------------------
+  # Which protocol this run claims to implement.
+  # ----------------------------------------------------------------------
+  protocol:
+    name: T1_CAUSAL_EPISODE_STATE_PROTOCOL_V1
+    document_sha256: ef044754020b1756ea7aae5fa1b747c5ba6fc0c8cd70d52e73185555897d70d4
+    # Re-digest the frozen document at run start. A byte change is a refusal.
+    verify_document: true
+
+  # ----------------------------------------------------------------------
+  # Run class. This is the most important switch in the file.
+  #
+  #   canonical_t1_development
+  #       Protocol evidence. Every frozen value must match, thresholds MUST be
+  #       derived from FIT-subject background negatives, and the run requires a
+  #       separately authorized T1 execution specification. Not authorized yet.
+  #
+  #   harness_verification
+  #       Everything else: synthetic streams, reviewer acceptance checks,
+  #       integration of a future model's outputs. Free to deviate. Every
+  #       artifact it writes is stamped protocol_evidence: false and it may
+  #       never write into the canonical attempt namespace.
+  # ----------------------------------------------------------------------
+  run:
+    run_class: harness_verification
+    run_root: cardiosentinel-runs/T1
+    attempt_id: T1_state_machine_v1
+
+  # ----------------------------------------------------------------------
+  # Stream geometry. One stream is one (record_id, channel_index) pair;
+  # state never crosses a stream, a record, a channel or a subject.
+  # ----------------------------------------------------------------------
+  stream:
+    sampling_frequency_hz: 250
+    window_samples: 2500
+    stride_samples: 1250
+    stream_key: [record_id, channel_index]
+    order_by: start_sample
+    # Causality guard: a window whose position is not strictly after its
+    # predecessor is a refusal, never a silent re-sort.
+    require_strictly_increasing: true
+    # Harness-layer operational policy, OUTSIDE the protocol. null keeps
+    # protocol behaviour exactly: a gap holds state and resets streaks,
+    # however long it is. A number re-arms cold start after a long dropout.
+    max_gap_seconds_before_stream_reset: null
+
+  # ----------------------------------------------------------------------
+  # The detector operating point that turns a model score into d_t.
+  # Frozen for canonical runs at the U1 classification threshold.
+  # ----------------------------------------------------------------------
+  detector:
+    threshold: 0.7554003000259399
+    threshold_source: frozen_u1_classification_threshold
+
+  # ----------------------------------------------------------------------
+  # Threshold generation.
+  #
+  # source: derived_from_fit_background_negatives
+  #     The protocol rule. p_watch/s_watch/p_event/s_event are computed at
+  #     execution time from the FIT-subject PRIMARY background negatives by
+  #     exact empirical order statistic k = ceil(q*N), 1-based, ties on
+  #     stable_id, no interpolation. The literal block below is ignored and
+  #     must stay null.
+  #
+  # source: explicit_literal
+  #     Synthetic and integration use only. Permitted ONLY when
+  #     run_class is harness_verification. Makes the run non-canonical.
+  # ----------------------------------------------------------------------
+  thresholds:
+    source: explicit_literal
+    q_watch: 0.95
+    q_event: 0.995
+    interpolation: false
+    tie_order: [value, stable_id]
+    literal:
+      p_watch: 0.60
+      s_watch: 0.60
+      p_event: 0.90
+      s_event: 0.90
+
+  # ----------------------------------------------------------------------
+  # Persistence. The three profiles are frozen; the config selects one.
+  # expected_windows is a human-readable assertion: the harness CHECKS it
+  # against the frozen profile and refuses on disagreement. It is never the
+  # source of the numbers actually used.
+  # ----------------------------------------------------------------------
+  persistence:
+    profile: CONSERVATIVE
+    expected_windows:
+      watch_clear: 6
+      event_confirm: 6
+      event_release: 6
+      re_event_confirm: 3
+      recovery_clear: 12
+      cold_event_confirm: 12
+
+  # ----------------------------------------------------------------------
+  # Cold start. Frozen: below this age EVENT needs d_t and p_t only, on the
+  # longer cold_event_confirm budget. This relaxes a T1 rule and repairs no
+  # upstream state.
+  # ----------------------------------------------------------------------
+  cold_start:
+    seconds: 300.0
+    requires_temporal_evidence: false
+
+  # ----------------------------------------------------------------------
+  # Availability. A window with no usable score is not evidence of anything.
+  # ----------------------------------------------------------------------
+  availability:
+    signal_quality_accept: [good, acceptable]
+    hold_state: true
+    reset_streaks: true
+    advance_state_time: true
+    imputation: false
+    forward_fill: false
+    synthetic_zero: false
+
+  # ----------------------------------------------------------------------
+  # Alerting. This layer is OUTSIDE the frozen protocol.
+  #
+  # The refractory period suppresses repeat alerts; it does NOT touch the
+  # state machine. State transitions are computed by the frozen protocol
+  # transition function and are byte-identical whether refractory is 0 or
+  # 3600. Suppressed alerts are still recorded, so nothing disappears.
+  # ----------------------------------------------------------------------
+  alerting:
+    emit_on_entry_to: [EVENT]
+    refractory_seconds: 300.0
+    refractory_applies_to: alert_emission_only
+    record_suppressed_alerts: true
+
+  # ----------------------------------------------------------------------
+  # Reporting-only fields. Signal quality decides availability; context and
+  # confounder flags are carried into the outputs for stratified reporting
+  # and are structurally barred from the transition function.
+  # ----------------------------------------------------------------------
+  reporting:
+    record_context_flags: true
+    context_flags_influence_transitions: false
