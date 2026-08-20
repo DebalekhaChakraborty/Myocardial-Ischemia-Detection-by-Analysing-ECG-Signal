@@ -42,7 +42,7 @@ T1_PROTOCOL_SHA256: Final = (
 T1_STARTING_GIT_SHA: Final = "b3004da9dcd8e7462d69eac81eb82ca9da86b8cb"
 
 # ---------------------------------------------------------------------------
-# Frozen upstream identities T1 consumes read-only (§4)
+# Frozen upstream identities T1 consumes read-only (§1)
 #
 # Every value is the exact immutable identity carried by the merged repository.
 # T1 binds them so a future execution harness cannot silently consume a
@@ -86,7 +86,7 @@ T1_FEATURE_CORPUS_SHA256: Final = (
 )
 
 # ---------------------------------------------------------------------------
-# The full VALIDATION timeline T1 development runs over (§5)
+# The full VALIDATION timeline T1 development runs over (§2)
 # ---------------------------------------------------------------------------
 T1_TIMELINE_ROW_COUNT: Final = 492_904
 T1_TIMELINE_STREAM_COUNT: Final = 30
@@ -104,12 +104,12 @@ T1_STRIDE_SECONDS: Final = T1_STRIDE_SAMPLES / T1_SAMPLING_FREQUENCY_HZ
 T1_TIMELINE_SOURCE: Final = "retained_t2_row_evidence_frozen_stream_lineage"
 T1_TIMELINE_REGENERATED_FROM_WAVEFORM: Final = False
 
-# Availability, reconciled across the two retained sources (§8).
+# Availability, reconciled across the two retained sources (§5).
 T1_EXPECTED_SCORE_PRESENT_ROWS: Final = 492_898
 T1_EXPECTED_UNAVAILABLE_ROWS: Final = 6
 
 # ---------------------------------------------------------------------------
-# The frozen detector operating point and calibration contract (§6, §7)
+# The frozen detector operating point and calibration contract (§3, §4)
 # ---------------------------------------------------------------------------
 T1_DETECTOR_THRESHOLD: Final = 0.7554003000259399
 T1_U1_CALIBRATOR_FAMILY: Final = "platt_logistic_on_recovered_logit"
@@ -132,7 +132,7 @@ T1_FULL_TIMELINE_CALIBRATION_CONTRACT: Final = (
 )
 
 # ---------------------------------------------------------------------------
-# The T1 state space (§9)
+# The T1 state space (§6)
 # ---------------------------------------------------------------------------
 T1_STATE_NORMAL: Final = "NORMAL"
 T1_STATE_WATCH: Final = "WATCH"
@@ -153,7 +153,7 @@ T1_PER_STREAM: Final = True
 T1_PATIENT_LEVEL_CHANNEL_FUSION_DEFINED: Final = False
 
 # ---------------------------------------------------------------------------
-# What one row may and may not offer the transition function (§7)
+# What one row may and may not offer the transition function (§4)
 # ---------------------------------------------------------------------------
 T1_ALLOWED_ROW_INPUTS: Final = (
     "stable_id",
@@ -191,7 +191,7 @@ T1_T2_REPORTING_THRESHOLD_NOT_T1_POLICY: Final = 0.8972153067588806
 T1_T2_THRESHOLD_IS_T1_POLICY: Final = False
 
 # ---------------------------------------------------------------------------
-# Prospective candidate threshold generation (§10)
+# Prospective candidate threshold generation (§7)
 # ---------------------------------------------------------------------------
 Q_WATCH: Final = (0.90, 0.95)
 Q_EVENT: Final = (0.99, 0.995)
@@ -205,7 +205,7 @@ T1_THRESHOLD_USES_CHALLENGE_ROWS: Final = False
 T1_THRESHOLD_USES_LABEL_WEIGHTING: Final = False
 
 # ---------------------------------------------------------------------------
-# The three frozen persistence profiles (§11)
+# The three frozen persistence profiles (§8)
 # ---------------------------------------------------------------------------
 
 
@@ -265,7 +265,7 @@ T1_CANDIDATE_POLICY_COUNT: Final = (
 )
 
 # ---------------------------------------------------------------------------
-# Cold start (§14)
+# Cold start (§11)
 # ---------------------------------------------------------------------------
 T1_COLD_START_SECONDS: Final = 300.0
 T1_COLD_START_REQUIRES_S4D: Final = False
@@ -273,7 +273,7 @@ T1_MATURE_REQUIRES_S4D: Final = True
 T1_COLD_START_MODIFIES_T2: Final = False
 
 # ---------------------------------------------------------------------------
-# Development split (§17) and the optimism disclosure (§18)
+# Development split (§14) and the optimism disclosure (§15)
 # ---------------------------------------------------------------------------
 T1_VALIDATION_SUBJECTS: Final = (
     "ltstdb:s2004",
@@ -304,7 +304,7 @@ T1_IS_INDEPENDENT_VALIDATION: Final = False
 T1_IS_CLINICAL_VALIDATION: Final = False
 
 # ---------------------------------------------------------------------------
-# Episode, matching and selection semantics (§19-§23)
+# Episode, matching and selection semantics (§16-§18)
 # ---------------------------------------------------------------------------
 T1_EPISODE_CADENCE_SAMPLES: Final = T1_STRIDE_SAMPLES
 T1_EPISODE_GAP_BRIDGING_PERMITTED: Final = False
@@ -321,7 +321,7 @@ T1_SELECTION_USES_CHALLENGE_EVIDENCE: Final = False
 T1_SELECTION_USES_LATENCY: Final = False
 T1_SELECTION_USES_WEIGHTED_COMPOSITE: Final = False
 
-# Bootstrap (§25)
+# Bootstrap (§20)
 T1_BOOTSTRAP_REPLICATES: Final = 1000
 T1_BOOTSTRAP_SEED: Final = 2026
 T1_BOOTSTRAP_UNIT: Final = "subject"
@@ -330,17 +330,17 @@ T1_BOOTSTRAP_CLAIM_SCOPE: Final = (
     "between_subject_variation_conditional_on_the_cross_fitted_t1_procedure"
 )
 
-# Cold-start reporting strata (§26)
+# Cold-start reporting strata (§21)
 T1_COLD_START_STRATA: Final = ("0_5_minutes", "5_60_minutes", "over_60_minutes")
 
-# Challenge families are reported, never routed on (§27)
+# Challenge families are reported, never routed on (§21)
 T1_CHALLENGE_FAMILIES: Final = ("rate_related", "axis_shift", "conduction_change")
 T1_CHALLENGE_IS_SELECTION_INPUT: Final = False
 T1_CHALLENGE_IS_TRANSITION_INPUT: Final = False
 T1_CONDUCTION_EVIDENCE_LEVEL: Final = "exploratory_descriptive"
 
 # ---------------------------------------------------------------------------
-# Firewalls (§30, §31, §32)
+# Firewalls (§23)
 # ---------------------------------------------------------------------------
 T1_TEST_ACCESSED: Final = False
 T1_SEALED_TEST_STATE: Final = "unopened"
@@ -433,7 +433,7 @@ class T1Row(NamedTuple):
 
 
 # ---------------------------------------------------------------------------
-# Deterministic fold generation (§17)
+# Deterministic fold generation (§14)
 # ---------------------------------------------------------------------------
 
 
@@ -467,7 +467,7 @@ def candidate_policies() -> tuple[T1CandidatePolicy, ...]:
 
 
 # ---------------------------------------------------------------------------
-# The exact empirical order statistic (§10)
+# The exact empirical order statistic (§7)
 # ---------------------------------------------------------------------------
 
 
@@ -492,7 +492,7 @@ def empirical_order_statistic(
 
 
 # ---------------------------------------------------------------------------
-# Evidence definitions (§12, §14)
+# Evidence definitions (§9, §11)
 # ---------------------------------------------------------------------------
 
 
@@ -566,7 +566,7 @@ def decision_error_uncertainty(
 
 
 # ---------------------------------------------------------------------------
-# Unavailable-row semantics (§8)
+# Unavailable-row semantics (§5)
 # ---------------------------------------------------------------------------
 
 T1_UNAVAILABLE_HOLDS_STATE: Final = True
@@ -579,7 +579,7 @@ T1_SYNTHETIC_ZERO_PERMITTED: Final = False
 
 
 # ---------------------------------------------------------------------------
-# Episode grouping (§19) and predicted runs (§20)
+# Episode grouping and predicted runs (§16)
 # ---------------------------------------------------------------------------
 
 
@@ -642,7 +642,7 @@ def match_runs_to_episodes(
 
 
 # ---------------------------------------------------------------------------
-# Policy selection ordering (§23)
+# Policy selection ordering (§18)
 # ---------------------------------------------------------------------------
 
 T1_SELECTION_ORDER: Final = (
@@ -720,7 +720,7 @@ def require_state(state: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# The exact transition specification (§15)
+# The exact transition specification (§12)
 # ---------------------------------------------------------------------------
 
 
