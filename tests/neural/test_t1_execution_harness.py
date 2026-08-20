@@ -720,3 +720,191 @@ def test_thresholds_may_be_supplied_explicitly_for_integration(run_config):
         stream((40, HOT)), run_config, thresholds=strict
     )
     assert T1_STATE_EVENT not in set(states(outputs))
+
+
+# ---------------------------------------------------------------------------
+# Canonical namespace protection
+#
+# The canonical run directory is itself claim-bearing: it existing in any state
+# consumes the one canonical T1 attempt. Guarding the attempt id alone is not
+# enough, because the directory is reachable by three different routes.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_root() -> Path:
+    from cardiosentinel.neural.t1_execution_spec import T1_RUN_ROOT_RELATIVE
+
+    return REPOSITORY_ROOT / T1_RUN_ROOT_RELATIVE
+
+
+def test_the_canonical_run_root_named_directly_is_refused(run_config):
+    """Route 1: run_root IS the canonical root, under an innocuous attempt id."""
+    attacked = dataclasses.replace(
+        run_config, run_root=_canonical_root(), attempt_id="smoke"
+    )
+    with pytest.raises(X.T1ExecutionError, match="claim-bearing"):
+        X.require_non_canonical_attempt(attacked)
+
+
+def test_a_directory_inside_the_canonical_run_root_is_refused(run_config):
+    """Route 2: burying the run deeper does not put it outside the namespace."""
+    attacked = dataclasses.replace(
+        run_config,
+        run_root=_canonical_root() / "nested" / "deeper",
+        attempt_id="smoke",
+    )
+    with pytest.raises(X.T1ExecutionError, match="claim-bearing"):
+        X.require_non_canonical_attempt(attacked)
+
+
+def test_the_canonical_root_reached_as_an_attempt_id_is_refused(run_config):
+    """Route 3: name the canonical root's PARENT and let attempt_id complete it."""
+    canonical = _canonical_root()
+    attacked = dataclasses.replace(
+        run_config, run_root=canonical.parent, attempt_id=canonical.name
+    )
+    with pytest.raises(X.T1ExecutionError):
+        X.require_non_canonical_attempt(attacked)
+
+
+def test_a_relative_canonical_run_root_is_refused(run_config):
+    """The guard must not depend on the process working directory."""
+    from cardiosentinel.neural.t1_execution_spec import T1_RUN_ROOT_RELATIVE
+
+    attacked = dataclasses.replace(
+        run_config, run_root=Path(T1_RUN_ROOT_RELATIVE), attempt_id="smoke"
+    )
+    with pytest.raises(X.T1ExecutionError, match="claim-bearing"):
+        X.require_non_canonical_attempt(attacked)
+
+
+def test_a_traversal_path_into_the_canonical_root_is_refused(run_config):
+    """`..` must be normalised before the comparison, not after the mkdir."""
+    from cardiosentinel.neural.t1_execution_spec import T1_RUN_ROOT_RELATIVE
+
+    traversal = (
+        Path("cardiosentinel-runs")
+        / "elsewhere"
+        / ".."
+        / Path(T1_RUN_ROOT_RELATIVE).name
+    )
+    attacked = dataclasses.replace(run_config, run_root=traversal, attempt_id="smoke")
+    with pytest.raises(X.T1ExecutionError, match="claim-bearing"):
+        X.require_non_canonical_attempt(attacked)
+
+
+def test_an_unrelated_run_root_is_allowed(run_config, tmp_path):
+    """The guard refuses the canonical namespace, not ordinary work."""
+    fine = dataclasses.replace(
+        run_config, run_root=tmp_path / "somewhere", attempt_id="smoke"
+    )
+    assert X.require_non_canonical_attempt(fine) is None
+
+
+def test_the_end_to_end_run_refuses_and_creates_nothing(run_config):
+    """The refusal fires before any directory is made, not after."""
+    canonical = _canonical_root()
+    existed_before = canonical.exists()
+    attacked = dataclasses.replace(run_config, run_root=canonical, attempt_id="smoke")
+    with pytest.raises(X.T1ExecutionError, match="claim-bearing"):
+        X.execute_t1_run(stream((5, QUIET)), attacked)
+    assert canonical.exists() == existed_before, (
+        "the guard let the canonical run root be created before refusing"
+    )
+
+
+@pytest.mark.parametrize("attempt", ["t1-v1-development", "T1-V1-Development-retry"])
+def test_a_canonical_attempt_id_is_refused_case_insensitively(run_config, attempt):
+    attacked = dataclasses.replace(run_config, attempt_id=attempt)
+    with pytest.raises(X.T1ExecutionError, match="reserved"):
+        X.require_non_canonical_attempt(attacked)
+
+
+# ---------------------------------------------------------------------------
+# Anti-drift: the specification owns the identity, the harness binds it
+# ---------------------------------------------------------------------------
+
+
+def test_the_harness_binds_the_specification_identity_rather_than_copying_it():
+    """A local copy of a frozen identity is a copy that can drift silently."""
+    from cardiosentinel.neural import t1_execution_spec as SPEC
+
+    assert X.CANONICAL_RUN_ROOT == REPOSITORY_ROOT / SPEC.T1_RUN_ROOT_RELATIVE
+    assert SPEC.T1_DEVELOPMENT_ATTEMPT_ID in X.CANONICAL_RESERVED_PREFIXES
+    assert Path(SPEC.T1_RUN_ROOT_RELATIVE).name in X.CANONICAL_RESERVED_PREFIXES
+
+
+def test_no_frozen_identity_is_hardcoded_as_a_literal_in_the_harness():
+    """The identity strings must come from the specification module by import."""
+    from cardiosentinel.neural import t1_execution_spec as SPEC
+
+    source = Path(X.__file__).read_text()
+    for literal in (
+        f'"{SPEC.T1_DEVELOPMENT_ATTEMPT_ID}"',
+        f'"{SPEC.T1_RUN_ROOT_RELATIVE}"',
+        f'"{SPEC.T1_EXPERIMENT_IDENTITY}"',
+    ):
+        assert literal not in source, (
+            f"{literal} is hardcoded in t1_execution.py; import it from the "
+            "execution specification instead"
+        )
+
+
+def test_the_run_manifest_binds_the_execution_specification(run_config):
+    from cardiosentinel.neural import t1_execution_spec as SPEC
+
+    X.execute_t1_run(stream((10, QUIET)), run_config)
+    manifest = X.read_run_artifact(
+        run_config.run_root / run_config.attempt_id, X.RUN_MANIFEST_NAME
+    )
+    binding = manifest["execution_specification"]
+    assert binding["document_sha256"] == SPEC.T1_EXECUTION_SPEC_SHA256
+    assert binding["canonical_attempt_id"] == SPEC.T1_DEVELOPMENT_ATTEMPT_ID
+    assert binding["canonical_run_root"] == str(SPEC.T1_RUN_ROOT_RELATIVE)
+    assert binding["canonical_namespace_claimed_by_this_run"] is False
+
+
+# ---------------------------------------------------------------------------
+# The authorization gate says what is actually true
+# ---------------------------------------------------------------------------
+
+
+def test_the_specification_exists_and_the_harness_does_not():
+    from cardiosentinel.neural import t1_config as C
+
+    assert C.T1_EXECUTION_SPECIFICATION_EXISTS is True
+    assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is False
+    assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE == (
+        "cardiosentinel.neural.t1_development_run"
+    )
+
+
+def test_the_canonical_refusal_no_longer_claims_the_specification_is_missing():
+    """The old message said 'none exists'. One exists; it is merged."""
+    raw = _raw_config()
+    raw["run"]["run_class"] = RUN_CLASS_CANONICAL
+    raw["thresholds"]["source"] = THRESHOLD_SOURCE_DERIVED
+    for key in ("p_watch", "s_watch", "p_event", "s_event"):
+        raw["thresholds"]["literal"][key] = None
+    with pytest.raises(T1ConfigError) as caught:
+        build_t1_episode_config(raw)
+    message = str(caught.value)
+    assert "exists and is merged" in message
+    assert "has not been implemented" in message
+    assert "not been authorized" in message
+    assert "none exists" not in message
+
+
+def test_the_canonical_development_harness_module_really_is_absent():
+    """The gate's stated reason must match the repository, not just sound right."""
+    import importlib.util
+
+    from cardiosentinel.neural import t1_config as C
+
+    found = importlib.util.find_spec(C.T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE)
+    assert found is None, (
+        "the canonical development harness now exists; the authorization gate's "
+        "reasoning needs revisiting by a human, and execution is still not "
+        "authorized by its mere existence"
+    )

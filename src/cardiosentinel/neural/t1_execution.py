@@ -25,6 +25,7 @@ convention.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -46,6 +47,13 @@ from cardiosentinel.neural.t1_engine import (
     T1RunOutputs,
     resolve_thresholds,
     run_t1_episode_state_machine,
+)
+from cardiosentinel.neural.t1_execution_spec import (
+    T1_DEVELOPMENT_ATTEMPT_ID,
+    T1_EXECUTION_SPEC_NAME,
+    T1_EXECUTION_SPEC_SHA256,
+    T1_EXPERIMENT_IDENTITY,
+    T1_RUN_ROOT_RELATIVE,
 )
 from cardiosentinel.neural.t1_protocol import (
     T1_PROTOCOL_NAME,
@@ -79,9 +87,14 @@ OUTPUT_NAMES: Final = (
     RECOVERY_NAME,
 )
 
-# Names reserved for the canonical T1 development attempt. The harness will not
-# claim one; only an authorized execution specification may.
-CANONICAL_RESERVED_PREFIXES: Final = ("t1-v1-development", "phase9-t1-development")
+# The canonical namespace, DERIVED from the frozen execution specification
+# rather than copied. A local copy of an identity is a copy that can drift out
+# of agreement with the document that owns it, and the drift is silent.
+CANONICAL_RUN_ROOT: Final = REPOSITORY_ROOT / T1_RUN_ROOT_RELATIVE
+CANONICAL_RESERVED_PREFIXES: Final = (
+    T1_DEVELOPMENT_ATTEMPT_ID,
+    Path(T1_RUN_ROOT_RELATIVE).name,
+)
 
 RUN_CLASS_FIELD: Final = "run_class"
 MANIFEST_CLASS: Final = "t1_episode_harness_run_manifest"
@@ -143,25 +156,72 @@ def t1_run_directory(run_root: Path, attempt_id: str) -> Path:
     return Path(run_root) / str(attempt_id)
 
 
+def absolute_run_path(path: Path | str) -> Path:
+    """Normalise a run path without depending on the process working directory.
+
+    A relative path is resolved against the repository root, never against the
+    current directory: the shell working directory in this environment does not
+    stay where it was put, and a guard that silently reinterprets its own
+    argument guards nothing.
+    """
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = REPOSITORY_ROOT / candidate
+    return Path(os.path.normpath(candidate)).resolve()
+
+
+def canonical_namespace_would_be_materialised(run_root: Path, attempt_id: str) -> bool:
+    """Would claiming this run create the canonical run root, at any depth?
+
+    ``claim_run_directory`` calls ``mkdir(parents=True)`` on the run
+    directory's parent and then creates the directory itself, so every ancestor
+    of the target comes into existence. The canonical root is therefore
+    materialised exactly when it is the target or an ancestor of it -- which
+    covers all three ways a caller can reach it: naming it as the run root,
+    naming a directory inside it, and naming its parent with the canonical
+    directory as the attempt id.
+    """
+    target = absolute_run_path(Path(run_root) / str(attempt_id))
+    canonical = absolute_run_path(CANONICAL_RUN_ROOT)
+    return target == canonical or canonical in target.parents
+
+
 def require_non_canonical_attempt(config: T1EpisodeConfig) -> None:
-    """Refuse to claim anything that would look like canonical T1 evidence."""
+    """Refuse to claim anything that would look like canonical T1 evidence.
+
+    Both halves matter. The attempt id is checked because a canonical *name*
+    beside synthetic output is misleading evidence; the run path is checked
+    because the canonical run directory is itself claim-bearing, and creating
+    it consumes the one canonical attempt whatever the directory is called.
+    """
     if (
         config.run_class == RUN_CLASS_CANONICAL
         and not T1_EXECUTION_SPECIFICATION_AUTHORIZED
     ):
         raise T1ExecutionError(
-            "A canonical T1 development run requires an authorized T1 execution "
-            "specification, and none exists."
+            f"A canonical T1 development run is not available. The frozen "
+            f"execution specification {T1_EXECUTION_SPEC_NAME} exists and is "
+            "merged, but the canonical development harness it specifies has not "
+            "been implemented, and scientific execution is not authorized. Use "
+            "the harness verification run class."
+        )
+    if canonical_namespace_would_be_materialised(config.run_root, config.attempt_id):
+        raise T1ExecutionError(
+            f"Claiming {config.attempt_id!r} under {config.run_root} would create "
+            f"the canonical T1 run root {CANONICAL_RUN_ROOT}. That directory is "
+            "itself claim-bearing: a canonical run directory existing in any "
+            "state consumes the one canonical attempt, and consuming it with "
+            "synthetic output would be unrecoverable. Choose a run root outside "
+            "the canonical namespace."
         )
     lowered = str(config.attempt_id).lower()
     for reserved in CANONICAL_RESERVED_PREFIXES:
-        if lowered.startswith(reserved):
+        if lowered.startswith(reserved.lower()):
             raise T1ExecutionError(
                 f"Attempt id {config.attempt_id!r} is reserved for the canonical T1 "
                 f"development attempt ({reserved!r}...). A harness verification run "
-                "may not occupy that name: a canonical run directory existing in any "
-                "state consumes the attempt, and consuming it with synthetic output "
-                "would be unrecoverable."
+                "may not occupy that name: canonical evidence must never be "
+                "confusable with synthetic output."
             )
 
 
@@ -205,6 +265,14 @@ def build_run_manifest(
         "protocol": {
             "name": T1_PROTOCOL_NAME,
             "document_sha256": T1_PROTOCOL_SHA256,
+        },
+        "execution_specification": {
+            "name": T1_EXECUTION_SPEC_NAME,
+            "document_sha256": T1_EXECUTION_SPEC_SHA256,
+            "canonical_experiment_identity": T1_EXPERIMENT_IDENTITY,
+            "canonical_attempt_id": T1_DEVELOPMENT_ATTEMPT_ID,
+            "canonical_run_root": str(T1_RUN_ROOT_RELATIVE),
+            "canonical_namespace_claimed_by_this_run": False,
         },
         "git": {
             "git_sha": git["git_sha"],

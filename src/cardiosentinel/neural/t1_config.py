@@ -34,6 +34,10 @@ from typing import Any, Final
 import yaml
 
 from cardiosentinel.neural.integrity import canonical_sha256
+from cardiosentinel.neural.t1_execution_spec import (
+    T1_EXECUTION_SPEC_NAME,
+    T1_EXECUTION_SPEC_SHA256,
+)
 from cardiosentinel.neural.t1_protocol import (
     Q_EVENT,
     Q_WATCH,
@@ -68,9 +72,24 @@ THRESHOLD_SOURCES: Final = (THRESHOLD_SOURCE_DERIVED, THRESHOLD_SOURCE_LITERAL)
 
 REFRACTORY_SCOPE: Final = "alert_emission_only"
 
-# The canonical T1 development attempt requires its own authorization, which
-# does not exist. The harness refuses to construct one rather than leaving the
-# refusal to a reviewer's memory.
+# The frozen execution specification EXISTS and is merged. What does not exist
+# is the canonical development harness it specifies, and separately, an
+# authorization to run science.
+#
+# These are three different facts and conflating them is how a gate opens by
+# accident:
+#
+#   1. the specification document exists                     -> True
+#   2. the canonical development harness is implemented      -> False
+#   3. canonical scientific execution is authorized          -> False
+#
+# Only (3) gates execution. It is a deliberate constant rather than a derived
+# check, because the existence of a module is not permission to run it.
+T1_EXECUTION_SPECIFICATION_EXISTS: Final = True
+T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE: Final = (
+    "cardiosentinel.neural.t1_development_run"
+)
+T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS: Final = False
 T1_EXECUTION_SPECIFICATION_AUTHORIZED: Final = False
 
 _SECTIONS: Final = (
@@ -328,11 +347,14 @@ def _require_canonical_agreement(
     """A canonical run must agree with the frozen protocol on every frozen value."""
     if not T1_EXECUTION_SPECIFICATION_AUTHORIZED:
         raise T1ConfigError(
-            f"run.run_class {RUN_CLASS_CANONICAL!r} needs an authorized T1 execution "
-            "specification, and none exists. The T1 protocol is frozen and merged, "
-            "but the execution specification is a separate human authorization that "
-            "has not been given. Use "
-            f"{RUN_CLASS_HARNESS!r} for synthetic and integration runs."
+            f"run.run_class {RUN_CLASS_CANONICAL!r} is not available. The frozen "
+            f"execution specification {T1_EXECUTION_SPEC_NAME} exists and is merged "
+            f"(digest {T1_EXECUTION_SPEC_SHA256}), but the canonical development "
+            f"harness it specifies -- {T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE} -- "
+            "has not been implemented, and canonical scientific execution has not "
+            "been authorized. A merged specification is a contract, not a "
+            f"permission. Use {RUN_CLASS_HARNESS!r} for synthetic and integration "
+            "runs."
         )
     frozen = {
         "stream.sampling_frequency_hz": (
