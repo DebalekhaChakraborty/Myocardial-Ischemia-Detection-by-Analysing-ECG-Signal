@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -25,34 +27,40 @@ from cardiosentinel.neural.t1_execution_spec import T1ExecutionSpecError
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
-# The executable AST of t1_protocol.py at the specification's starting master,
-# 9fa7e88ee648a71e397516ccce210dcf0f06c409, with docstrings stripped. The §N
-# comment repair must not move this digest by a single bit.
-T1_PROTOCOL_BASE_AST_SHA256 = (
-    "9e67ccae93b7a3daf856e0e0a96f63739801abaf65c5d89775a035e54d1a4b8d"
+# t1_protocol.py at the specification's starting master,
+# 9fa7e88ee648a71e397516ccce210dcf0f06c409, digested with every COMMENT token
+# removed and every line right-stripped. The §N comment repair must not move
+# this digest by a single bit.
+#
+# This is deliberately NOT a digest of `ast.dump` output. `ast.dump` serialises
+# internal node fields, which change between interpreter versions -- 3.12 added
+# `type_params` to function and class nodes, for one -- so an `ast.dump` digest
+# binds the file AND the interpreter that read it, and fails the moment CI runs
+# a different Python than the author did. Removing comment tokens from the
+# source text is a property of the file alone.
+T1_PROTOCOL_COMMENT_STRIPPED_SHA256 = (
+    "66548c4ced7513ccbf83781417e5cd23fd3293f49fa0079873834f3c4d6ec17c"
 )
 
 
-def _strip_docstrings(tree: ast.AST) -> ast.AST:
-    for node in ast.walk(tree):
-        if isinstance(
-            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
-            body = node.body
-            if (
-                body
-                and isinstance(body[0], ast.Expr)
-                and isinstance(body[0].value, ast.Constant)
-                and isinstance(body[0].value.value, str)
-            ):
-                node.body = body[1:] or [ast.Pass()]
-    return tree
+def _comment_stripped_digest(path: Path) -> str:
+    """Digest the source with every comment removed, interpreter-independently.
 
-
-def _executable_ast_digest(path: Path) -> str:
-    tree = _strip_docstrings(ast.parse(path.read_text()))
-    dump = ast.dump(tree, annotate_fields=True, include_attributes=False)
-    return hashlib.sha256(dump.encode()).hexdigest()
+    Comment spans come from `tokenize`, so a string that merely looks like a
+    comment is untouched. Lines are right-stripped afterwards, because deleting
+    a trailing comment leaves the whitespace that preceded it.
+    """
+    source = path.read_text()
+    spans: dict[int, list[tuple[int, int]]] = {}
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.COMMENT:
+            spans.setdefault(token.start[0], []).append((token.start[1], token.end[1]))
+    stripped = []
+    for number, line in enumerate(source.splitlines(), start=1):
+        for start, end in sorted(spans.get(number, []), reverse=True):
+            line = line[:start] + line[end:]
+        stripped.append(line.rstrip())
+    return hashlib.sha256("\n".join(stripped).encode()).hexdigest()
 
 
 def _module_calls(module) -> set[str]:
@@ -527,13 +535,35 @@ def test_40c_the_planned_artifact_names_are_frozen():
 # ---------------------------------------------------------------------------
 
 
-def test_the_protocol_comment_repair_left_the_executable_ast_unchanged():
-    """Comments and docstrings may differ; executable structure may not."""
-    digest = _executable_ast_digest(Path(P.__file__))
-    assert digest == T1_PROTOCOL_BASE_AST_SHA256, (
-        "the executable AST of t1_protocol.py moved; the repair was supposed to "
-        "touch comments only"
+def test_the_protocol_comment_repair_changed_nothing_but_comments():
+    """Comments may differ; everything else may not.
+
+    Stronger than an AST comparison in one respect: docstrings are string
+    expressions, not comment tokens, so they are inside this digest too. The
+    repair may not touch one.
+    """
+    digest = _comment_stripped_digest(Path(P.__file__))
+    assert digest == T1_PROTOCOL_COMMENT_STRIPPED_SHA256, (
+        "t1_protocol.py changed outside its comments; the repair was supposed to "
+        "touch comment text only"
     )
+
+
+def test_the_protocol_still_parses_to_a_single_consistent_module():
+    """A same-interpreter sanity check that costs nothing and catches a lot."""
+    tree = ast.parse(Path(P.__file__).read_text())
+    functions = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+    for required in (
+        "validate_t1_protocol_document",
+        "t1_folds",
+        "candidate_policies",
+        "empirical_order_statistic",
+        "next_state",
+        "group_reference_episodes",
+        "match_runs_to_episodes",
+        "policy_sort_key",
+    ):
+        assert required in functions, required
 
 
 def test_the_repaired_section_references_resolve_against_the_frozen_document():
