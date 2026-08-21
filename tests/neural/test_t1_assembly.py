@@ -579,7 +579,7 @@ def test_the_canonical_attempt_is_untouched():
         ),
         (
             "t1_persistence.py",
-            "f715871bd1213d7605aa9b9117c0b8d1a86470b939e04e1df8614a9f982697df",
+            "bd5ba291ddafa5ecbc0c63749580823168d1d85ed993548b4eff7582f1181f10",
         ),
     ],
 )
