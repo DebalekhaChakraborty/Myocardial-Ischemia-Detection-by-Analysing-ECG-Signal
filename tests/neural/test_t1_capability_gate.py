@@ -27,6 +27,7 @@ from cardiosentinel.neural import t1_development_run as R
 from cardiosentinel.neural import t1_evidence_store as STORE
 from cardiosentinel.neural import t1_execution_spec as SPEC
 from cardiosentinel.neural import t1_fold_evaluation as E
+from cardiosentinel.neural import t1_fold_evaluator as V
 from cardiosentinel.neural import t1_persistence as PERSIST
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -106,8 +107,11 @@ def subject_of_record(record):
     return "ltstdb:s2004"
 
 
-def evaluate_fold(fold, authority):
-    return {"artifact": {}}
+class _Source:
+    """Minimal target source: the protocol shape and nothing wider."""
+
+    def read_subject_targets(self, subject_id, *, partition):  # pragma: no cover
+        raise AssertionError("no test in this module opens targets")
 
 
 def assemble_two(*, oof_columns=None, columns=None, selections=None):
@@ -125,8 +129,10 @@ def _complete(**overrides) -> D.T1ExecutionCollaborators:
         "t2_identity": Path("/nonexistent/t2_outer_row_identity.npz"),
         "t2_selected_scores": Path("/nonexistent/t2_selected_scores.npz"),
         "calibrators": {"ltstdb:s2004": object()},
+        "target_source": _Source(),
         "subject_of_record": _attested("subject_of_record", subject_of_record),
-        "evaluate_fold": _attested("evaluate_fold", evaluate_fold),
+        # The real evaluator: a complete graph is one the gate would let run.
+        "evaluate_fold": V.T1CanonicalFoldEvaluator(),
         "assemble_oof_state_columns": _attested(
             "assemble_oof_state_columns", assemble_two
         ),
@@ -206,9 +212,7 @@ def test_a_refusal_names_the_stage_that_would_have_failed():
 def test_an_undeclared_collaborator_is_refused_rather_than_assumed():
     """Silence is a refusal. The allowlist is the point."""
     with pytest.raises(G.T1CapabilityError, match="declares no execution capability"):
-        G.require_executable_capability(
-            _complete(evaluate_fold=lambda fold, authority: {"artifact": {}})
-        )
+        G.require_executable_capability(_complete(assemble_challenge=lambda **k: {}))
 
 
 def test_an_attestation_cannot_be_moved_to_another_role():
@@ -311,7 +315,8 @@ def test_the_call_contract_matches_the_drivers_actual_call_sites():
     harness = Path(R.__file__).read_text(encoding="utf-8")
     assert "subject_of_record=collaborators.subject_of_record" in driver
     assert "evaluate_fold=collaborators.evaluate_fold" in driver
-    assert "evaluate_fold(fold, authority)" in harness
+    assert "evaluate_fold(\n" in harness
+    assert "evaluate_fold.evaluate_held_out(" in harness
     assert "subject_of_record(str(record))" in harness
     for role, (_, keywords) in G.CAPABILITY_CALL_CONTRACT.items():
         for keyword in keywords:

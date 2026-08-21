@@ -446,6 +446,10 @@ class T1DevelopmentRun:
     claimed: PERSIST.T1ClaimedRun | None = None
     upstream: dict[str, Any] = field(default_factory=dict)
     fold_state: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # One held-out evaluation per fold, keyed by fold index. Populated only
+    # after that fold's barrier opened, so its presence is itself evidence the
+    # promotion happened first.
+    held_out_traces: dict[int, dict[str, Any]] = field(default_factory=dict)
     state: dict[str, Any] = field(default_factory=dict)
 
     # -- stages 1-9: pre-claim ------------------------------------------------
@@ -661,13 +665,38 @@ class T1DevelopmentRun:
 
     # -- stage 14: the folds --------------------------------------------------
 
-    def stage_folds(self, *, evaluate_fold: Any) -> list[dict[str, Any]]:
+    def stage_folds(
+        self,
+        *,
+        evaluate_fold: Any,
+        columns: dict[str, np.ndarray],
+        target_source: Any,
+    ) -> list[dict[str, Any]]:
         """Twelve leave-one-subject-out folds, each behind its own label barrier.
 
-        ``evaluate_fold`` supplies the fold's FIT background population and its
-        held-out evaluation, so this method owns the choreography and the
-        barrier while the data access stays where it can be audited.
+        ``evaluate_fold`` supplies the fold's FIT selection and its held-out
+        evaluation, so this method owns the choreography and the barrier while
+        the data access stays where it can be audited.
+
+        The two phases are separated by the promotion, and that separation is
+        the barrier. Selection runs against a FIT-scoped authority, which
+        refuses the held-out subject outright. Only once the fold's selection
+        artifact is promoted and re-read with a verified digest can
+        `held_out_evaluation_authority` be constructed at all, so the policy is
+        fixed in a durable artifact before the held-out subject's targets are
+        reachable by anything.
+
+        The evaluator receives the stage 12 columns rather than a path: it
+        opens no evidence of its own, and the label-blind timeline this run
+        already assembled is the only one it may reason over.
         """
+        # Local import: `t1_fold_authority` imports this module, so binding it
+        # at module scope would close a cycle.
+        from cardiosentinel.neural.t1_fold_authority import (
+            fit_evaluation_authority,
+            held_out_evaluation_authority,
+        )
+
         claimed = self._require_claimed()
         selections: list[dict[str, Any]] = []
         for stage in (
@@ -686,7 +715,17 @@ class T1DevelopmentRun:
         for fold in t1_folds():
             authority = fit_authority(fold.fit_subjects)
             authority.require_authorized(fold.fit_subjects[0])
-            selection = evaluate_fold(fold, authority)
+            selection = evaluate_fold(
+                fold,
+                fit_evaluation_authority(fold, source=target_source),
+                columns,
+            )
+            if selection["artifact"].get("held_out_labels_opened") is not False:
+                raise T1DevelopmentError(
+                    f"Fold {fold.fold_index} selection does not attest that the "
+                    "held-out subject stayed closed. Selection happens before "
+                    "the barrier and must say so."
+                )
 
             digest = PERSIST.promote_fold_selection(
                 claimed, fold.fold_index, selection["artifact"]
@@ -701,10 +740,27 @@ class T1DevelopmentRun:
 
             held_out = held_out_authority(fold.held_out_subject, state)
             held_out.require_authorized(fold.held_out_subject)
-            require_single_held_out_policy_run(1)
+            evaluated = evaluate_fold.evaluate_held_out(
+                fold,
+                held_out_evaluation_authority(fold, state, source=target_source),
+                columns,
+                selection["artifact"],
+            )
+            require_single_held_out_policy_run(int(evaluated["policy_runs"]))
+            if str(evaluated["selected_policy_id"]) != str(
+                selection["artifact"]["selected_policy_id"]
+            ):
+                raise T1DevelopmentError(
+                    f"Fold {fold.fold_index} evaluated "
+                    f"{evaluated['selected_policy_id']!r} on the held-out "
+                    "subject after promoting "
+                    f"{selection['artifact']['selected_policy_id']!r}. The "
+                    "promoted artifact is the decision, not a description of it."
+                )
             self.state.setdefault("held_out_labels_opened_for_folds", []).append(
                 fold.fold_index
             )
+            self.held_out_traces[fold.fold_index] = evaluated
             selections.append({**selection["artifact"], "selection_sha256": digest})
 
         if len(selections) != T1_FOLD_COUNT:
