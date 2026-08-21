@@ -24,7 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from _attempt_guard import assert_attempt_unconsumed
+from _attempt_guard import ATTEMPT_PRESENT, assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_composition as C
@@ -359,8 +359,14 @@ def test_the_canonical_attempt_was_not_consumed_by_these_tests():
     between any caller and a second attempt.
     """
     assert_attempt_unconsumed()
-    with pytest.raises(PERSIST.T1PersistenceError, match="already claimed"):
-        PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+    if ATTEMPT_PRESENT:
+        with pytest.raises(PERSIST.T1PersistenceError, match="already claimed"):
+            PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+    else:
+        # Gitignored and local-only: CI has no copy of the consumed attempt.
+        assert PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)[
+            "existing_run_directory"
+        ] is False
 
 
 def test_an_existing_attempt_refuses_rather_than_re_rooting(tmp_path):

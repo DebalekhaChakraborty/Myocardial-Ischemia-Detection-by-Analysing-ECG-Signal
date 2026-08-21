@@ -70,9 +70,19 @@ def test_the_guard_watches_the_continuation_namespace_too(monkeypatch, tmp_path)
 
 
 def test_the_fingerprint_covers_both_namespaces():
+    """The fingerprint reports both namespaces, whichever exists here.
+
+    The consumed attempt is gitignored and local-only: present on the frozen
+    interpreter where the science ran, absent on CI. Asserting it is present
+    would be this module's own mistake facing the other way, so the assertion
+    is on the shape of the answer and on the namespace that must be empty
+    everywhere.
+    """
     canonical, continuation = GUARD.attempt_fingerprint()
-    assert canonical[0] is True, "the consumed canonical attempt is missing from disk"
+    assert canonical[0] is GUARD.ATTEMPT_PRESENT
+    assert isinstance(canonical[1], tuple)
     assert continuation[0] is False, "a continuation run directory exists"
+    assert continuation[1] == ()
 
 
 def test_the_guard_is_applied_to_every_test_in_this_package():

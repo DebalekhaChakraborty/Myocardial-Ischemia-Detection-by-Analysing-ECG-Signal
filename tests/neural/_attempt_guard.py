@@ -87,3 +87,12 @@ def assert_attempt_unconsumed() -> None:
         "a T1 continuation run directory changed during this test.\n"
         f"  before: {continuation_before}\n  after:  {continuation_now}"
     )
+
+
+# Whether the consumed canonical attempt is on this disk at all. It is
+# gitignored and local-only: present on the frozen scientific interpreter where
+# the science ran, absent on CI. Tests whose expected behaviour differs between
+# those two worlds branch on this rather than assuming either one -- assuming
+# the attempt is absent is the mistake this module was written to fix, and
+# assuming it is present is the same mistake facing the other way.
+ATTEMPT_PRESENT: bool = CANONICAL_ATTEMPT.exists()

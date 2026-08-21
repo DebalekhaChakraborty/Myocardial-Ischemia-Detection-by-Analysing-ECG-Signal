@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from _attempt_guard import assert_attempt_unconsumed
+from _attempt_guard import ATTEMPT_PRESENT, assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_development_run as R
 from cardiosentinel.neural import t1_evidence_store as STORE
@@ -96,6 +96,17 @@ def test_the_canonical_attempt_cannot_be_claimed_twice():
     suite and what the refusal below proves for the mechanism.
     """
     assert_attempt_unconsumed()
+    if not ATTEMPT_PRESENT:
+        # CI has no copy of the run directory -- it is gitignored and
+        # local-only -- so there the guard's correct answer is the census.
+        assert PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT) == {
+            "attempt_id": SPEC.T1_DEVELOPMENT_ATTEMPT_ID,
+            "existing_run_directory": False,
+            "automatic_retry_permitted": False,
+            "automatic_alternate_name_permitted": False,
+            "recovery_identity_predeclared": False,
+        }
+        return
     with pytest.raises(PERSIST.T1PersistenceError) as caught:
         PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
     message = str(caught.value).lower()
