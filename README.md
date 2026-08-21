@@ -60,10 +60,18 @@ training-sampling policy, and metrics protocol. Phase 3B-1 is complete: each
 frozen B0--B3 global classical baseline received one sealed-test evaluation,
 with no test-guided tuning. The compact evidence and limitations are recorded in
 [`docs/PHASE3B1_CLASSICAL_BASELINE_RESULTS.md`](docs/PHASE3B1_CLASSICAL_BASELINE_RESULTS.md).
-The prospective B4 compact raw-waveform neural baseline is frozen in
-[`docs/B4_PROTOCOL_V1.md`](docs/B4_PROTOCOL_V1.md). Its implementation and
-lossless train/validation waveform pipeline are complete, while the full B4
-scientific training and test evaluation have not yet been run.
+The B4 neural-architecture selection, frozen in
+[`docs/B4_PROTOCOL_V1.md`](docs/B4_PROTOCOL_V1.md), is complete: three
+candidates (compact CNN, CNN-Transformer, CNN-SSM) were trained and compared
+on validation, and B4-B (CNN-Transformer) is the selected official model
+(see [`docs/B4_GLOBAL_ENCODER_SELECTION_V1.md`](docs/B4_GLOBAL_ENCODER_SELECTION_V1.md)).
+Physiology fusion, patient-adaptive memory, contamination-safe memory
+updates, and calibration with selective routing are each complete and frozen;
+longitudinal temporal modeling is trained and one-shot outer-validated. A
+causal episode-state layer has a complete canonical execution harness with no
+attempts executed yet. See
+[`docs/CURRENT_STATE.md`](docs/CURRENT_STATE.md) for the current experiment
+ladder, open work, and known risks.
 
 Data commands require the optional `data` dependency group and never download
 data during import or tests:
