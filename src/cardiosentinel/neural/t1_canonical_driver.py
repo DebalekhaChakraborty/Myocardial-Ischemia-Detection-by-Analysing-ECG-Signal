@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Sequence
 
+from cardiosentinel.neural import t1_persistence as PERSIST
 from cardiosentinel.neural.t1_capability_gate import (
     CAPABILITY_STAGE_BINDINGS,
     capability_report,
@@ -343,9 +344,14 @@ class T1CanonicalDevelopmentExecutor:
     threads each result into the next, and records a deterministic receipt per
     step. There is exactly one path through `execute`: no retry, no recovery,
     no resume, no alternate run root, no seed, fold or subject override and no
-    TEST option. A failure at any stage propagates unchanged -- the driver has
-    no exception handler, because swallowing a refusal is how a consumed
-    attempt turns into a second one.
+    TEST option.
+
+    A failure at any stage propagates unchanged. The handler around the staged
+    body exists to write evidence, never to decide: it persists the failure
+    receipt the specification requires, lets the status name the failing stage,
+    and re-raises the original exception. It catches nothing it does not
+    immediately re-raise, retries nothing, and repairs nothing -- an attempt
+    consumed by a failure stays consumed, and the receipt says so.
     """
 
     run: T1DevelopmentRun
@@ -454,113 +460,173 @@ class T1CanonicalDevelopmentExecutor:
         would spend the single canonical attempt before discovering it cannot
         complete. Both refusals happen before anything is resolved, so today
         this function never reaches a filesystem, a row or a label.
+
+        Both gates sit outside the handler on purpose. A refusal there predates
+        the claim, so there is no run directory to write a receipt into and
+        nothing to record; only a failure after the claim leaves evidence worth
+        keeping.
         """
         require_canonical_execution_capability()
         require_executable_capability(collaborators)
         self.validate_artifact_plan()
+        try:
+            # -- stages 1-9: pre-claim verification ------------------------------
+            preflight = self.run.stage_preflight()
+            self._record(STAGE_PROVE_ATTEMPT_ABSENT, "pre_claim_verification_passed")
 
-        # -- stages 1-9: pre-claim verification ------------------------------
-        preflight = self.run.stage_preflight()
-        self._record(STAGE_PROVE_ATTEMPT_ABSENT, "pre_claim_verification_passed")
+            # -- stage 10: the claim; the attempt is spent from here -------------
+            claimed = self.run.stage_claim(preflight)
+            self._record(STAGE_CLAIM, str(claimed.run_dir))
 
-        # -- stage 10: the claim; the attempt is spent from here -------------
-        claimed = self.run.stage_claim(preflight)
-        self._record(STAGE_CLAIM, str(claimed.run_dir))
-
-        # -- stage 11: upstream identity must not have moved -----------------
-        self.run.stage_verify_upstream()
-        self._record(STAGE_VERIFY_UPSTREAM, "upstream_identity_stable")
-
-        # -- stages 12-13: the label-blind timeline --------------------------
-        columns = self.run.stage_assemble_label_blind(
-            m2_row_evidence=collaborators.m2_row_evidence,
-            t2_identity=collaborators.t2_identity,
-            t2_scores=collaborators.t2_selected_scores,
-            calibrators=collaborators.calibrators,
-            subject_of_record=collaborators.subject_of_record,
-        )
-        self._record(STAGE_ASSEMBLE_LABEL_BLIND, "label_blind_timeline_assembled")
-
-        input_manifest = self.run.stage_promote_input_evidence(columns)
-        self._record(
-            STAGE_PROMOTE_INPUT_EVIDENCE, str(input_manifest["content_sha256"])
-        )
-
-        # -- stages 14-22: twelve folds behind twelve label barriers ---------
-        selections = self.run.stage_folds(
-            evaluate_fold=collaborators.evaluate_fold,
-            columns=columns,
-            target_source=collaborators.target_source,
-        )
-        self._record(STAGE_FOLD_PROMOTE_HELD_OUT, f"folds_completed={len(selections)}")
-
-        # -- stages 23-24: cross-fitted evidence and its result --------------
-        # Each fold contributed the trace for its own held-out subject, so the
-        # twelve traces tile the timeline. Widening is not computing: the
-        # values arrive from the held-out evaluations unchanged.
-        traced_columns = widen_with_held_out_traces(columns, self.run.held_out_traces)
-        oof_columns = collaborators.assemble_oof_state_columns(
-            columns=traced_columns, selections=selections
-        )
-        oof_manifest = self.run.stage_oof_state_evidence(
-            oof_columns,
-            fold_selection_sha256=_fold_selection_digest(selections),
-        )
-        self._record(STAGE_OOF_STATE_EVIDENCE, str(oof_manifest["content_sha256"]))
-
-        oof_digest = self.run.stage_oof_result(
-            collaborators.assemble_oof_result(
-                oof_columns=oof_columns, selections=selections
+            # -- stage 11: upstream identity must not have moved -----------------
+            self.run.stage_verify_upstream()
+            self._record(STAGE_VERIFY_UPSTREAM, "upstream_identity_stable")
+            self._checkpoint(
+                PERSIST.STATUS_PREFLIGHT_COMPLETE,
+                STAGE_VERIFY_UPSTREAM,
             )
-        )
-        self._record(STAGE_OOF_RESULT, oof_digest)
 
-        # -- stage 25: subject evidence and the frozen bootstrap -------------
-        subject_digest, bootstrap_digest = (
-            self.run.stage_subject_evidence_and_bootstrap(
-                subject_evidence=collaborators.assemble_subject_evidence(
-                    oof_columns=oof_columns
-                ),
-                bootstrap=collaborators.assemble_bootstrap(oof_columns=oof_columns),
+            # -- stages 12-13: the label-blind timeline --------------------------
+            columns = self.run.stage_assemble_label_blind(
+                m2_row_evidence=collaborators.m2_row_evidence,
+                t2_identity=collaborators.t2_identity,
+                t2_scores=collaborators.t2_selected_scores,
+                calibrators=collaborators.calibrators,
+                subject_of_record=collaborators.subject_of_record,
             )
-        )
-        self._record(STAGE_BOOTSTRAP, f"{subject_digest}:{bootstrap_digest}")
+            self._record(STAGE_ASSEMBLE_LABEL_BLIND, "label_blind_timeline_assembled")
 
-        # -- stage 26: challenge annotation, joined after the state trace ----
-        challenge_digest = self.run.stage_challenge(
-            collaborators.assemble_challenge(oof_columns=oof_columns)
-        )
-        self._record(STAGE_CHALLENGE, challenge_digest)
-
-        # -- stage 27: deployment configuration, never development evidence --
-        configuration_digest = self.run.stage_final_configuration(
-            collaborators.assemble_final_configuration(
-                oof_columns=oof_columns, selections=selections
+            input_manifest = self.run.stage_promote_input_evidence(columns)
+            self._record(
+                STAGE_PROMOTE_INPUT_EVIDENCE, str(input_manifest["content_sha256"])
             )
+            self._checkpoint(
+                PERSIST.STATUS_LABEL_BLIND_EVIDENCE_COMPLETE,
+                STAGE_PROMOTE_INPUT_EVIDENCE,
+            )
+
+            # -- stages 14-22: twelve folds behind twelve label barriers ---------
+            selections = self.run.stage_folds(
+                evaluate_fold=collaborators.evaluate_fold,
+                columns=columns,
+                target_source=collaborators.target_source,
+            )
+            self._record(
+                STAGE_FOLD_PROMOTE_HELD_OUT, f"folds_completed={len(selections)}"
+            )
+            self._checkpoint(
+                PERSIST.STATUS_FOLDS_COMPLETE,
+                STAGE_FOLD_PROMOTE_HELD_OUT,
+            )
+
+            # -- stages 23-24: cross-fitted evidence and its result --------------
+            # Each fold contributed the trace for its own held-out subject, so the
+            # twelve traces tile the timeline. Widening is not computing: the
+            # values arrive from the held-out evaluations unchanged.
+            traced_columns = widen_with_held_out_traces(
+                columns, self.run.held_out_traces
+            )
+            oof_columns = collaborators.assemble_oof_state_columns(
+                columns=traced_columns, selections=selections
+            )
+            oof_manifest = self.run.stage_oof_state_evidence(
+                oof_columns,
+                fold_selection_sha256=_fold_selection_digest(selections),
+            )
+            self._record(STAGE_OOF_STATE_EVIDENCE, str(oof_manifest["content_sha256"]))
+            self._checkpoint(
+                PERSIST.STATUS_OOF_STATE_COMPLETE,
+                STAGE_OOF_STATE_EVIDENCE,
+            )
+
+            oof_digest = self.run.stage_oof_result(
+                collaborators.assemble_oof_result(
+                    oof_columns=oof_columns, selections=selections
+                )
+            )
+            self._record(STAGE_OOF_RESULT, oof_digest)
+
+            # -- stage 25: subject evidence and the frozen bootstrap -------------
+            subject_digest, bootstrap_digest = (
+                self.run.stage_subject_evidence_and_bootstrap(
+                    subject_evidence=collaborators.assemble_subject_evidence(
+                        oof_columns=oof_columns
+                    ),
+                    bootstrap=collaborators.assemble_bootstrap(oof_columns=oof_columns),
+                )
+            )
+            self._record(STAGE_BOOTSTRAP, f"{subject_digest}:{bootstrap_digest}")
+
+            # -- stage 26: challenge annotation, joined after the state trace ----
+            challenge_digest = self.run.stage_challenge(
+                collaborators.assemble_challenge(oof_columns=oof_columns)
+            )
+            self._record(STAGE_CHALLENGE, challenge_digest)
+
+            # -- stage 27: deployment configuration, never development evidence --
+            configuration_digest = self.run.stage_final_configuration(
+                collaborators.assemble_final_configuration(
+                    oof_columns=oof_columns, selections=selections
+                )
+            )
+            self._record(STAGE_FINAL_CONFIGURATION, configuration_digest)
+
+            # -- stages 28-29: lock and completion -------------------------------
+            lock_digest = self.run.stage_experiment_lock()
+            self._record(STAGE_EXPERIMENT_LOCK, lock_digest)
+
+            completion = self.run.stage_completion()
+            self._record(STAGE_COMPLETION, "run_complete")
+
+            return {
+                "driver": DRIVER_NAME,
+                "stages_entered": list(self.run.stages.entered),
+                "stage_count": len(CANONICAL_EXECUTION_PLAN),
+                "receipts": list(self.receipts),
+                "input_evidence_sha256": input_manifest["content_sha256"],
+                "oof_state_evidence_sha256": oof_manifest["content_sha256"],
+                "oof_result_sha256": oof_digest,
+                "experiment_lock_sha256": lock_digest,
+                "completion": completion,
+                "retry_performed": False,
+                "recovery_performed": False,
+                "test_accessed": False,
+            }
+        except BaseException as error:
+            # Diagnostic only, and only after the claim. The receipt is
+            # written, the status is updated to name the failing stage, and
+            # the original exception continues upward unchanged. Nothing is
+            # retried, resumed, repaired or made to look clean, and a
+            # consumed attempt stays consumed.
+            self._receipt_on_failure(error)
+            raise
+
+    def _receipt_on_failure(self, error: BaseException) -> None:
+        """Persist the diagnostic receipt without ever masking the failure.
+
+        A receipt that cannot be written is a lost diagnostic. An exception
+        raised while writing one would be a lost *failure*, which is worse, so
+        the original error is annotated rather than replaced.
+        """
+        try:
+            self.run.failure_receipt(error)
+        except BaseException as receipt_error:  # pragma: no cover - disk state
+            error.add_note(
+                "The T1 failure receipt could not be written: "
+                f"{type(receipt_error).__name__}: {receipt_error}"
+            )
+
+    def _checkpoint(self, status: str, stage: str) -> None:
+        """Operational progress only. Never a scientific value.
+
+        A status written once at the claim reports a state that stops being
+        true the moment the next stage starts. These checkpoints keep the
+        operational file honest about how far a run got, and carry no count,
+        digest, threshold or row.
+        """
+        PERSIST.write_status_checkpoint(
+            self.run.claimed, status, stage=stage, progress=dict(self.run.state)
         )
-        self._record(STAGE_FINAL_CONFIGURATION, configuration_digest)
-
-        # -- stages 28-29: lock and completion -------------------------------
-        lock_digest = self.run.stage_experiment_lock()
-        self._record(STAGE_EXPERIMENT_LOCK, lock_digest)
-
-        completion = self.run.stage_completion()
-        self._record(STAGE_COMPLETION, "run_complete")
-
-        return {
-            "driver": DRIVER_NAME,
-            "stages_entered": list(self.run.stages.entered),
-            "stage_count": len(CANONICAL_EXECUTION_PLAN),
-            "receipts": list(self.receipts),
-            "input_evidence_sha256": input_manifest["content_sha256"],
-            "oof_state_evidence_sha256": oof_manifest["content_sha256"],
-            "oof_result_sha256": oof_digest,
-            "experiment_lock_sha256": lock_digest,
-            "completion": completion,
-            "retry_performed": False,
-            "recovery_performed": False,
-            "test_accessed": False,
-        }
 
     def _record(self, stage: str, detail: str) -> None:
         self.receipts.append(

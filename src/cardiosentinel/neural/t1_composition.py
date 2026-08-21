@@ -244,6 +244,17 @@ class _StageReached:
         return self._stage in tuple(self._run.stages.entered)
 
 
+# The evaluator's counter names, mapped to the names the assembly layer reads.
+# Module scope and explicit, so the two vocabularies are visible to a reader of
+# this file rather than discoverable only by running the twenty-fourth stage.
+PRIMARY_CONFUSION_KEYS: Final = {
+    "tp": "true_positive",
+    "fp": "false_positive",
+    "tn": "true_negative",
+    "fn": "false_negative",
+}
+
+
 def _pooled_episode_evidence(run: T1DevelopmentRun) -> dict[str, int]:
     """Sum the per-fold episode counts the evaluator already produced."""
     totals = {
@@ -259,11 +270,38 @@ def _pooled_episode_evidence(run: T1DevelopmentRun) -> dict[str, int]:
 
 
 def _pooled_confusion(run: T1DevelopmentRun) -> dict[str, int]:
-    totals = {"tp": 0, "fp": 0, "tn": 0, "fn": 0}
-    for trace in run.held_out_traces.values():
+    """Pool the per-fold PRIMARY confusion and translate it once, here.
+
+    Two vocabularies exist and both are correct in their own layer. The fold
+    evaluator counts with `tp/fp/tn/fn`, which is what a counter is called next
+    to the loop that increments it; the assembly layer reads
+    `true_positive/...`, which is what a reported margin is called in an
+    evidence document. This function is the single place they meet, so the
+    translation belongs here, written out rather than implied.
+
+    A missing count is a refusal, never a zero. A silently defaulted margin is
+    an evidence value that nothing produced, and the difference between "no
+    true positives" and "the producer stopped supplying true positives" is the
+    difference this layer exists to keep.
+    """
+    totals = dict.fromkeys(PRIMARY_CONFUSION_KEYS, 0)
+    for index, trace in run.held_out_traces.items():
+        confusion = trace["primary_confusion"]
+        missing = [key for key in PRIMARY_CONFUSION_KEYS if key not in confusion]
+        if missing:
+            raise T1CompositionError(
+                f"Fold {index} reported PRIMARY confusion without {missing}. The "
+                f"evaluator supplies {sorted(PRIMARY_CONFUSION_KEYS)} and the "
+                f"assembly layer reads "
+                f"{sorted(PRIMARY_CONFUSION_KEYS.values())}; a count that is "
+                "absent is refused rather than defaulted to zero."
+            )
         for key in totals:
-            totals[key] += int(trace["primary_confusion"].get(key, 0))
-    return totals
+            totals[key] += int(confusion[key])
+    return {
+        reported: totals[counted]
+        for counted, reported in PRIMARY_CONFUSION_KEYS.items()
+    }
 
 
 def _pooled_latency(run: T1DevelopmentRun) -> tuple[float, ...]:

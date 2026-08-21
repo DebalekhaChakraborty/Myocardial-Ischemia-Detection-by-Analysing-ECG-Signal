@@ -43,7 +43,7 @@ FROZEN_SOURCE_DIGESTS = {
         "464ca1607191aa02042a6dcbb8cfeda4d4f3aced1eae2e29ae4b77be8cf6d39c"
     ),
     "t1_persistence.py": (
-        "f715871bd1213d7605aa9b9117c0b8d1a86470b939e04e1df8614a9f982697df"
+        "bd5ba291ddafa5ecbc0c63749580823168d1d85ed993548b4eff7582f1181f10"
     ),
 }
 
@@ -417,17 +417,66 @@ def test_the_artifact_plan_is_the_specifications():
 
 
 def test_the_driver_has_no_retry_or_recovery_path():
+    """No loop, and no handler that can end without re-raising.
+
+    This test used to assert that `execute` contained no handler at all, which
+    was true of the code it was written against and is no longer the property
+    worth holding. The specification requires a post-claim failure to leave a
+    receipt, and writing one means catching the exception that produced it.
+
+    What must never happen is a handler that *ends* -- one that returns,
+    continues, passes or raises something else, any of which turns a consumed
+    attempt into a second one. So the assertion moved from "no handler" to
+    "every handler re-raises the exception it caught", which is the honest
+    version of the same guarantee and would still catch a retry hidden in an
+    except block.
+    """
     execute = next(
         node
         for node in ast.walk(ast.parse(_driver_source()))
         if isinstance(node, ast.FunctionDef) and node.name == "execute"
     )
     loops = [n for n in ast.walk(execute) if isinstance(n, (ast.While, ast.For))]
-    handlers = [
-        n for n in ast.walk(execute) if isinstance(n, (ast.Try, ast.ExceptHandler))
-    ]
     assert loops == [], "the driver loops over stages; a retry could hide there"
-    assert handlers == [], "the driver swallows an exception"
+
+    handlers = [n for n in ast.walk(execute) if isinstance(n, ast.ExceptHandler)]
+    assert handlers, "the post-claim failure receipt needs a handler to be written"
+    for handler in handlers:
+        last = handler.body[-1]
+        assert isinstance(last, ast.Raise), (
+            "an except block in the driver ends without raising; a swallowed "
+            "refusal is how a consumed attempt turns into a second one"
+        )
+        assert last.exc is None, (
+            "the driver raises a new exception instead of re-raising the one "
+            "that failed; the original failure is the evidence"
+        )
+        for node in ast.walk(handler):
+            assert not isinstance(node, (ast.While, ast.For)), (
+                "a loop inside the failure handler could retry the attempt"
+            )
+
+
+def test_the_failure_handler_only_writes_a_receipt():
+    """The handler records; it must not decide, repair or re-enter a stage."""
+    execute = next(
+        node
+        for node in ast.walk(ast.parse(_driver_source()))
+        if isinstance(node, ast.FunctionDef) and node.name == "execute"
+    )
+    for handler in [n for n in ast.walk(execute) if isinstance(n, ast.ExceptHandler)]:
+        called = {
+            node.func.attr
+            for node in ast.walk(handler)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert called == {"_receipt_on_failure"}, (
+            f"the failure handler calls {sorted(called)}; it may only write the "
+            "receipt before re-raising"
+        )
+        assert not any(name.startswith("stage_") for name in called), (
+            "the failure handler re-enters a stage"
+        )
 
 
 def test_the_driver_exposes_no_override_of_any_kind():

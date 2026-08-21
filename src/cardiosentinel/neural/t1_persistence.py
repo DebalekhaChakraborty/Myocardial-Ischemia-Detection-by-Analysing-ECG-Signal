@@ -58,6 +58,31 @@ STATUS_STARTED: Final = "STARTED"
 STATUS_COMPLETE: Final = "COMPLETE"
 STATUS_FAILED: Final = "FAILED_OR_INTERRUPTED"
 
+# Operational checkpoints between the claim and a terminal status. They exist
+# so that an interrupted run says how far it got, which a status written once
+# at the claim cannot: a file reading STARTED ten minutes after the process
+# died reports a state that did not hold.
+#
+# These are operational metadata and nothing else. No count, digest, threshold
+# or per-row value belongs here -- the promoted artifacts are the evidence, and
+# a second place to read a number is a second number to disagree with.
+STATUS_PREFLIGHT_COMPLETE: Final = "PREFLIGHT_COMPLETE"
+STATUS_LABEL_BLIND_EVIDENCE_COMPLETE: Final = "LABEL_BLIND_EVIDENCE_COMPLETE"
+STATUS_FOLDS_COMPLETE: Final = "FOLDS_COMPLETE"
+STATUS_OOF_STATE_COMPLETE: Final = "OOF_STATE_COMPLETE"
+
+STATUS_CHECKPOINTS: Final = (
+    STATUS_PREFLIGHT_COMPLETE,
+    STATUS_LABEL_BLIND_EVIDENCE_COMPLETE,
+    STATUS_FOLDS_COMPLETE,
+    STATUS_OOF_STATE_COMPLETE,
+)
+STATUS_SEQUENCE: Final = (
+    STATUS_STARTED,
+    *STATUS_CHECKPOINTS,
+    STATUS_COMPLETE,
+)
+
 RUN_STATUS_NAME: Final = "T1_RUN_STATUS.json"
 PREFLIGHT_NAME: Final = "T1_PREFLIGHT.json"
 INPUT_LINEAGE_NAME: Final = "T1_INPUT_LINEAGE.json"
@@ -296,6 +321,74 @@ def claim_canonical_run(
     return claimed
 
 
+def read_run_status(claimed: T1ClaimedRun) -> dict[str, Any]:
+    """The status as it currently stands on disk."""
+    path = claimed.run_dir / RUN_STATUS_NAME
+    if not path.is_file():
+        raise T1PersistenceError(f"No run status at {path}.")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_status_checkpoint(
+    claimed: T1ClaimedRun | None,
+    status: str,
+    *,
+    stage: str,
+    progress: dict[str, Any] | None = None,
+) -> Path | None:
+    """Record how far a claimed run has got. Operational metadata only.
+
+    Nothing scientific passes through here. The promoted artifacts are the
+    evidence and a second place to read a count is a second count to disagree
+    with, so a checkpoint carries a status, a stage name, a timestamp and the
+    same progress booleans the claim wrote -- and no metric, digest or row.
+
+    Refuses an unknown status, and refuses to move backwards through the frozen
+    sequence. A checkpoint that regresses means the stages ran out of order,
+    which is a defect worth a refusal rather than a quietly rewritten file.
+    Nothing is deleted or repaired: this file is operational, and it is the one
+    artifact in the run directory that is meant to be rewritten.
+    """
+    if claimed is None:
+        return None
+    if status not in STATUS_SEQUENCE:
+        raise T1PersistenceError(
+            f"{status!r} is not a T1 run status. Known statuses are "
+            f"{list(STATUS_SEQUENCE)}."
+        )
+    existing = read_run_status(claimed)
+    previous = str(existing.get("status", STATUS_STARTED))
+    if previous in STATUS_SEQUENCE and STATUS_SEQUENCE.index(
+        status
+    ) <= STATUS_SEQUENCE.index(previous):
+        raise T1PersistenceError(
+            f"Run status cannot move from {previous!r} to {status!r}. The "
+            "checkpoint sequence is frozen and does not repeat or regress."
+        )
+    updated = {
+        "attempt_id": claimed.attempt_id,
+        "experiment_identity": T1_EXPERIMENT_IDENTITY,
+        "status": status,
+        "stage": stage,
+        "started_at": claimed.started_at,
+        "updated_at": _now(),
+        "authorized_git_sha": claimed.authorized_git_sha,
+        "automatic_retry_permitted": False,
+        "test_accessed": T1_TEST_ACCESSED,
+        "sealed_test_state": T1_SEALED_TEST_STATE,
+    }
+    for field_name in (
+        "label_blind_input_opened",
+        "held_out_labels_opened_for_folds",
+        "oof_evidence_promoted",
+        "final_configuration_completed",
+    ):
+        updated[field_name] = (progress or {}).get(field_name, existing.get(field_name))
+    path = claimed.run_dir / RUN_STATUS_NAME
+    write_json_atomic(path, updated)
+    return path
+
+
 def promote(
     claimed: T1ClaimedRun,
     name: str,
@@ -378,16 +471,25 @@ def write_failure_receipt(
     )
     path = claimed.run_dir / FAILURE_RECEIPT_NAME
     write_json_atomic(path, receipt)
+    failed_at = str(receipt["failed_at"])
+    # The status names the failing stage, the exception type and when it
+    # happened, so the operational file answers "what broke and where" without
+    # opening the receipt. A status left reading STARTED after a failure
+    # reports a state that did not hold, which is worse than no status at all.
     write_json_atomic(
         claimed.run_dir / RUN_STATUS_NAME,
         {
             "attempt_id": claimed.attempt_id,
             "experiment_identity": T1_EXPERIMENT_IDENTITY,
             "status": STATUS_FAILED,
+            "stage": receipt.get("stage"),
             "started_at": claimed.started_at,
-            "updated_at": _now(),
+            "updated_at": failed_at,
+            "failed_at": failed_at,
+            "exception_type": type(error).__name__,
             "authorized_git_sha": claimed.authorized_git_sha,
             "failure_receipt": FAILURE_RECEIPT_NAME,
+            "attempt_consumed": True,
             "automatic_retry_permitted": False,
             "test_accessed": T1_TEST_ACCESSED,
             "sealed_test_state": T1_SEALED_TEST_STATE,
