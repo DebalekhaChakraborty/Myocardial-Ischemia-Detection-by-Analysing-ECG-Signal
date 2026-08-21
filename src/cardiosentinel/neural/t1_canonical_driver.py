@@ -38,6 +38,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping, Sequence
 
+from cardiosentinel.neural.t1_capability_gate import (
+    CAPABILITY_STAGE_BINDINGS,
+    capability_report,
+    require_executable_capability,
+)
 from cardiosentinel.neural.t1_config import (
     T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE,
     T1_EXECUTION_SPECIFICATION_AUTHORIZED,
@@ -247,6 +252,20 @@ REQUIRED_COLLABORATOR_PATHS: Final = (
     "t2_selected_scores",
 )
 
+# A collaborator the driver threads but the gate does not know about would be
+# bound, unverified and first reached after the claim -- the exact shape of the
+# defect the gate exists to remove. Import fails rather than letting the two
+# lists drift apart silently.
+_UNGATED: Final = sorted(
+    set(REQUIRED_COLLABORATOR_CALLABLES) - set(CAPABILITY_STAGE_BINDINGS)
+)
+if _UNGATED:  # pragma: no cover - a drift test asserts this stays empty
+    raise T1DriverError(
+        f"Collaborators {_UNGATED} have no pre-claim capability binding. "
+        "Every label-bearing step the driver threads must be verifiable "
+        "before the attempt is claimed."
+    )
+
 
 @dataclass(frozen=True, slots=True)
 class T1ExecutionCollaborators:
@@ -350,20 +369,52 @@ class T1CanonicalDevelopmentExecutor:
     def verify_collaborators(
         collaborators: T1ExecutionCollaborators,
     ) -> dict[str, Any]:
-        """Prove the execution collaborators are all bound, without executing.
+        """Report what is bound and what could finish, without executing.
 
         Deliberately available without authorization and outside `execute`:
         "could this run" and "may this run" are different questions, and a
         reviewer must be able to ask the first without answering the second.
         Nothing is claimed, read, opened or created, and the permission gate is
         not consulted because no permission is being exercised.
+
+        ``collaborators_complete`` means every collaborator is bound.
+        ``execution_graph_complete`` means every one of them could also finish.
+        The two are reported separately because the gap between them is the
+        defect this layer was hardened against: a refusal-only implementation
+        is bound, is callable, and cannot complete a run.
         """
+        from cardiosentinel.neural.t1_fold_authority import authority_contract
+        from cardiosentinel.neural.t1_fold_evaluation import evaluation_capability
+
         collaborators.require_complete()
+        capability = evaluation_capability()
+        # Bound and executable are different questions and the report answers
+        # both, because a graph that is complete in the first sense and empty
+        # in the second is exactly the state that used to reach the claim.
+        gate = capability_report(collaborators)
         return {
             "collaborators_complete": True,
+            "execution_graph_complete": gate["execution_graph_complete"],
+            "capability_gate": gate,
             "required_callables": list(REQUIRED_COLLABORATOR_CALLABLES),
             "required_paths": list(REQUIRED_COLLABORATOR_PATHS),
+            # Every capability the architecture needs, and the one permission
+            # it does not have. The two are reported side by side so a reader
+            # cannot mistake a complete graph for an armed one.
+            "capabilities_present": {
+                "specification": True,
+                "harness": True,
+                "canonical_driver": True,
+                "fold_authority": bool(
+                    authority_contract()["fold_scoped_authority_required"]
+                ),
+                "target_source": bool(capability["target_source"]),
+                "fold_evaluator": bool(capability["evaluator_implementation"]),
+            },
+            "execution_enabled": bool(capability["execution_enabled"]),
             "execution_authorized": bool(T1_EXECUTION_SPECIFICATION_AUTHORIZED),
+            "labels_opened": False,
+            "folds_run": False,
             "executed": False,
             "attempt_consumed": False,
         }
@@ -383,11 +434,17 @@ class T1CanonicalDevelopmentExecutor:
     def execute(self, collaborators: T1ExecutionCollaborators) -> dict[str, Any]:
         """Walk the twenty-nine frozen stages once, in order.
 
-        Refuses before anything is resolved while authorization is closed, so
-        today this function never reaches a filesystem, a row or a label.
+        Two gates run before any stage, and they refuse for different reasons.
+        `require_canonical_execution_capability` asks whether this run *may*
+        start; `require_executable_capability` asks whether it *could finish*.
+        The second is not a formality: the claim is stage 10 and the first
+        collaborator is reached at stage 12, so a graph that is merely bound
+        would spend the single canonical attempt before discovering it cannot
+        complete. Both refusals happen before anything is resolved, so today
+        this function never reaches a filesystem, a row or a label.
         """
         require_canonical_execution_capability()
-        collaborators.require_complete()
+        require_executable_capability(collaborators)
         self.validate_artifact_plan()
 
         # -- stages 1-9: pre-claim verification ------------------------------
