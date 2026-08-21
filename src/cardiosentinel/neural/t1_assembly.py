@@ -57,6 +57,7 @@ from cardiosentinel.neural.t1_execution_spec import (
     T1_FINAL_CONFIGURATION_IS_DEVELOPMENT_EVIDENCE,
     T1_FINAL_CONFIGURATION_OVERWRITES_OOF_RESULT,
     T1_FOLD_COUNT,
+    T1_HELD_OUT_POLICY_RUNS_PER_FOLD,
     T1_OOF_STATE_EVIDENCE_COLUMNS,
     T1_STRIDE_SECONDS,
     T1_SUBJECT_IDENTITY_DERIVED_FROM_LABEL,
@@ -619,8 +620,197 @@ def assemble_oof_result(
     return collaborator
 
 
-def assemble_subject_evidence(*, per_subject: Mapping[str, Mapping[str, Any]]) -> Any:
-    """Bind the per-subject evidence; return the driver-shaped callable."""
+# ---------------------------------------------------------------------------
+# Subject-level evidence, from the held-out evaluations (spec section 21)
+# ---------------------------------------------------------------------------
+
+# Subject-level metrics are label-dependent, and the OOF state evidence store is
+# label-free by design -- `label` and `primary_mask` are forbidden columns
+# there. So these do not come from `oof_columns`, and forcing them into it would
+# mean widening the store to carry the very members it exists to exclude.
+#
+# They come from the held-out evaluations instead, which is not a second source
+# of truth but the same one seen at the right stage: each fold holds out exactly
+# one subject, so fold index and subject are a bijection and per-fold held-out
+# evidence *is* per-subject evidence. The evaluator already produced these
+# counts behind that fold's barrier; nothing here re-opens a label, re-runs a
+# fold or re-derives a policy.
+SUBJECT_EVIDENCE_FIELDS: Final = (
+    "fold_index",
+    "selected_policy_id",
+    "reference_episodes",
+    "predicted_event_runs",
+    "matched_episodes",
+    "unmatched_predicted_runs",
+    "primary_true_positive",
+    "primary_false_positive",
+    "primary_true_negative",
+    "primary_false_negative",
+    "episode_f1",
+    "primary_window_mcc",
+    "detected_episode_count",
+    "median_onset_latency_seconds",
+)
+
+# The statistic the frozen subject bootstrap resamples. Episode F1 is the
+# protocol's primary episode-level quantity; naming it here is what makes "the
+# bootstrap did not quietly change its statistic" checkable.
+BOOTSTRAP_SUBJECT_STATISTIC: Final = "episode_f1"
+
+
+def require_held_out_bijection(
+    held_out_traces: Mapping[int, Mapping[str, Any]],
+) -> dict[str, Mapping[str, Any]]:
+    """One fold per subject, one subject per fold, all twelve present.
+
+    Checked in both directions and against the frozen roster. A missing fold
+    means that fold's barrier never opened, and a repeated subject would mean
+    one subject's evidence stood in for another's; either would make the
+    subject-level claim untrue while still producing a full-looking artifact.
+    """
+    folds = sorted(int(index) for index in held_out_traces)
+    if folds != list(range(T1_FOLD_COUNT)):
+        raise T1AssemblyError(
+            f"Held-out evidence covers folds {folds}, not the frozen "
+            f"0..{T1_FOLD_COUNT - 1}. Subject evidence is assembled only after "
+            "every fold's barrier has opened."
+        )
+    by_subject: dict[str, Mapping[str, Any]] = {}
+    for index in folds:
+        trace = held_out_traces[index]
+        for field in ("held_out_subject", "selected_policy_id", "policy_runs"):
+            if field not in trace:
+                raise T1AssemblyError(
+                    f"Fold {index} held-out evidence is missing {field!r}."
+                )
+        if int(trace["policy_runs"]) != T1_HELD_OUT_POLICY_RUNS_PER_FOLD:
+            raise T1AssemblyError(
+                f"Fold {index} records {trace['policy_runs']} held-out policy "
+                f"runs; the design is {T1_HELD_OUT_POLICY_RUNS_PER_FOLD}."
+            )
+        if int(trace.get("fold_index", index)) != index:
+            raise T1AssemblyError(
+                f"Fold {index} evidence carries fold_index "
+                f"{trace.get('fold_index')!r}. A fold names itself."
+            )
+        subject = str(trace["held_out_subject"])
+        if subject in by_subject:
+            raise T1AssemblyError(
+                f"{subject!r} was held out by more than one fold, so its "
+                "evidence is not cross-fitted."
+            )
+        by_subject[subject] = trace
+    missing = sorted(set(T1_VALIDATION_SUBJECTS) - set(by_subject))
+    if missing:
+        raise T1AssemblyError(
+            f"No fold held out {missing}. Every VALIDATION subject is held out "
+            "exactly once."
+        )
+    return by_subject
+
+
+def _confusion_arrays(confusion: Mapping[str, int]) -> tuple[np.ndarray, np.ndarray]:
+    """Rebuild the exact margins the frozen MCC helper consumes.
+
+    The counts are the evidence; this only puts them in the shape
+    `window_mcc` takes, so the correlation is computed by the frozen helper
+    rather than by a second formula written here.
+    """
+    counts = {key: int(confusion.get(key, 0)) for key in ("tp", "fp", "tn", "fn")}
+    predicted = [True] * (counts["tp"] + counts["fp"]) + [False] * (
+        counts["tn"] + counts["fn"]
+    )
+    actual = (
+        [True] * counts["tp"]
+        + [False] * counts["fp"]
+        + [False] * counts["tn"]
+        + [True] * counts["fn"]
+    )
+    return np.asarray(predicted, dtype=bool), np.asarray(actual, dtype=bool)
+
+
+def _median(values: Sequence[float]) -> float | None:
+    """Undefined for an empty sample, never zero.
+
+    A subject whose episodes were all missed has no onset latency at all.
+    Reporting zero there would read as an instant detection.
+    """
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return None
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+
+def derive_subject_evidence(
+    *, held_out_traces: Mapping[int, Mapping[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    """Per-subject evidence, arranged from that subject's held-out fold."""
+    by_subject = require_held_out_bijection(held_out_traces)
+    evidence: dict[str, dict[str, Any]] = {}
+    for subject in sorted(by_subject):
+        trace = by_subject[subject]
+        episodes = trace.get("episode_evidence")
+        confusion = trace.get("primary_confusion")
+        if not isinstance(episodes, Mapping) or not isinstance(confusion, Mapping):
+            raise T1AssemblyError(
+                f"{subject!r} held-out evidence lacks episode evidence or the "
+                "PRIMARY confusion counts."
+            )
+        matched = int(episodes["matched_episodes"])
+        predicted = int(episodes["predicted_event_runs"])
+        reference = int(episodes["reference_episodes"])
+        latency = tuple(trace.get("onset_latency_seconds", ()))
+        predicted_positive, actual_positive = _confusion_arrays(confusion)
+        evidence[subject] = {
+            "fold_index": int(trace["fold_index"]),
+            "selected_policy_id": str(trace["selected_policy_id"]),
+            "reference_episodes": reference,
+            "predicted_event_runs": predicted,
+            "matched_episodes": matched,
+            "unmatched_predicted_runs": int(
+                episodes.get("unmatched_predicted_runs", predicted - matched)
+            ),
+            "primary_true_positive": int(confusion.get("tp", 0)),
+            "primary_false_positive": int(confusion.get("fp", 0)),
+            "primary_true_negative": int(confusion.get("tn", 0)),
+            "primary_false_negative": int(confusion.get("fn", 0)),
+            "episode_f1": episode_f1(matched, predicted, reference),
+            "primary_window_mcc": window_mcc(predicted_positive, actual_positive),
+            "detected_episode_count": len(latency),
+            "median_onset_latency_seconds": _median(latency),
+        }
+    return evidence
+
+
+def derive_subject_statistic(
+    *, held_out_traces: Mapping[int, Mapping[str, Any]]
+) -> dict[str, float]:
+    """The one float per subject the frozen bootstrap resamples.
+
+    An undefined episode F1 is carried as NaN rather than zero, because the
+    bootstrap preserves undefined replicates and a zero would be indistinguish-
+    able from a real measurement of zero.
+    """
+    evidence = derive_subject_evidence(held_out_traces=held_out_traces)
+    statistic: dict[str, float] = {}
+    for subject in sorted(evidence):
+        value = evidence[subject][BOOTSTRAP_SUBJECT_STATISTIC]
+        statistic[subject] = float("nan") if value is None else float(value)
+    return statistic
+
+
+def assemble_subject_evidence(
+    *, held_out_traces: Mapping[int, Mapping[str, Any]]
+) -> Any:
+    """Bind the held-out evaluations; return the driver-shaped callable.
+
+    Takes the evaluations rather than a per-subject map, so the evidence is
+    arranged from what the folds actually produced instead of being handed in
+    by whoever composed the graph.
+    """
 
     @declare_execution_capability(
         "assemble_subject_evidence",
@@ -632,14 +822,20 @@ def assemble_subject_evidence(*, per_subject: Mapping[str, Mapping[str, Any]]) -
     )
     def collaborator(*, oof_columns: Mapping[str, Any]) -> dict[str, Any]:
         return _build_assemble_subject_evidence(
-            oof_columns=oof_columns, per_subject=per_subject
+            oof_columns=oof_columns,
+            per_subject=derive_subject_evidence(held_out_traces=held_out_traces),
         )
 
     return collaborator
 
 
-def assemble_bootstrap(*, subject_statistic: Mapping[str, float]) -> Any:
-    """Bind the per-subject statistic; return the driver-shaped callable."""
+def assemble_bootstrap(*, held_out_traces: Mapping[int, Mapping[str, Any]]) -> Any:
+    """Bind the held-out evaluations; return the driver-shaped callable.
+
+    The statistic is derived from the same evidence the subject artifact
+    reports, so the bootstrap cannot resample a number that appears nowhere
+    else.
+    """
 
     @declare_execution_capability(
         "assemble_bootstrap",
@@ -652,7 +848,8 @@ def assemble_bootstrap(*, subject_statistic: Mapping[str, float]) -> Any:
     )
     def collaborator(*, oof_columns: Mapping[str, Any]) -> dict[str, Any]:
         return _build_assemble_bootstrap(
-            oof_columns=oof_columns, subject_statistic=subject_statistic
+            oof_columns=oof_columns,
+            subject_statistic=derive_subject_statistic(held_out_traces=held_out_traces),
         )
 
     return collaborator
