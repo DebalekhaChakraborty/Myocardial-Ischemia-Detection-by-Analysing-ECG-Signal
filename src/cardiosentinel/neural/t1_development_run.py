@@ -79,7 +79,6 @@ from cardiosentinel.neural.t1_execution_spec import (
     T1_EXPECTED_GIT_SHA_FLAG,
     T1_FOLD_COUNT,
     T1_STRIDE_SECONDS,
-    T1ExecutionSpecError,
     require_cli_option_permitted,
     require_defined_metric,
     require_held_out_access_authorized,
@@ -450,6 +449,9 @@ class T1DevelopmentRun:
     # after that fold's barrier opened, so its presence is itself evidence the
     # promotion happened first.
     held_out_traces: dict[int, dict[str, Any]] = field(default_factory=dict)
+    # The stage 12 timeline, kept so section 23's all-VALIDATION selection
+    # runs over the same rows rather than assembling a second view of them.
+    label_blind_columns: dict[str, Any] | None = None
     state: dict[str, Any] = field(default_factory=dict)
 
     # -- stages 1-9: pre-claim ------------------------------------------------
@@ -621,7 +623,7 @@ class T1DevelopmentRun:
         temporal = np.full(raw.shape, STORE.ABSENT, dtype=np.float64)
         temporal[present] = np.asarray(scores["score"], dtype=np.float64)[present]
 
-        return {
+        self.label_blind_columns = {
             "stable_id": np.asarray(m2["stable_id"]),
             "record_id": records,
             "channel_index": channels,
@@ -635,6 +637,7 @@ class T1DevelopmentRun:
             "s4d_temporal_evidence_s_t": temporal,
             "elapsed_stream_seconds": elapsed,
         }
+        return self.label_blind_columns
 
     def stage_promote_input_evidence(
         self, columns: dict[str, np.ndarray]
@@ -974,21 +977,41 @@ def registered_options(
 
 
 def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover
-    """Entry point. Never runs on import."""
+    """Entry point. Never runs on import.
+
+    Four steps, in this order and for this reason. Permission is asked first,
+    so an unauthorized invocation resolves no artifact and reads no manifest.
+    The graph is composed second, from canonical locations with no path
+    parameter. Its capability is proven third, before the claim, so a graph
+    that could not finish never starts. Only then is the choreography
+    delegated to the one driver that owns it.
+
+    While `T1_EXECUTION_SPECIFICATION_AUTHORIZED` is False this function
+    refuses at the first step, having touched nothing.
+    """
+    from cardiosentinel.neural.t1_canonical_driver import (
+        T1CanonicalDevelopmentExecutor,
+        require_canonical_execution_capability,
+    )
+    from cardiosentinel.neural.t1_composition import (
+        build_canonical_collaborators,
+        resolve_canonical_composition,
+    )
+
     parser = build_parser()
     arguments = parser.parse_args(argv)
     for option in registered_options(parser):
         require_cli_option_permitted(option)
-    require_no_test_access("validation")
-    validate_t1_protocol_document()
-    validate_t1_execution_spec_document()
-    raise T1ExecutionSpecError(
-        "The canonical T1 development run is implemented but has not been "
-        "authorized to execute. Authorization is a separate human decision taken "
-        f"after this harness is merged and its SHA frozen; "
-        f"{T1_EXPECTED_GIT_SHA_FLAG} {arguments.expected_git_sha} names a commit, "
-        "not a permission."
-    )
+
+    require_canonical_execution_capability()
+
+    run = T1DevelopmentRun(authorized_git_sha=arguments.expected_git_sha)
+    composition = resolve_canonical_composition(run.repository_root)
+    collaborators = build_canonical_collaborators(run, composition)
+
+    executor = T1CanonicalDevelopmentExecutor(run=run)
+    result = executor.execute(collaborators)
+    return 0 if result else 1
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -26,6 +26,7 @@ from cardiosentinel.neural.t1_protocol import (
     T1_STATE_NORMAL,
     T1_STATE_WATCH,
     T1_VALIDATION_SUBJECTS,
+    t1_folds,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -37,6 +38,9 @@ class _Source:
 
     def read_subject_targets(self, subject_id, *, partition):  # pragma: no cover
         raise AssertionError("no test in this module opens targets")
+
+
+IDENTITY_PATH = Path("/nonexistent/t2_outer_row_identity.npz")
 
 
 def _canonical_root() -> Path:
@@ -126,6 +130,49 @@ def _code_only() -> str:
 def test_each_collaborator_exists(name):
     assert hasattr(A, name), name
     assert callable(getattr(A, name))
+
+
+def _identity_file(tmp_path):
+    """A synthetic row identity whose stable ids match `_columns()`."""
+    import numpy as _np
+
+    stable = _np.asarray(_columns()["stable_id"])
+    families = _np.asarray(
+        [
+            "rate_related_confounder" if index % 4 == 0 else "background_negative"
+            for index in range(len(stable))
+        ]
+    )
+    path = tmp_path / "t2_outer_row_identity.npz"
+    _np.savez(path, stable_id=stable, target_family=families)
+    return path
+
+
+def _held_out_traces(undefined_subjects=()):
+    """Twelve held-out evaluations, one per subject, matching the bijection.
+
+    `episode_f1` is 0.5 for every subject by construction (matched 1, predicted
+    2, reference 2 gives 2/(2+1+1)), so a test that needs a known statistic
+    gets one without injecting it.
+    """
+    traces = {}
+    for fold in t1_folds():
+        undefined = fold.held_out_subject in undefined_subjects
+        traces[fold.fold_index] = {
+            "fold_index": fold.fold_index,
+            "held_out_subject": fold.held_out_subject,
+            "selected_policy_id": "qw0.9_qe0.99_FAST",
+            "policy_runs": 1,
+            "episode_evidence": {
+                "reference_episodes": 0 if undefined else 2,
+                "predicted_event_runs": 0 if undefined else 2,
+                "matched_episodes": 0 if undefined else 1,
+                "unmatched_predicted_runs": 0 if undefined else 1,
+            },
+            "primary_confusion": {"tp": 5, "fp": 5, "tn": 90, "fn": 5},
+            "onset_latency_seconds": () if undefined else (12.0,),
+        }
+    return traces
 
 
 def test_the_collaborators_are_exactly_the_drivers_missing_ones():
@@ -253,24 +300,40 @@ def test_final_configuration_refuses_a_missing_field():
         )(oof_columns=_columns(), selections=_selections())
 
 
-def test_challenge_refuses_an_unknown_family():
-    with pytest.raises(A.T1AssemblyError, match="Unknown challenge families"):
-        A.assemble_challenge(challenge_rows={"MADE_UP": [0, 1]})(oof_columns=_columns())
+def test_challenge_families_cannot_be_unknown_by_construction(tmp_path):
+    """The guarantee moved: membership is derived, so it cannot be forged.
+
+    The builder used to refuse an injected family it did not recognise. It no
+    longer takes one, so an unknown family is not refused -- it is unreachable,
+    which is the stronger property.
+    """
+    import inspect
+
+    assert "challenge_rows" not in inspect.signature(A.assemble_challenge).parameters
+    artifact = A.assemble_challenge(t2_identity=_identity_file(tmp_path))(
+        oof_columns=_columns()
+    )
+    assert set(artifact["families"]) == set(A.CHALLENGE_FAMILIES)
 
 
-def test_challenge_refuses_rows_outside_the_trace():
-    with pytest.raises(A.T1AssemblyError, match="outside the trace"):
-        A.assemble_challenge(challenge_rows={"RATE": [9999]})(oof_columns=_columns())
+def test_challenge_rows_cannot_fall_outside_the_trace(tmp_path):
+    """Rows are positions found in the trace, so out-of-range cannot arise."""
+    artifact = A.assemble_challenge(t2_identity=_identity_file(tmp_path))(
+        oof_columns=_columns()
+    )
+    width = len(_columns()["stable_id"])
+    for family in A.CHALLENGE_FAMILIES:
+        assert artifact["families"][family]["row_count"] <= width
 
 
-def test_subject_evidence_refuses_a_missing_subject():
-    with pytest.raises(A.T1AssemblyError, match="missing subjects"):
-        A.assemble_subject_evidence(per_subject={})(oof_columns=_columns())
+def test_subject_evidence_refuses_an_incomplete_fold_set():
+    with pytest.raises(A.T1AssemblyError, match="covers folds"):
+        A.assemble_subject_evidence(held_out_traces={})(oof_columns=_columns())
 
 
-def test_bootstrap_refuses_a_missing_statistic():
-    with pytest.raises(A.T1AssemblyError, match="lacks a statistic"):
-        A.assemble_bootstrap(subject_statistic={})(oof_columns=_columns())
+def test_bootstrap_refuses_an_incomplete_fold_set():
+    with pytest.raises(A.T1AssemblyError, match="covers folds"):
+        A.assemble_bootstrap(held_out_traces={})(oof_columns=_columns())
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +400,9 @@ def test_exposure_includes_unavailable_positions():
 
 
 def test_the_bootstrap_is_the_frozen_design():
-    bootstrap = A.assemble_bootstrap(
-        subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
-    )(oof_columns=_columns())
+    bootstrap = A.assemble_bootstrap(held_out_traces=_held_out_traces())(
+        oof_columns=_columns()
+    )
     assert bootstrap["replicates"] == 1000
     assert bootstrap["seed"] == 2026
     assert bootstrap["unit"] == "subject"
@@ -348,34 +411,32 @@ def test_the_bootstrap_is_the_frozen_design():
 
 
 def test_the_bootstrap_is_deterministic():
-    build = A.assemble_bootstrap(
-        subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
-    )
+    build = A.assemble_bootstrap(held_out_traces=_held_out_traces())
     assert build(oof_columns=_columns()) == build(oof_columns=_columns())
 
 
 def test_undefined_replicates_are_preserved_not_zeroed():
-    statistic = {s: 0.5 for s in T1_VALIDATION_SUBJECTS}
-    statistic[T1_VALIDATION_SUBJECTS[0]] = float("nan")
-    bootstrap = A.assemble_bootstrap(subject_statistic=statistic)(
-        oof_columns=_columns()
-    )
+    bootstrap = A.assemble_bootstrap(
+        held_out_traces=_held_out_traces(
+            undefined_subjects=(T1_VALIDATION_SUBJECTS[0],)
+        )
+    )(oof_columns=_columns())
     assert bootstrap["undefined_replicates"] > 0
     assert bootstrap["defined_replicates"] + bootstrap["undefined_replicates"] == 1000
 
 
 def test_subject_order_is_the_frozen_roster_not_the_observed_order():
-    evidence = A.assemble_subject_evidence(
-        per_subject={s: {"episode_f1": 0.5} for s in T1_VALIDATION_SUBJECTS}
-    )(oof_columns=_columns())
+    evidence = A.assemble_subject_evidence(held_out_traces=_held_out_traces())(
+        oof_columns=_columns()
+    )
     assert evidence["subject_order"] == [
         s for s in T1_VALIDATION_SUBJECTS if s in evidence["subject_order"]
     ]
     assert evidence["inferential_unit"] == "subject"
 
 
-def test_challenge_is_annotation_never_an_input():
-    challenge = A.assemble_challenge(challenge_rows={"RATE": [0, 1, 2], "AXIS": [3]})(
+def test_challenge_is_annotation_never_an_input(tmp_path):
+    challenge = A.assemble_challenge(t2_identity=_identity_file(tmp_path))(
         oof_columns=_columns()
     )
     assert challenge["is_selection_input"] is False
@@ -468,10 +529,10 @@ def test_no_collaborator_creates_a_scientific_artifact(tmp_path):
     assert sorted(tmp_path.iterdir()) == []
 
 
-def test_no_collaborator_changes_authorization_state():
+def test_no_collaborator_changes_authorization_state(tmp_path):
     before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     A.assemble_oof_state_columns(columns=_columns(), selections=_selections())
-    A.assemble_challenge(challenge_rows={"RATE": [0]})(oof_columns=_columns())
+    A.assemble_challenge(t2_identity=_identity_file(tmp_path))(oof_columns=_columns())
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
     code = _code_only()
@@ -511,7 +572,7 @@ def test_the_canonical_attempt_is_untouched():
         ),
         (
             "t1_development_run.py",
-            "e31d81e630f6c8d546352db0289fcbc5ca7c87fcc24488d830b9c89b6ed69720",
+            "0077bb8e2c4d3996cb44657e36d3a380556386d026fd17ae74139b96c2464594",
         ),
         (
             "t1_evidence_store.py",
@@ -571,12 +632,10 @@ def _bound_collaborators():
             },
         ),
         assemble_subject_evidence=A.assemble_subject_evidence(
-            per_subject={s: {} for s in T1_VALIDATION_SUBJECTS}
+            held_out_traces=_held_out_traces()
         ),
-        assemble_bootstrap=A.assemble_bootstrap(
-            subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
-        ),
-        assemble_challenge=A.assemble_challenge(challenge_rows={"RATE": [0]}),
+        assemble_bootstrap=A.assemble_bootstrap(held_out_traces=_held_out_traces()),
+        assemble_challenge=A.assemble_challenge(t2_identity=IDENTITY_PATH),
         assemble_final_configuration=A.assemble_final_configuration(
             configuration=dict.fromkeys(A.FINAL_CONFIGURATION_FIELDS, 0.5),
             oof_result_promoted=True,
