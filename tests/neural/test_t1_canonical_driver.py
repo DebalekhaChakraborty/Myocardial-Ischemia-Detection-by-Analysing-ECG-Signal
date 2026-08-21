@@ -37,7 +37,7 @@ FROZEN_SOURCE_DIGESTS = {
         "edb0cbf1afe43dee48b5d2d0ed190e0939530fc026fd2f09d3312b929ab1fbe3"
     ),
     "t1_development_run.py": (
-        "2fb3d7494363ee41be157bdf9a88db3f9852a1606024acb90193ed538f04d358"
+        "e31d81e630f6c8d546352db0289fcbc5ca7c87fcc24488d830b9c89b6ed69720"
     ),
     "t1_evidence_store.py": (
         "464ca1607191aa02042a6dcbb8cfeda4d4f3aced1eae2e29ae4b77be8cf6d39c"
@@ -46,6 +46,13 @@ FROZEN_SOURCE_DIGESTS = {
         "f715871bd1213d7605aa9b9117c0b8d1a86470b939e04e1df8614a9f982697df"
     ),
 }
+
+
+class _Source:
+    """Minimal target source: the protocol shape and nothing wider."""
+
+    def read_subject_targets(self, subject_id, *, partition):  # pragma: no cover
+        raise AssertionError("no test here opens targets")
 
 
 def _driver_source() -> str:
@@ -107,6 +114,7 @@ def _collaborators(**overrides) -> D.T1ExecutionCollaborators:
         "t2_identity": Path("/nonexistent/t2_outer_row_identity.npz"),
         "t2_selected_scores": Path("/nonexistent/t2_selected_scores.npz"),
         "calibrators": {"s20221": object()},
+        "target_source": _Source(),
         "subject_of_record": lambda record: "s20221",
         "evaluate_fold": lambda *a, **k: {"artifact": {}},
         "assemble_oof_state_columns": lambda **k: {},

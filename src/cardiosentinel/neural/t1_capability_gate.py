@@ -106,7 +106,7 @@ CAPABILITY_STAGE_BINDINGS: Final = {
 # `t1_development_run.stage_folds`; a drift test binds the two together.
 CAPABILITY_CALL_CONTRACT: Final = {
     "subject_of_record": (1, ()),
-    "evaluate_fold": (2, ()),
+    "evaluate_fold": (3, ()),
     "assemble_oof_state_columns": (0, ("columns", "selections")),
     "assemble_oof_result": (0, ("oof_columns", "selections")),
     "assemble_subject_evidence": (0, ("oof_columns",)),
@@ -120,6 +120,14 @@ CAPABILITY_CALL_CONTRACT: Final = {
 # role sorts first. A gate that reported a later failure would understate how
 # much of the run had already been spent.
 REQUIRED_CAPABILITY_ROLES: Final = tuple(CAPABILITY_STAGE_BINDINGS)
+
+# ``evaluate_fold`` is two calls, not one. The harness runs selection before the
+# fold's barrier and the held-out evaluation after it, and the second call is
+# reached twelve stages past the claim -- so a graph whose evaluator has only
+# the first half is exactly the failure this gate exists to catch.
+SECOND_PHASE_ROLE: Final = "evaluate_fold"
+SECOND_PHASE_METHOD: Final = "evaluate_held_out"
+SECOND_PHASE_POSITIONALS: Final = 4
 
 _REACH_ORDER: Final = [
     T1_STAGE_ORDER.index(stage) for stage in CAPABILITY_STAGE_BINDINGS.values()
@@ -428,6 +436,9 @@ def require_completable(role: str, collaborator: Any) -> T1CapabilityAttestation
             "cannot complete. Refused before the claim; nothing was consumed."
         )
 
+    if role == SECOND_PHASE_ROLE:
+        _require_second_phase(collaborator)
+
     proof = _returns_a_value(_implementation_of(collaborator))
     if proof is False:
         raise T1CapabilityError(
@@ -438,6 +449,41 @@ def require_completable(role: str, collaborator: Any) -> T1CapabilityAttestation
             "proof; the proof wins."
         )
     return attestation
+
+
+def _require_second_phase(collaborator: Any) -> None:
+    """Prove the post-barrier half exists and can finish, before the claim.
+
+    Held to the same standard as the first half: it must accept the harness's
+    call, and its body must be able to return. An evaluator that selected a
+    policy and then had nothing to run it with would fail after twelve folds
+    of the attempt had already been spent.
+    """
+    stage = CAPABILITY_STAGE_BINDINGS[SECOND_PHASE_ROLE]
+    method = getattr(collaborator, SECOND_PHASE_METHOD, None)
+    if not callable(method):
+        raise T1CapabilityError(
+            f"The fold evaluator exposes no callable {SECOND_PHASE_METHOD!r}. "
+            f"Stage {stage!r} selects a policy and the barrier then opens for "
+            "the held-out subject; an evaluator without the second half would "
+            "leave every fold's held-out trace unproduced, after the claim."
+        )
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return
+    try:
+        signature.bind(*([_PLACEHOLDER] * SECOND_PHASE_POSITIONALS))
+    except TypeError as error:
+        raise T1CapabilityError(
+            f"{SECOND_PHASE_METHOD!r} cannot accept the call the harness makes "
+            f"(fold, authority, columns, selection): {error}."
+        ) from error
+    if _returns_a_value(_implementation_of(method)) is False:
+        raise T1CapabilityError(
+            f"{SECOND_PHASE_METHOD!r} has no reachable return, so the held-out "
+            "trace it is supposed to produce could never arrive."
+        )
 
 
 def require_execution_graph_complete(

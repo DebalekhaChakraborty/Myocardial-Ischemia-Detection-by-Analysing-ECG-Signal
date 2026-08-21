@@ -29,6 +29,13 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 IDENTITY = Path("/nonexistent/t2_outer_row_identity.npz")
 
 
+class _Source:
+    """Minimal target source: the protocol shape and nothing wider."""
+
+    def read_subject_targets(self, subject_id, *, partition):  # pragma: no cover
+        raise AssertionError("no test here opens targets")
+
+
 def _source() -> E.T1CorpusTargetSource:
     return E.T1CorpusTargetSource(IDENTITY)
 
@@ -403,6 +410,7 @@ def _collaborators() -> D.T1ExecutionCollaborators:
         t2_identity=IDENTITY,
         t2_selected_scores=Path("/nonexistent/scores.npz"),
         calibrators={"ltstdb:s2004": object()},
+        target_source=_Source(),
         subject_of_record=lambda record: "ltstdb:s2004",
         evaluate_fold=E.T1NonExecutingFoldEvaluator(),
         assemble_oof_state_columns=lambda **k: {},
@@ -491,7 +499,7 @@ def test_test_stays_sealed():
         ),
         (
             "t1_development_run.py",
-            "2fb3d7494363ee41be157bdf9a88db3f9852a1606024acb90193ed538f04d358",
+            "e31d81e630f6c8d546352db0289fcbc5ca7c87fcc24488d830b9c89b6ed69720",
         ),
         (
             "t1_evidence_store.py",

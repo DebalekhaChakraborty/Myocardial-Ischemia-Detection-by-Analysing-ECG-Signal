@@ -66,6 +66,13 @@ class ImpostorSource(CountingSource):
         )
 
 
+class _Source:
+    """Minimal target source: the protocol shape and nothing wider."""
+
+    def read_subject_targets(self, subject_id, *, partition):  # pragma: no cover
+        raise AssertionError("no test here opens targets")
+
+
 def _promoted_fold_state() -> dict[str, object]:
     """The state the held-out barrier requires: promoted and digest-verified."""
     return {
@@ -407,6 +414,7 @@ def test_the_driver_can_verify_collaborators_without_executing():
         t2_identity=Path("/nonexistent/id.npz"),
         t2_selected_scores=Path("/nonexistent/scores.npz"),
         calibrators={"ltstdb:s2004": object()},
+        target_source=_Source(),
         subject_of_record=lambda record: "ltstdb:s2004",
         evaluate_fold=lambda *a, **k: {"artifact": {}},
         assemble_oof_state_columns=lambda **k: {},
@@ -456,7 +464,7 @@ def test_the_authority_contract_is_the_specifications():
         ),
         (
             "t1_development_run.py",
-            "2fb3d7494363ee41be157bdf9a88db3f9852a1606024acb90193ed538f04d358",
+            "e31d81e630f6c8d546352db0289fcbc5ca7c87fcc24488d830b9c89b6ed69720",
         ),
         (
             "t1_evidence_store.py",

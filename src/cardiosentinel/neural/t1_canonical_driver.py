@@ -84,6 +84,7 @@ from cardiosentinel.neural.t1_execution_spec import (
     T1_STAGE_ORDER,
     require_no_test_access,
 )
+from cardiosentinel.neural.t1_fold_evaluator import widen_with_held_out_traces
 
 DRIVER_NAME: Final = "T1CanonicalDevelopmentExecutor"
 
@@ -283,6 +284,11 @@ class T1ExecutionCollaborators:
     t2_identity: Path
     t2_selected_scores: Path
     calibrators: Mapping[str, Any]
+    # The target source the harness builds fold authorities from. It lives here
+    # rather than on the evaluator on purpose: an evaluator holding a source
+    # would have a route around the authorities, which is the one thing the
+    # fold firewall exists to prevent.
+    target_source: Any
     subject_of_record: Callable[[str], str]
     evaluate_fold: Callable[..., dict[str, Any]]
     assemble_oof_state_columns: Callable[..., dict[str, Any]]
@@ -315,6 +321,12 @@ class T1ExecutionCollaborators:
             raise T1DriverError(
                 "No U1 calibrators were supplied. They are applied as frozen "
                 "fits and are never refitted here."
+            )
+        if not hasattr(self.target_source, "read_subject_targets"):
+            raise T1DriverError(
+                "The target source must expose read_subject_targets(subject_id, "
+                "*, partition). Nothing wider is accepted, because a wider "
+                "source is a global label table with a narrow door painted on it."
             )
 
 
@@ -475,12 +487,20 @@ class T1CanonicalDevelopmentExecutor:
         )
 
         # -- stages 14-22: twelve folds behind twelve label barriers ---------
-        selections = self.run.stage_folds(evaluate_fold=collaborators.evaluate_fold)
+        selections = self.run.stage_folds(
+            evaluate_fold=collaborators.evaluate_fold,
+            columns=columns,
+            target_source=collaborators.target_source,
+        )
         self._record(STAGE_FOLD_PROMOTE_HELD_OUT, f"folds_completed={len(selections)}")
 
         # -- stages 23-24: cross-fitted evidence and its result --------------
+        # Each fold contributed the trace for its own held-out subject, so the
+        # twelve traces tile the timeline. Widening is not computing: the
+        # values arrive from the held-out evaluations unchanged.
+        traced_columns = widen_with_held_out_traces(columns, self.run.held_out_traces)
         oof_columns = collaborators.assemble_oof_state_columns(
-            columns=columns, selections=selections
+            columns=traced_columns, selections=selections
         )
         oof_manifest = self.run.stage_oof_state_evidence(
             oof_columns,

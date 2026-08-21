@@ -269,8 +269,22 @@ class T1NonExecutingFoldEvaluator:
             "them, and no attempt has been consumed."
         )
 
-    def __call__(self, fold: Any, authority: Any) -> dict[str, Any]:  # pragma: no cover
-        """The driver's `evaluate_fold` shape, which also refuses."""
+    def __call__(  # pragma: no cover
+        self, fold: Any, authority: Any, columns: Any
+    ) -> dict[str, Any]:
+        """The harness's `evaluate_fold` shape, which also refuses.
+
+        Kept in step with the real evaluator's signature deliberately. A
+        placeholder that failed the gate's shape check would be refused for the
+        wrong reason, and the reason is the whole point: this object is
+        complete and disabled, not malformed.
+        """
+        raise T1FoldEvaluationError(EVALUATION_DISABLED_MESSAGE)
+
+    def evaluate_held_out(  # pragma: no cover
+        self, fold: Any, authority: Any, columns: Any, selection: Any
+    ) -> dict[str, Any]:
+        """The post-barrier half, present in shape and absent in body."""
         raise T1FoldEvaluationError(EVALUATION_DISABLED_MESSAGE)
 
     def t1_execution_capability(self) -> T1CapabilityAttestation:
