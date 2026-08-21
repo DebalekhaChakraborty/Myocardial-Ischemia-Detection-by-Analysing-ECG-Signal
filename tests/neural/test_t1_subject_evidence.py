@@ -294,9 +294,11 @@ def test_no_fold_is_rerun_and_no_policy_is_rederived():
 # ---------------------------------------------------------------------------
 
 
-def test_authorization_remains_false():
+def test_deriving_subject_evidence_does_not_change_authorization():
+    """Assembling evidence is not a permission event."""
+    before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     A.derive_subject_evidence(held_out_traces=_traces())
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
 
 
 def test_the_canonical_attempt_is_untouched():

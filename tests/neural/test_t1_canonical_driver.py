@@ -232,18 +232,19 @@ def test_the_claim_is_the_boundary_the_attempt_is_spent_at():
 # ---------------------------------------------------------------------------
 
 
-def test_authorization_is_closed_on_this_branch():
-    """This PR builds a capability and must not grant a permission.
+def test_authorization_is_open_on_this_branch():
+    """The tripwire this test was fired to protect has done its job.
 
-    A deliberate tripwire on repository state, not on driver behaviour. The
-    separate authorization PR flips this constant and must update this test in
-    the same change -- the same way it updates the four state assertions the
-    merged harness left behind. Every behavioural test above controls the gate
-    itself and is unaffected by the flip.
+    It previously asserted the constant was False and instructed the separate
+    authorization PR to update it here, in the same change that flips it. This
+    is that change. All three facts now read True, which is exactly the state
+    in which a check derived from the first two would be indistinguishable
+    from a deliberate one -- so the behavioural tests around this one drive the
+    gate explicitly rather than relying on the repository constant.
     """
     assert CFG.T1_EXECUTION_SPECIFICATION_EXISTS is True
     assert CFG.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is True
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is True
 
 
 def test_the_driver_refuses_to_execute(monkeypatch):

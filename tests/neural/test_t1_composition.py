@@ -129,7 +129,18 @@ def test_the_complete_graph_passes_the_capability_gate():
 
 
 @needs_artifacts
-def test_authorization_is_the_only_remaining_blocker():
+def test_permission_is_the_only_remaining_blocker(monkeypatch):
+    """The real graph is complete, and withdrawing permission still stops it.
+
+    This is the one test in the suite that builds the complete graph against
+    the real canonical artifacts, so it is also the one that most needs
+    permission withdrawn explicitly rather than inherited from the repository
+    constant. Both modules are patched because the driver holds its own
+    imported reference. `_run()` additionally carries a dummy authorized SHA,
+    so the commit check would refuse this invocation even if the gate did not.
+    """
+    monkeypatch.setattr(CFG, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
+    monkeypatch.setattr(D, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
     run = _run()
     composition = C.resolve_canonical_composition(REPOSITORY_ROOT)
     collaborators = C.build_canonical_collaborators(run, composition)
@@ -138,6 +149,7 @@ def test_authorization_is_the_only_remaining_blocker():
         D.T1CanonicalDevelopmentExecutor(run=run).execute(collaborators)
     assert run.stages.entered == []
     assert run.claimed is None
+    assert not _canonical_root().exists()
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +263,15 @@ def test_main_delegates_to_the_one_driver():
 # ---------------------------------------------------------------------------
 
 
-def test_authorization_remains_false():
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
-    assert D.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+def test_composing_the_graph_does_not_change_authorization():
+    """Resolving artifacts is not a permission event.
+
+    Agreement is the invariant that survives the flip: a divergent copy of the
+    constant is how a gate opens on one code path and not another.
+    """
+    assert D.T1_EXECUTION_SPECIFICATION_AUTHORIZED is (
+        CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
+    )
 
 
 def test_the_canonical_attempt_is_untouched():

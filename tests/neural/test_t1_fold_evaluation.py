@@ -428,13 +428,20 @@ def test_the_complete_collaborator_graph_exists():
     assert all(report["capabilities_present"].values()), report["capabilities_present"]
 
 
-def test_verification_does_not_grant_permission():
+def test_verification_runs_nothing_and_consumes_nothing():
+    """Verification reports permission; it does not act on it.
+
+    `execution_authorized` now reports True because it mirrors the repository
+    constant. The properties that matter are the other three: verifying a
+    graph must not enable, execute or consume anything.
+    """
     report = D.T1CanonicalDevelopmentExecutor.verify_collaborators(_collaborators())
-    assert report["execution_authorized"] is False
+    assert report["execution_authorized"] is (
+        CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
+    )
     assert report["execution_enabled"] is False
     assert report["executed"] is False
     assert report["attempt_consumed"] is False
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
 
 
 def test_verification_opens_no_labels_and_runs_no_fold():
@@ -443,8 +450,15 @@ def test_verification_opens_no_labels_and_runs_no_fold():
     assert report["folds_run"] is False
 
 
-def test_a_complete_graph_still_refuses_to_execute():
-    """Capability is complete; permission is still closed."""
+def test_a_complete_graph_refuses_when_permission_is_withdrawn(monkeypatch):
+    """Capability is complete; withdrawing permission still stops it dead.
+
+    Permission is withdrawn on both modules -- the driver holds its own
+    imported reference -- so the refusal observed here is the permission one
+    rather than a later check firing for an unrelated reason.
+    """
+    monkeypatch.setattr(CFG, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
+    monkeypatch.setattr(D, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
     executor = D.T1CanonicalDevelopmentExecutor(
         run=D.T1DevelopmentRun(authorized_git_sha="0" * 40)
     )

@@ -534,7 +534,6 @@ def test_no_collaborator_changes_authorization_state(tmp_path):
     A.assemble_oof_state_columns(columns=_columns(), selections=_selections())
     A.assemble_challenge(t2_identity=_identity_file(tmp_path))(oof_columns=_columns())
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
     code = _code_only()
     assert "T1_EXECUTION_SPECIFICATION_AUTHORIZED" not in code
 

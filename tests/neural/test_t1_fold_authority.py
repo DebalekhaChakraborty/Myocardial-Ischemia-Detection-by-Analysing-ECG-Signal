@@ -428,13 +428,19 @@ def test_the_driver_can_verify_collaborators_without_executing():
     assert report["collaborators_complete"] is True
     assert report["executed"] is False
     assert report["attempt_consumed"] is False
-    assert report["execution_authorized"] is False
+    # Mirrors the repository constant; the properties that matter here are
+    # that verifying answered "could this run" without running anything.
+    assert report["execution_authorized"] is (
+        CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
+    )
     assert not _canonical_root().exists()
 
 
 def test_verifying_collaborators_does_not_grant_permission():
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    """Verification neither grants nor revokes; the two views stay in step."""
+    before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     assert D.T1CanonicalDevelopmentExecutor.verify_collaborators.__doc__
+    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
 
 
 def test_the_authority_contract_is_the_specifications():

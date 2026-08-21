@@ -377,12 +377,14 @@ def test_the_frozen_ranking_rules_are_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def test_authorization_remains_false(corpus):
+def test_selecting_a_configuration_does_not_change_authorization(corpus):
+    """Selecting over VALIDATION is science, not a permission event."""
+    before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     columns, targets = corpus
     F.select_final_validation_configuration(
         columns=columns, authority=F.final_validation_authority(source=_Source(targets))
     )
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
 
 
 def test_the_canonical_attempt_is_untouched(corpus):
@@ -394,15 +396,15 @@ def test_the_canonical_attempt_is_untouched(corpus):
     assert not _canonical_root().exists()
 
 
-def test_the_entrypoint_is_reachable_but_still_refuses():
-    """Superseded premise, stated deliberately.
+def test_the_entrypoint_asks_permission_before_executing():
+    """Ordering, not state, is what protects the attempt.
 
     Earlier PRs asserted `main()` never reached the executor, which was true
-    of the code they shipped. The composition-root PR wires it on purpose, so
-    the property worth holding now is the one that actually protects the
-    attempt: the path exists and permission still refuses at the first step.
+    of the code they shipped. The composition-root PR wires it on purpose and
+    the authorization PR grants permission, so the surviving property is the
+    one that still protects the attempt whatever the constant reads: the gate
+    is asked strictly before the executor is called.
     """
-    from cardiosentinel.neural import t1_config as _CFG
     from cardiosentinel.neural import t1_development_run as _R
 
     source = Path(_R.__file__).read_text(encoding="utf-8")
@@ -410,7 +412,6 @@ def test_the_entrypoint_is_reachable_but_still_refuses():
     assert "T1CanonicalDevelopmentExecutor" in body
     gate = body.index("require_canonical_execution_capability()")
     assert body.index("executor.execute(") > gate
-    assert _CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
 
 
 def test_the_frozen_sources_are_byte_identical():

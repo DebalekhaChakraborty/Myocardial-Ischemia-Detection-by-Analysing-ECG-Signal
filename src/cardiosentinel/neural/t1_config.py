@@ -72,25 +72,32 @@ THRESHOLD_SOURCES: Final = (THRESHOLD_SOURCE_DERIVED, THRESHOLD_SOURCE_LITERAL)
 
 REFRACTORY_SCOPE: Final = "alert_emission_only"
 
-# The frozen execution specification EXISTS and is merged. What does not exist
-# is the canonical development harness it specifies, and separately, an
-# authorization to run science.
+# The frozen execution specification EXISTS and is merged, the canonical
+# development harness it specifies is implemented and wired to a composition
+# root, and canonical scientific execution has now been authorized by a human
+# naming the merged commit.
 #
 # These are three different facts and conflating them is how a gate opens by
 # accident:
 #
 #   1. the specification document exists                     -> True
-#   2. the canonical development harness is implemented      -> False
-#   3. canonical scientific execution is authorized          -> False
+#   2. the canonical development harness is implemented      -> True
+#   3. canonical scientific execution is authorized          -> True
 #
-# Only (3) gates execution. It is a deliberate constant rather than a derived
-# check, because the existence of a module is not permission to run it.
+# All three read True, which is precisely the state in which a check derived
+# from the first two would be indistinguishable from a deliberate one. Only (3)
+# gates execution, and it stays a deliberate constant rather than a derived
+# check: a merged specification is a contract and a merged harness is a
+# capability, and neither is a permission. Granting (3) did not weaken any
+# other check -- every invocation still proves the authorized commit against a
+# clean HEAD, the runtime identity against the frozen dependency digest, the
+# upstream chain, that TEST is unopened, and that the attempt does not exist.
 T1_EXECUTION_SPECIFICATION_EXISTS: Final = True
 T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE: Final = (
     "cardiosentinel.neural.t1_development_run"
 )
 T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS: Final = True
-T1_EXECUTION_SPECIFICATION_AUTHORIZED: Final = False
+T1_EXECUTION_SPECIFICATION_AUTHORIZED: Final = True
 
 _SECTIONS: Final = (
     "protocol",
