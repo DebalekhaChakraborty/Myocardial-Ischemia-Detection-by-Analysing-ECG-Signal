@@ -37,7 +37,7 @@ FROZEN_SOURCE_DIGESTS = {
         "edb0cbf1afe43dee48b5d2d0ed190e0939530fc026fd2f09d3312b929ab1fbe3"
     ),
     "t1_development_run.py": (
-        "e31d81e630f6c8d546352db0289fcbc5ca7c87fcc24488d830b9c89b6ed69720"
+        "0077bb8e2c4d3996cb44657e36d3a380556386d026fd17ae74139b96c2464594"
     ),
     "t1_evidence_store.py": (
         "464ca1607191aa02042a6dcbb8cfeda4d4f3aced1eae2e29ae4b77be8cf6d39c"

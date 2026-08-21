@@ -394,12 +394,23 @@ def test_the_canonical_attempt_is_untouched(corpus):
     assert not _canonical_root().exists()
 
 
-def test_no_entrypoint_became_reachable():
-    from cardiosentinel.neural import t1_development_run as R
+def test_the_entrypoint_is_reachable_but_still_refuses():
+    """Superseded premise, stated deliberately.
 
-    source = Path(R.__file__).read_text(encoding="utf-8")
-    main_body = source[source.index("def main(") :]
-    assert "T1CanonicalDevelopmentExecutor" not in main_body
+    Earlier PRs asserted `main()` never reached the executor, which was true
+    of the code they shipped. The composition-root PR wires it on purpose, so
+    the property worth holding now is the one that actually protects the
+    attempt: the path exists and permission still refuses at the first step.
+    """
+    from cardiosentinel.neural import t1_config as _CFG
+    from cardiosentinel.neural import t1_development_run as _R
+
+    source = Path(_R.__file__).read_text(encoding="utf-8")
+    body = source[source.index("def main(") :]
+    assert "T1CanonicalDevelopmentExecutor" in body
+    gate = body.index("require_canonical_execution_capability()")
+    assert body.index("executor.execute(") > gate
+    assert _CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
 
 
 def test_the_frozen_sources_are_byte_identical():

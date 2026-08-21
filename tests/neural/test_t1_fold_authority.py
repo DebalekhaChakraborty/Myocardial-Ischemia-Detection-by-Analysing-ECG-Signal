@@ -464,7 +464,7 @@ def test_the_authority_contract_is_the_specifications():
         ),
         (
             "t1_development_run.py",
-            "e31d81e630f6c8d546352db0289fcbc5ca7c87fcc24488d830b9c89b6ed69720",
+            "0077bb8e2c4d3996cb44657e36d3a380556386d026fd17ae74139b96c2464594",
         ),
         (
             "t1_evidence_store.py",
