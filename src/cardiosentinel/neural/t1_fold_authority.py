@@ -31,8 +31,10 @@ that someone had to be authorized to build.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Final, Protocol, Sequence, runtime_checkable
+from typing import Any, Final, Iterator, Protocol, Sequence, runtime_checkable
 
 from cardiosentinel.neural.t1_development_run import (
     TARGET_AUTHORITY,
@@ -133,6 +135,67 @@ class T1SubjectTargets:
             "row_count": len(self),
             "columns": ("stable_id", "primary_positive", "primary_mask"),
         }
+
+
+@dataclass(frozen=True, slots=True)
+class ScopedTargetRequest:
+    """Proof that an authority authorized this exact subject, just now.
+
+    Minted inside `targets_for_subject` and visible only for the duration of
+    that one delegated read. A target source that finds no request in scope was
+    called directly, which is the case this exists to refuse: without it,
+    "reached only through the authority" would be a convention that any caller
+    holding a source reference could ignore.
+    """
+
+    fold_index: int
+    subject_id: str
+    scope: str
+    partition: str
+
+
+_ACTIVE_REQUEST: Final[ContextVar[ScopedTargetRequest | None]] = ContextVar(
+    "t1_active_scoped_target_request", default=None
+)
+
+
+@contextmanager
+def _authorized_request(request: ScopedTargetRequest) -> Iterator[None]:
+    token = _ACTIVE_REQUEST.set(request)
+    try:
+        yield
+    finally:
+        _ACTIVE_REQUEST.reset(token)
+
+
+def active_scoped_request() -> ScopedTargetRequest | None:
+    """The authorization in scope right now, if a read is being delegated."""
+    return _ACTIVE_REQUEST.get()
+
+
+def require_active_scoped_request(
+    subject_id: str, partition: str
+) -> ScopedTargetRequest:
+    """Refuse a read that no authority is currently sponsoring.
+
+    Checked by the target source rather than by the authority, because the
+    authority cannot police a caller that never asked it anything.
+    """
+    request = _ACTIVE_REQUEST.get()
+    if request is None:
+        raise T1FoldAuthorityError(
+            "No fold authority is sponsoring this read. Targets are reachable "
+            "only through FoldScopedEvaluationAuthority.targets_for_subject; a "
+            "source called directly is a global label table being read by "
+            "another name."
+        )
+    if request.subject_id != str(subject_id) or request.partition != str(partition):
+        raise T1FoldAuthorityError(
+            f"The sponsoring authority authorized {request.subject_id!r} in "
+            f"{request.partition!r}, but the read asked for {subject_id!r} in "
+            f"{partition!r}."
+        )
+    return request
 
 
 @runtime_checkable
@@ -256,7 +319,14 @@ class FoldScopedEvaluationAuthority:
         """
         authorized = self.require_authorized(subject_id)
         partition = require_validation_partition(self.partition)
-        targets = self.source.read_subject_targets(authorized, partition=partition)
+        request = ScopedTargetRequest(
+            fold_index=self.fold_index,
+            subject_id=authorized,
+            scope=self.scope,
+            partition=partition,
+        )
+        with _authorized_request(request):
+            targets = self.source.read_subject_targets(authorized, partition=partition)
         if not isinstance(targets, T1SubjectTargets):
             raise T1FoldAuthorityError(
                 "A target source must return T1SubjectTargets, not "
@@ -353,6 +423,7 @@ def authority_contract() -> dict[str, Any]:
         "fold_scoped_authority_required": T1_FOLD_SCOPED_TARGET_AUTHORITY_REQUIRED,
         "forbidden_accessors": list(T1_FORBIDDEN_AUTHORITY_ACCESSORS),
         "construction_reads_targets": False,
+        "reads_require_an_active_authority": True,
         "test_accessed": False,
     }
 

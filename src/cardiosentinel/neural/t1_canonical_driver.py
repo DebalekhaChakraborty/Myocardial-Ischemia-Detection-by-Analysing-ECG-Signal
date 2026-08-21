@@ -358,12 +358,32 @@ class T1CanonicalDevelopmentExecutor:
         Nothing is claimed, read, opened or created, and the permission gate is
         not consulted because no permission is being exercised.
         """
+        from cardiosentinel.neural.t1_fold_authority import authority_contract
+        from cardiosentinel.neural.t1_fold_evaluation import evaluation_capability
+
         collaborators.require_complete()
+        capability = evaluation_capability()
         return {
             "collaborators_complete": True,
             "required_callables": list(REQUIRED_COLLABORATOR_CALLABLES),
             "required_paths": list(REQUIRED_COLLABORATOR_PATHS),
+            # Every capability the architecture needs, and the one permission
+            # it does not have. The two are reported side by side so a reader
+            # cannot mistake a complete graph for an armed one.
+            "capabilities_present": {
+                "specification": True,
+                "harness": True,
+                "canonical_driver": True,
+                "fold_authority": bool(
+                    authority_contract()["fold_scoped_authority_required"]
+                ),
+                "target_source": bool(capability["target_source"]),
+                "fold_evaluator": bool(capability["evaluator_implementation"]),
+            },
+            "execution_enabled": bool(capability["execution_enabled"]),
             "execution_authorized": bool(T1_EXECUTION_SPECIFICATION_AUTHORIZED),
+            "labels_opened": False,
+            "folds_run": False,
             "executed": False,
             "attempt_consumed": False,
         }
