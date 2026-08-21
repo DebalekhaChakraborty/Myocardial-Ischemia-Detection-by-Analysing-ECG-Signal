@@ -442,6 +442,99 @@ def promote_fold_selection(
     return digest
 
 
+HELD_OUT_EVALUATION_CLASS: Final = "t1_v1_held_out_evaluation_evidence"
+HELD_OUT_EVALUATION_REQUIRED_FIELDS: Final = (
+    "artifact_class",
+    "attempt_id",
+    "authorized_git_sha",
+    "fold_index",
+    "held_out_subject",
+    "selected_policy_id",
+    "policy",
+    "thresholds",
+    "primary_confusion",
+    "episode_evidence",
+    "onset_latency_seconds",
+    "policy_runs",
+    "fold_selection_sha256",
+    "generated_during_canonical_execution",
+    "is_recovery_artifact",
+    "is_continuation_artifact",
+    "test_accessed",
+)
+
+
+def promote_held_out_evaluation(
+    claimed: T1ClaimedRun, fold_index: int, payload: dict[str, Any]
+) -> str:
+    """Promote one fold's held-out evaluation evidence, per specification §17.
+
+    §17 asks for the held-out state trace **and evaluation evidence** to be
+    persisted once. The canonical attempt persisted the trace, by widening it
+    into the stage-23 OOF store, and kept the evaluation evidence in an
+    in-process mapping that died with the process. Twelve folds of completed
+    measurement were lost to a defect in the twenty-fourth stage.
+
+    So this is written per fold, the moment the evaluation returns, rather than
+    once at the end: evidence that exists only after the last stage succeeds is
+    evidence that a failure in any stage can erase. A fold that completed
+    stays completed on disk whatever happens afterwards.
+
+    It records what already happened. Nothing here evaluates, selects, derives
+    a threshold or reads a row, and the re-read verifies that what was written
+    is what was meant, exactly as the selection barrier does.
+    """
+    missing = [
+        field for field in HELD_OUT_EVALUATION_REQUIRED_FIELDS if field not in payload
+    ]
+    if missing:
+        raise T1PersistenceError(
+            f"Fold {fold_index} held-out evaluation evidence is missing "
+            f"{missing}. Incomplete evidence is refused rather than promoted: "
+            "an artifact that exists but cannot answer the specification is "
+            "worse than an artifact that is absent."
+        )
+    path = claimed.held_out_dir / f"T1_FOLD_{fold_index:02d}_HELD_OUT.json"
+    if path.exists():
+        raise T1PersistenceError(
+            f"Fold {fold_index} held-out evaluation evidence is already "
+            "promoted. It is not overwritten, and a second evaluation of a "
+            "held-out subject does not exist."
+        )
+    require_runtime_identity(
+        EnforcementPoint.PRE_PROMOTION,
+        record=claimed.runtime,
+        detail=f"held_out_evaluation:{fold_index}",
+    )
+    # Every refusal above happens before the directory exists, so a refused
+    # promotion leaves no trace of having been attempted.
+    claimed.held_out_dir.mkdir(parents=True, exist_ok=True)
+    write_json_atomic(path, payload)
+    digest = sha256_file(path)
+    reread = json.loads(path.read_text(encoding="utf-8"))
+    if canonical_sha256(reread) != canonical_sha256(payload):
+        raise T1PersistenceError(
+            f"Fold {fold_index} held-out evidence did not read back as written."
+        )
+    return digest
+
+
+def read_held_out_evaluations(claimed: T1ClaimedRun) -> dict[int, dict[str, Any]]:
+    """Every fold's held-out evidence that survives on disk, by fold index.
+
+    A run that failed part way leaves the folds it finished. Reading them back
+    is how a human sees what was measured before the failure, and it is the
+    only reason this evidence is written per fold rather than at the end.
+    """
+    if not claimed.held_out_dir.is_dir():
+        return {}
+    evidence: dict[int, dict[str, Any]] = {}
+    for path in sorted(claimed.held_out_dir.glob("T1_FOLD_*_HELD_OUT.json")):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        evidence[int(payload["fold_index"])] = payload
+    return evidence
+
+
 def write_failure_receipt(
     claimed: T1ClaimedRun | None,
     error: BaseException,

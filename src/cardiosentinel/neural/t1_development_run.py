@@ -423,6 +423,73 @@ def elapsed_stream_seconds(
     return (int(start_sample) - int(first_start_sample)) / float(frequency_hz)
 
 
+def _held_out_evidence(
+    *,
+    claimed: PERSIST.T1ClaimedRun,
+    fold: Any,
+    evaluated: dict[str, Any],
+    selection: dict[str, Any],
+    selection_sha256: str,
+) -> dict[str, Any]:
+    """Arrange what the held-out evaluation already produced, and only that.
+
+    Every value is copied from something that exists: the evaluation the
+    evaluator just returned, or the selection artifact promoted before the
+    barrier opened. The policy and its thresholds are read from the promoted
+    selection rather than from the evaluation, because the promoted artifact is
+    the decision and the evaluation is a description of running it. The caller
+    has already refused if the two disagree.
+
+    Nothing here evaluates, selects, derives a threshold or opens a row. The
+    per-row trace is deliberately absent: it belongs to the OOF state store the
+    specification defines in section 18, and writing it twice would be two
+    records of one measurement.
+    """
+    return {
+        "artifact_class": PERSIST.HELD_OUT_EVALUATION_CLASS,
+        "attempt_id": claimed.attempt_id,
+        "experiment_identity": PERSIST.T1_EXPERIMENT_IDENTITY,
+        "authorized_git_sha": claimed.authorized_git_sha,
+        "protocol_sha256": PERSIST.T1_PROTOCOL_SHA256,
+        "execution_spec_sha256": PERSIST.T1_EXECUTION_SPEC_SHA256,
+        "fold_index": int(fold.fold_index),
+        "held_out_subject": str(fold.held_out_subject),
+        "fit_subject_count": len(fold.fit_subjects),
+        "selected_policy_id": str(evaluated["selected_policy_id"]),
+        "policy": {
+            "q_watch": selection["q_watch"],
+            "q_event": selection["q_event"],
+            "persistence_profile": selection["persistence_profile"],
+        },
+        "thresholds": {
+            "p_watch": selection["p_watch"],
+            "s_watch": selection["s_watch"],
+            "p_event": selection["p_event"],
+            "s_event": selection["s_event"],
+        },
+        "primary_confusion": dict(evaluated["primary_confusion"]),
+        "episode_evidence": dict(evaluated["episode_evidence"]),
+        "onset_latency_seconds": [
+            float(value) for value in evaluated["onset_latency_seconds"]
+        ],
+        "evaluated_row_count": len(evaluated["row_positions"]),
+        "policy_runs": int(evaluated["policy_runs"]),
+        "evaluation_scope": dict(evaluated["evaluation_scope"]),
+        "fold_selection_sha256": str(selection_sha256),
+        "input_lineage_sha256": claimed.promoted.get(PERSIST.INPUT_LINEAGE_NAME),
+        # Said out loud in the artifact, so a reader never has to infer any of
+        # it from the directory the file happens to sit in.
+        "generated_during_canonical_execution": True,
+        "is_recovery_artifact": False,
+        "is_continuation_artifact": False,
+        "held_out_labels_opened": True,
+        "threshold_generated_here": False,
+        "policy_selected_here": False,
+        "state_trace_regenerated_here": False,
+        "test_accessed": False,
+    }
+
+
 # ---------------------------------------------------------------------------
 # The run
 # ---------------------------------------------------------------------------
@@ -762,6 +829,21 @@ class T1DevelopmentRun:
                 )
             self.state.setdefault("held_out_labels_opened_for_folds", []).append(
                 fold.fold_index
+            )
+            # Specification section 17 wants the evaluation evidence persisted
+            # once, and this is that once. It happens here, before the next
+            # fold and long before the OOF assembly, so evidence for a fold
+            # that finished cannot be erased by a stage that has not run yet.
+            state["held_out_evaluation_sha256"] = PERSIST.promote_held_out_evaluation(
+                claimed,
+                fold.fold_index,
+                _held_out_evidence(
+                    claimed=claimed,
+                    fold=fold,
+                    evaluated=evaluated,
+                    selection=selection["artifact"],
+                    selection_sha256=digest,
+                ),
             )
             self.held_out_traces[fold.fold_index] = evaluated
             selections.append({**selection["artifact"], "selection_sha256": digest})
