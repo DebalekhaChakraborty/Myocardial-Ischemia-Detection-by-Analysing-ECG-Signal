@@ -214,8 +214,6 @@ def test_oof_state_columns_return_exactly_the_frozen_schema():
 def test_oof_result_refuses_impossible_episode_counts():
     with pytest.raises(A.T1AssemblyError, match="cannot exceed"):
         A.assemble_oof_result(
-            oof_columns=_columns(),
-            selections=_selections(),
             episode_evidence={
                 "reference_episodes": 2,
                 "predicted_event_runs": 2,
@@ -228,17 +226,15 @@ def test_oof_result_refuses_impossible_episode_counts():
                 "false_negative": 1,
                 "true_negative": 1,
             },
-        )
+        )(oof_columns=_columns(), selections=_selections())
 
 
 def test_final_configuration_refuses_before_the_oof_result_is_promoted():
     with pytest.raises(A.T1AssemblyError, match="only after"):
         A.assemble_final_configuration(
-            oof_columns=_columns(),
-            selections=_selections(),
             configuration=dict.fromkeys(A.FINAL_CONFIGURATION_FIELDS, 0.5),
             oof_result_promoted=False,
-        )
+        )(oof_columns=_columns(), selections=_selections())
 
 
 def test_final_configuration_refuses_a_missing_field():
@@ -246,31 +242,28 @@ def test_final_configuration_refuses_a_missing_field():
     del configuration["p_event"]
     with pytest.raises(A.T1AssemblyError, match="missing"):
         A.assemble_final_configuration(
-            oof_columns=_columns(),
-            selections=_selections(),
-            configuration=configuration,
-            oof_result_promoted=True,
-        )
+            configuration=configuration, oof_result_promoted=True
+        )(oof_columns=_columns(), selections=_selections())
 
 
 def test_challenge_refuses_an_unknown_family():
     with pytest.raises(A.T1AssemblyError, match="Unknown challenge families"):
-        A.assemble_challenge(oof_columns=_columns(), challenge_rows={"MADE_UP": [0, 1]})
+        A.assemble_challenge(challenge_rows={"MADE_UP": [0, 1]})(oof_columns=_columns())
 
 
 def test_challenge_refuses_rows_outside_the_trace():
     with pytest.raises(A.T1AssemblyError, match="outside the trace"):
-        A.assemble_challenge(oof_columns=_columns(), challenge_rows={"RATE": [9999]})
+        A.assemble_challenge(challenge_rows={"RATE": [9999]})(oof_columns=_columns())
 
 
 def test_subject_evidence_refuses_a_missing_subject():
     with pytest.raises(A.T1AssemblyError, match="missing subjects"):
-        A.assemble_subject_evidence(oof_columns=_columns(), per_subject={})
+        A.assemble_subject_evidence(per_subject={})(oof_columns=_columns())
 
 
 def test_bootstrap_refuses_a_missing_statistic():
     with pytest.raises(A.T1AssemblyError, match="lacks a statistic"):
-        A.assemble_bootstrap(oof_columns=_columns(), subject_statistic={})
+        A.assemble_bootstrap(subject_statistic={})(oof_columns=_columns())
 
 
 # ---------------------------------------------------------------------------
@@ -280,8 +273,6 @@ def test_bootstrap_refuses_a_missing_statistic():
 
 def _oof_result():
     return A.assemble_oof_result(
-        oof_columns=_columns(),
-        selections=_selections(),
         episode_evidence={
             "reference_episodes": 6,
             "predicted_event_runs": 4,
@@ -294,7 +285,7 @@ def _oof_result():
             "false_negative": 3,
             "true_negative": 16,
         },
-    )
+    )(oof_columns=_columns(), selections=_selections())
 
 
 def test_the_oof_result_reports_the_sections_the_spec_names():
@@ -340,9 +331,8 @@ def test_exposure_includes_unavailable_positions():
 
 def test_the_bootstrap_is_the_frozen_design():
     bootstrap = A.assemble_bootstrap(
-        oof_columns=_columns(),
-        subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS},
-    )
+        subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
+    )(oof_columns=_columns())
     assert bootstrap["replicates"] == 1000
     assert bootstrap["seed"] == 2026
     assert bootstrap["unit"] == "subject"
@@ -351,18 +341,17 @@ def test_the_bootstrap_is_the_frozen_design():
 
 
 def test_the_bootstrap_is_deterministic():
-    kwargs = dict(
-        oof_columns=_columns(),
-        subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS},
+    build = A.assemble_bootstrap(
+        subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
     )
-    assert A.assemble_bootstrap(**kwargs) == A.assemble_bootstrap(**kwargs)
+    assert build(oof_columns=_columns()) == build(oof_columns=_columns())
 
 
 def test_undefined_replicates_are_preserved_not_zeroed():
     statistic = {s: 0.5 for s in T1_VALIDATION_SUBJECTS}
     statistic[T1_VALIDATION_SUBJECTS[0]] = float("nan")
-    bootstrap = A.assemble_bootstrap(
-        oof_columns=_columns(), subject_statistic=statistic
+    bootstrap = A.assemble_bootstrap(subject_statistic=statistic)(
+        oof_columns=_columns()
     )
     assert bootstrap["undefined_replicates"] > 0
     assert bootstrap["defined_replicates"] + bootstrap["undefined_replicates"] == 1000
@@ -370,9 +359,8 @@ def test_undefined_replicates_are_preserved_not_zeroed():
 
 def test_subject_order_is_the_frozen_roster_not_the_observed_order():
     evidence = A.assemble_subject_evidence(
-        oof_columns=_columns(),
-        per_subject={s: {"episode_f1": 0.5} for s in T1_VALIDATION_SUBJECTS},
-    )
+        per_subject={s: {"episode_f1": 0.5} for s in T1_VALIDATION_SUBJECTS}
+    )(oof_columns=_columns())
     assert evidence["subject_order"] == [
         s for s in T1_VALIDATION_SUBJECTS if s in evidence["subject_order"]
     ]
@@ -380,8 +368,8 @@ def test_subject_order_is_the_frozen_roster_not_the_observed_order():
 
 
 def test_challenge_is_annotation_never_an_input():
-    challenge = A.assemble_challenge(
-        oof_columns=_columns(), challenge_rows={"RATE": [0, 1, 2], "AXIS": [3]}
+    challenge = A.assemble_challenge(challenge_rows={"RATE": [0, 1, 2], "AXIS": [3]})(
+        oof_columns=_columns()
     )
     assert challenge["is_selection_input"] is False
     assert challenge["is_transition_input"] is False
@@ -395,11 +383,9 @@ def test_challenge_is_annotation_never_an_input():
 
 def test_the_final_configuration_is_never_development_evidence():
     configuration = A.assemble_final_configuration(
-        oof_columns=_columns(),
-        selections=_selections(),
         configuration=dict.fromkeys(A.FINAL_CONFIGURATION_FIELDS, 0.5),
         oof_result_promoted=True,
-    )
+    )(oof_columns=_columns(), selections=_selections())
     assert configuration["is_development_evidence"] is False
     assert configuration["replaces_oof_result"] is False
     assert configuration["in_sample_on_all_twelve_subjects"] is True
@@ -478,7 +464,7 @@ def test_no_collaborator_creates_a_scientific_artifact(tmp_path):
 def test_no_collaborator_changes_authorization_state():
     before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     A.assemble_oof_state_columns(columns=_columns(), selections=_selections())
-    A.assemble_challenge(oof_columns=_columns(), challenge_rows={"RATE": [0]})
+    A.assemble_challenge(challenge_rows={"RATE": [0]})(oof_columns=_columns())
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
     code = _code_only()
@@ -543,3 +529,95 @@ def test_the_upstream_contracts_are_unchanged():
     assert SPEC.T1_REQUIRED_T2_RETAINED_ARM == "causal_s4d_longitudinal_v1"
     assert SPEC.T1_U1_REFIT_PERMITTED is False
     assert SPEC.T1_FOLD_COUNT == 12
+
+
+# ---------------------------------------------------------------------------
+# The pre-claim capability gate
+# ---------------------------------------------------------------------------
+
+
+def _bound_collaborators():
+    from cardiosentinel.neural import t1_canonical_driver as D
+    from cardiosentinel.neural import t1_fold_evaluation as E
+
+    return D.T1ExecutionCollaborators(
+        m2_row_evidence=Path("/nonexistent/m2.npz"),
+        t2_identity=Path("/nonexistent/t2_outer_row_identity.npz"),
+        t2_selected_scores=Path("/nonexistent/s.npz"),
+        calibrators={"ltstdb:s2004": object()},
+        subject_of_record=A.subject_of_record(),
+        evaluate_fold=E.T1NonExecutingFoldEvaluator(),
+        assemble_oof_state_columns=A.assemble_oof_state_columns,
+        assemble_oof_result=A.assemble_oof_result(
+            episode_evidence={
+                "reference_episodes": 6,
+                "predicted_event_runs": 4,
+                "matched_episodes": 3,
+            },
+            onset_latency_seconds=[5.0],
+            primary_confusion={
+                "true_positive": 3,
+                "false_positive": 2,
+                "false_negative": 3,
+                "true_negative": 16,
+            },
+        ),
+        assemble_subject_evidence=A.assemble_subject_evidence(
+            per_subject={s: {} for s in T1_VALIDATION_SUBJECTS}
+        ),
+        assemble_bootstrap=A.assemble_bootstrap(
+            subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
+        ),
+        assemble_challenge=A.assemble_challenge(challenge_rows={"RATE": [0]}),
+        assemble_final_configuration=A.assemble_final_configuration(
+            configuration=dict.fromkeys(A.FINAL_CONFIGURATION_FIELDS, 0.5),
+            oof_result_promoted=True,
+        ),
+    )
+
+
+def test_every_assembly_collaborator_satisfies_the_pre_claim_gate():
+    """The gate is an allowlist: silence is refused, so each must attest."""
+    from cardiosentinel.neural import t1_capability_gate as G
+
+    report = G.capability_report(_bound_collaborators())
+    for role, entry in report["roles"].items():
+        if role == "evaluate_fold":
+            continue
+        assert entry["executes"] is True, f"{role} does not attest capability"
+
+
+def test_the_signatures_match_the_calls_the_driver_actually_makes():
+    """The defect the gate exists to catch: bound, callable, wrong shape."""
+    import inspect
+
+    from cardiosentinel.neural.t1_capability_gate import CAPABILITY_CALL_CONTRACT
+
+    collaborators = _bound_collaborators()
+    for role, (positional, keywords) in CAPABILITY_CALL_CONTRACT.items():
+        if role == "evaluate_fold":
+            continue
+        target = getattr(collaborators, role)
+        signature = inspect.signature(target)
+        signature.bind(
+            *[object()] * positional, **{name: object() for name in keywords}
+        )
+
+
+def test_the_only_role_that_cannot_execute_is_the_fold_evaluator():
+    from cardiosentinel.neural import t1_capability_gate as G
+
+    report = G.capability_report(_bound_collaborators())
+    unable = sorted(
+        role for role, entry in report["roles"].items() if not entry["executes"]
+    )
+    assert unable == ["evaluate_fold"]
+    assert report["execution_graph_complete"] is False
+
+
+def test_the_incomplete_graph_is_refused_before_the_claim():
+    from cardiosentinel.neural import t1_capability_gate as G
+
+    with pytest.raises(G.T1CapabilityError, match="evaluate_fold"):
+        G.require_executable_capability(_bound_collaborators())
+    assert not _canonical_root().exists()

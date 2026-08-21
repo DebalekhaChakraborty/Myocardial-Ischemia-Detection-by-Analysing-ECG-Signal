@@ -29,6 +29,11 @@ from typing import Any, Final, Mapping, Sequence
 import numpy as np
 
 from cardiosentinel.data.ltstdb import subject_id_for_record
+from cardiosentinel.neural.t1_capability_gate import (
+    T1_CAPABILITY_ATTRIBUTE,
+    attest,
+    declare_execution_capability,
+)
 from cardiosentinel.neural.t1_development_run import (
     contiguous_runs,
     episode_f1,
@@ -154,6 +159,27 @@ class T1SubjectAuthority:
         }
 
 
+# Declared on the class rather than per instance: `T1SubjectAuthority` is a
+# slots dataclass, and every instance of it has identical behaviour, so the
+# type can speak accurately for all of them. A class whose instances differed
+# in capability would need a per-instance attestation instead.
+setattr(
+    T1SubjectAuthority,
+    T1_CAPABILITY_ATTRIBUTE,
+    attest(
+        "subject_of_record",
+        provider="T1SubjectAuthority",
+        executes=True,
+        reason=(
+            "Resolves a record to its subject through the frozen "
+            "subject_id_for_record and verifies roster membership. "
+            "Complete: it reads no data and cannot fail for want of "
+            "an implementation."
+        ),
+    ),
+)
+
+
 def subject_of_record() -> T1SubjectAuthority:
     """The `subject_of_record` collaborator."""
     return T1SubjectAuthority()
@@ -206,6 +232,16 @@ def _ordered_subjects(columns: Mapping[str, Any]) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 
 
+@declare_execution_capability(
+    "assemble_oof_state_columns",
+    executes=True,
+    reason=(
+        "Arranges the frozen OOF state-evidence schema from columns the "
+        "caller already holds. Complete: it returns the schema in full, "
+        "opens nothing, and every refusal is an input defect rather "
+        "than a missing part."
+    ),
+)
 def assemble_oof_state_columns(
     *, columns: Mapping[str, Any], selections: Sequence[Mapping[str, Any]]
 ) -> dict[str, np.ndarray]:
@@ -261,7 +297,7 @@ def _state_flows(emitted: Sequence[str]) -> dict[str, int]:
     return counts
 
 
-def assemble_oof_result(
+def _build_assemble_oof_result(
     *,
     oof_columns: Mapping[str, Any],
     selections: Sequence[Mapping[str, Any]],
@@ -371,7 +407,7 @@ def assemble_oof_result(
 # ---------------------------------------------------------------------------
 
 
-def assemble_subject_evidence(
+def _build_assemble_subject_evidence(
     *, oof_columns: Mapping[str, Any], per_subject: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Any]:
     """Per-subject evidence in frozen roster order. Subject is the unit."""
@@ -390,7 +426,7 @@ def assemble_subject_evidence(
     }
 
 
-def assemble_bootstrap(
+def _build_assemble_bootstrap(
     *, oof_columns: Mapping[str, Any], subject_statistic: Mapping[str, float]
 ) -> dict[str, Any]:
     """1000 replicates, seed 2026, subjects resampled with multiplicity.
@@ -440,7 +476,7 @@ def assemble_bootstrap(
 # ---------------------------------------------------------------------------
 
 
-def assemble_challenge(
+def _build_assemble_challenge(
     *, oof_columns: Mapping[str, Any], challenge_rows: Mapping[str, Sequence[int]]
 ) -> dict[str, Any]:
     """Family identity joined after the state trace, never before it.
@@ -495,7 +531,7 @@ def assemble_challenge(
 # ---------------------------------------------------------------------------
 
 
-def assemble_final_configuration(
+def _build_assemble_final_configuration(
     *,
     oof_columns: Mapping[str, Any],
     selections: Sequence[Mapping[str, Any]],
@@ -535,6 +571,137 @@ def assemble_final_configuration(
         "replaces_oof_result": T1_FINAL_CONFIGURATION_OVERWRITES_OOF_RESULT,
         "purpose": "deployment_or_separately_authorised_test_only",
     }
+
+
+# ---------------------------------------------------------------------------
+# The driver-shaped collaborators
+# ---------------------------------------------------------------------------
+
+# Five of the seven need evidence the driver does not carry: episode counts,
+# onset latencies, the PRIMARY confusion margins, per-subject statistics,
+# challenge row membership and the final configuration. The driver's call sites
+# pass only the columns and the selections, so that evidence is bound when the
+# collaborator is built rather than passed when it is called. Binding is what
+# keeps the signature honest: a collaborator that took extra required arguments
+# would pass `callable` and then fail the call the driver actually makes, which
+# is the class of defect the pre-claim capability gate exists to catch.
+
+
+def assemble_oof_result(
+    *,
+    episode_evidence: Mapping[str, Any],
+    onset_latency_seconds: Sequence[float],
+    primary_confusion: Mapping[str, int],
+) -> Any:
+    """Bind the held-out episode evidence; return the driver-shaped callable."""
+
+    @declare_execution_capability(
+        "assemble_oof_result",
+        executes=True,
+        reason=(
+            "Arranges the spec section 19 evidence from counts bound at "
+            "construction, deriving only the ratios the specification "
+            "names. Complete: no reported part is unimplemented."
+        ),
+    )
+    def collaborator(
+        *, oof_columns: Mapping[str, Any], selections: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        return _build_assemble_oof_result(
+            oof_columns=oof_columns,
+            selections=selections,
+            episode_evidence=episode_evidence,
+            onset_latency_seconds=onset_latency_seconds,
+            primary_confusion=primary_confusion,
+        )
+
+    return collaborator
+
+
+def assemble_subject_evidence(*, per_subject: Mapping[str, Mapping[str, Any]]) -> Any:
+    """Bind the per-subject evidence; return the driver-shaped callable."""
+
+    @declare_execution_capability(
+        "assemble_subject_evidence",
+        executes=True,
+        reason=(
+            "Orders per-subject evidence bound at construction by the "
+            "frozen roster and returns it in full. Complete."
+        ),
+    )
+    def collaborator(*, oof_columns: Mapping[str, Any]) -> dict[str, Any]:
+        return _build_assemble_subject_evidence(
+            oof_columns=oof_columns, per_subject=per_subject
+        )
+
+    return collaborator
+
+
+def assemble_bootstrap(*, subject_statistic: Mapping[str, float]) -> Any:
+    """Bind the per-subject statistic; return the driver-shaped callable."""
+
+    @declare_execution_capability(
+        "assemble_bootstrap",
+        executes=True,
+        reason=(
+            "Runs the frozen 1000-replicate subject bootstrap over "
+            "already-frozen statistics via subject_bootstrap_indices. "
+            "Complete: no fold is rerun and no policy re-derived."
+        ),
+    )
+    def collaborator(*, oof_columns: Mapping[str, Any]) -> dict[str, Any]:
+        return _build_assemble_bootstrap(
+            oof_columns=oof_columns, subject_statistic=subject_statistic
+        )
+
+    return collaborator
+
+
+def assemble_challenge(*, challenge_rows: Mapping[str, Sequence[int]]) -> Any:
+    """Bind challenge row membership; return the driver-shaped callable."""
+
+    @declare_execution_capability(
+        "assemble_challenge",
+        executes=True,
+        reason=(
+            "Joins challenge family identity after the state trace and "
+            "reports the per-family counts spec section 22 names. "
+            "Complete."
+        ),
+    )
+    def collaborator(*, oof_columns: Mapping[str, Any]) -> dict[str, Any]:
+        return _build_assemble_challenge(
+            oof_columns=oof_columns, challenge_rows=challenge_rows
+        )
+
+    return collaborator
+
+
+def assemble_final_configuration(
+    *, configuration: Mapping[str, Any], oof_result_promoted: bool = False
+) -> Any:
+    """Bind the deployment configuration; return the driver-shaped callable."""
+
+    @declare_execution_capability(
+        "assemble_final_configuration",
+        executes=True,
+        reason=(
+            "Arranges the deployment configuration spec section 23 names. "
+            "Complete: the pre-promotion refusal is an ordering guard, "
+            "not a missing part."
+        ),
+    )
+    def collaborator(
+        *, oof_columns: Mapping[str, Any], selections: Sequence[Mapping[str, Any]]
+    ) -> dict[str, Any]:
+        return _build_assemble_final_configuration(
+            oof_columns=oof_columns,
+            selections=selections,
+            configuration=configuration,
+            oof_result_promoted=oof_result_promoted,
+        )
+
+    return collaborator
 
 
 # ---------------------------------------------------------------------------
