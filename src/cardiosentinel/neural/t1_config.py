@@ -89,7 +89,7 @@ T1_EXECUTION_SPECIFICATION_EXISTS: Final = True
 T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE: Final = (
     "cardiosentinel.neural.t1_development_run"
 )
-T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS: Final = False
+T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS: Final = True
 T1_EXECUTION_SPECIFICATION_AUTHORIZED: Final = False
 
 _SECTIONS: Final = (
@@ -351,10 +351,11 @@ def _require_canonical_agreement(
             f"execution specification {T1_EXECUTION_SPEC_NAME} exists and is merged "
             f"(digest {T1_EXECUTION_SPEC_SHA256}), but the canonical development "
             f"harness it specifies -- {T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE} -- "
-            "has not been implemented, and canonical scientific execution has not "
-            "been authorized. A merged specification is a contract, not a "
-            f"permission. Use {RUN_CLASS_HARNESS!r} for synthetic and integration "
-            "runs."
+            "is implemented but has NOT been authorized to execute. A merged "
+            "specification is a contract and a merged harness is a capability; "
+            "neither is a permission. Canonical execution is authorized "
+            "separately, by a human naming the merged harness commit. Use "
+            f"{RUN_CLASS_HARNESS!r} for synthetic and integration runs."
         )
     frozen = {
         "stream.sampling_frequency_hz": (
