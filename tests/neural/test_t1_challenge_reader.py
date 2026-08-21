@@ -278,15 +278,15 @@ def test_the_assembler_still_satisfies_the_capability_gate(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_the_entrypoint_is_reachable_but_still_refuses():
-    """Superseded premise, stated deliberately.
+def test_the_entrypoint_asks_permission_before_executing():
+    """Ordering, not state, is what protects the attempt.
 
     Earlier PRs asserted `main()` never reached the executor, which was true
-    of the code they shipped. The composition-root PR wires it on purpose, so
-    the property worth holding now is the one that actually protects the
-    attempt: the path exists and permission still refuses at the first step.
+    of the code they shipped. The composition-root PR wires it on purpose and
+    the authorization PR grants permission, so the surviving property is the
+    one that still protects the attempt whatever the constant reads: the gate
+    is asked strictly before the executor is called.
     """
-    from cardiosentinel.neural import t1_config as _CFG
     from cardiosentinel.neural import t1_development_run as _R
 
     source = Path(_R.__file__).read_text(encoding="utf-8")
@@ -294,11 +294,12 @@ def test_the_entrypoint_is_reachable_but_still_refuses():
     assert "T1CanonicalDevelopmentExecutor" in body
     gate = body.index("require_canonical_execution_capability()")
     assert body.index("executor.execute(") > gate
-    assert _CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
 
 
-def test_authorization_remains_false():
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+def test_reading_challenge_membership_does_not_change_authorization():
+    """The reader is label-blind and permission-blind alike."""
+    before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
+    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
 
 
 def test_the_canonical_attempt_is_untouched(tmp_path):

@@ -548,8 +548,14 @@ def test_the_evaluator_matches_the_harness_call_shape():
 
 
 def test_authorization_is_untouched():
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
-    assert D.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    """Agreement between the two views is the invariant that survives the flip.
+
+    A divergent copy of the constant is how a gate opens on one code path and
+    not another, so the two are compared to each other rather than to a value.
+    """
+    assert D.T1_EXECUTION_SPECIFICATION_AUTHORIZED is (
+        CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
+    )
 
 
 def test_the_canonical_attempt_is_untouched(corpus):

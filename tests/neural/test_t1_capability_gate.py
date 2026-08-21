@@ -169,6 +169,21 @@ def authorized(monkeypatch):
     return True
 
 
+@pytest.fixture
+def unauthorized(monkeypatch):
+    """Permission withdrawn, so the refusal under test is the permission one.
+
+    The mirror of `authorized`, and necessary rather than cosmetic now that the
+    repository constant is True: a test that wants to observe the permission
+    refusal has to withdraw permission, or it observes some later check
+    refusing for an unrelated reason. Patched on both modules because the
+    driver holds its own imported reference to the constant.
+    """
+    monkeypatch.setattr(CFG, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
+    monkeypatch.setattr(D, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # 1. A callable refusal-only evaluator is rejected
 # ---------------------------------------------------------------------------
@@ -404,11 +419,17 @@ def test_a_complete_attested_graph_passes_the_gate():
     assert len(receipt["attestations"]) == len(G.REQUIRED_CAPABILITY_ROLES)
 
 
-def test_passing_the_capability_gate_is_not_permission():
+def test_passing_the_capability_gate_is_not_permission(unauthorized):
+    """A complete graph is a capability; the gate still asks for permission.
+
+    Permission is withdrawn explicitly rather than leaned on from repository
+    state, so this proves the gate refuses rather than proving the constant
+    happens to be False.
+    """
     G.require_executable_capability(_complete())
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
     with pytest.raises(D.T1DriverError, match="human authorization is not granted"):
         _executor().execute(_complete())
+    assert not _canonical_root().exists()
 
 
 def test_the_report_separates_bound_from_executable():
@@ -465,9 +486,17 @@ def test_the_gate_module_never_writes_or_opens_anything():
         assert forbidden not in code, f"the gate calls {forbidden}"
 
 
-def test_authorization_remains_false_after_every_check():
-    assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
-    assert D.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+def test_authorization_is_unchanged_by_every_check():
+    """Checking a capability neither grants nor revokes permission.
+
+    The invariant that survives authorization is agreement, not falsity: the
+    driver's imported reference and the config constant must be the same
+    value, because a divergent copy is how a gate opens on one code path and
+    not another.
+    """
+    assert D.T1_EXECUTION_SPECIFICATION_AUTHORIZED is (
+        CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
+    )
     assert CFG.T1_EXECUTION_SPECIFICATION_EXISTS is True
     assert CFG.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is True
 
