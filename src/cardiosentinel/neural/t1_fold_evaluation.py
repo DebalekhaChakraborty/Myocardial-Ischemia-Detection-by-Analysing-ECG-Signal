@@ -15,6 +15,11 @@ is the step that runs twelve candidate policies and scores them, and enabling
 it is a separate decision from wiring it. Capability and permission stay
 separate here exactly as they do at the driver and the config gate.
 
+It also declares its own inability to the pre-claim capability gate, through
+`t1_execution_capability`. Being callable was once enough to reach the claim,
+which meant this object could have cost the single canonical attempt at stage
+17; the declaration is what moves that refusal to before stage 1.
+
 **What neither piece does.** No fold is run, no validation label is read, no
 prediction is generated, no metric is computed, no OOF evidence is produced, no
 policy is selected, TEST is unreachable and no canonical directory is created.
@@ -38,6 +43,10 @@ from typing import Any, Final, Protocol, Sequence, runtime_checkable
 
 import numpy as np
 
+from cardiosentinel.neural.t1_capability_gate import (
+    T1CapabilityAttestation,
+    attest,
+)
 from cardiosentinel.neural.t1_execution_spec import (
     T1_CANDIDATE_POLICIES_PER_FOLD,
     T1_HELD_OUT_POLICY_RUNS_PER_FOLD,
@@ -264,6 +273,25 @@ class T1NonExecutingFoldEvaluator:
         """The driver's `evaluate_fold` shape, which also refuses."""
         raise T1FoldEvaluationError(EVALUATION_DISABLED_MESSAGE)
 
+    def t1_execution_capability(self) -> T1CapabilityAttestation:
+        """Declare, to the pre-claim gate, that this cannot finish a run.
+
+        Being callable is not the same as being able to complete, and the
+        driver claims the attempt seven stages before it first calls a fold
+        evaluator. Saying so here is what keeps that claim from happening: the
+        gate refuses this graph before stage 1 rather than after stage 10.
+        """
+        return attest(
+            "evaluate_fold",
+            provider=type(self).__name__,
+            executes=False,
+            reason=(
+                "The twelve-candidate selection and the held-out trace are not "
+                "implemented; this object exists to complete the collaborator "
+                "graph for review, not to run science."
+            ),
+        )
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "evaluator": type(self).__name__,
@@ -287,6 +315,7 @@ def evaluation_capability() -> dict[str, Any]:
         "evaluator_contract": T1FoldEvaluator.__name__,
         "evaluator_implementation": T1NonExecutingFoldEvaluator.__name__,
         "execution_enabled": False,
+        "declares_capability_to_the_pre_claim_gate": True,
         "target_members": list(T1_TARGET_MEMBERS),
         "refused_members": list(T1_TARGET_MEMBERS_REFUSED),
         "reads_require_an_active_authority": True,
