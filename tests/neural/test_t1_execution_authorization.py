@@ -24,9 +24,41 @@ from cardiosentinel.neural import t1_config as CFG
 from cardiosentinel.neural import t1_development_run as R
 from cardiosentinel.neural import t1_execution_spec as SPEC
 from cardiosentinel.neural import t1_persistence as PERSIST
+from cardiosentinel.neural.runtime_sentinel import (
+    RuntimeIntegrityError,
+    RuntimeIntegrityRecord,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 CANONICAL_SHA = "5804e66668dda062a7dfe2d3a5bb3a43bff7ee5e"
+
+
+def _observed_dependency_digest() -> str:
+    from cardiosentinel.neural.provenance import dependency_environment
+
+    return str(dependency_environment()["installed_packages_sha256"])
+
+
+def _frozen_dependency_digest() -> str:
+    from cardiosentinel.neural.p1_experiment import FROZEN_DEPENDENCY_DIGEST
+
+    return str(FROZEN_DEPENDENCY_DIGEST)
+
+
+# `stage_preflight` opens with the runtime-identity check, so any test that
+# needs to reach the commit check behind it requires the frozen scientific
+# interpreter. CI installs a different set and is refused at stage 1 -- which
+# is correct behaviour, and `test_a_foreign_runtime_is_refused_first` covers
+# it directly and runs everywhere. Same convention as the sibling harness
+# suite.
+ON_FROZEN_INTERPRETER = _observed_dependency_digest() == _frozen_dependency_digest()
+requires_frozen_runtime = pytest.mark.skipif(
+    not ON_FROZEN_INTERPRETER,
+    reason=(
+        "reaching the commit check requires the frozen scientific interpreter; "
+        "this environment reports a different installed-package digest"
+    ),
+)
 
 
 def _argv(sha: str) -> list[str]:
@@ -63,6 +95,16 @@ def test_authorization_was_false_before_this_change():
     """
     import subprocess
 
+    reachable = subprocess.run(
+        ["git", "cat-file", "-e", f"{CANONICAL_SHA}^{{commit}}"],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+    )
+    if reachable.returncode != 0:
+        pytest.skip(
+            f"{CANONICAL_SHA[:12]} is not in this clone (shallow checkout); the "
+            "proof runs where the history is complete"
+        )
     blob = subprocess.run(
         ["git", "show", f"{CANONICAL_SHA}:src/cardiosentinel/neural/t1_config.py"],
         cwd=REPOSITORY_ROOT,
@@ -178,6 +220,7 @@ def test_the_execution_flag_is_required():
     assert not _canonical_root().exists()
 
 
+@requires_frozen_runtime
 def test_a_wrong_sha_is_refused(monkeypatch):
     """HEAD is re-read and compared; the authorization names one commit."""
     monkeypatch.setattr(
@@ -193,6 +236,7 @@ def test_a_wrong_sha_is_refused(monkeypatch):
     assert not _canonical_root().exists()
 
 
+@requires_frozen_runtime
 def test_a_dirty_tree_is_refused(monkeypatch):
     """Canonical evidence requires a clean checkout, and nothing is repaired."""
     monkeypatch.setattr(
@@ -208,6 +252,7 @@ def test_a_dirty_tree_is_refused(monkeypatch):
     assert not _canonical_root().exists()
 
 
+@requires_frozen_runtime
 def test_the_sha_is_checked_before_any_upstream_or_row_access(monkeypatch):
     """A wrong SHA stops at stage 2, before the upstream chain is even read."""
     opened: list[str] = []
@@ -287,9 +332,37 @@ def test_no_run_directory_is_created_on_any_refusal_path(argv, monkeypatch):
         lambda root: {"git_sha": CANONICAL_SHA, "git_dirty": False},
     )
     existed = _canonical_root().exists()
-    with pytest.raises((PERSIST.T1PersistenceError, SystemExit, CFG.T1ConfigError)):
+    with pytest.raises(
+        (
+            PERSIST.T1PersistenceError,
+            RuntimeIntegrityError,
+            SystemExit,
+            CFG.T1ConfigError,
+        )
+    ):
         R.main(argv)
     assert _canonical_root().exists() is existed
+    assert not _canonical_root().exists()
+
+
+def test_a_foreign_runtime_is_refused_first():
+    """The runtime identity is stage 1, ahead of the commit check.
+
+    Runs everywhere: the record is given an expected digest that matches no
+    environment, so the refusal is a property of the check rather than of the
+    machine. This is what the three commit-check tests above skip behind on a
+    non-frozen interpreter.
+    """
+    run = R.T1DevelopmentRun(
+        authorized_git_sha=CANONICAL_SHA,
+        runtime=RuntimeIntegrityRecord(expected_digest="0" * 64),
+    )
+    with pytest.raises(RuntimeIntegrityError) as caught:
+        run.stage_preflight()
+    message = str(caught.value)
+    assert "start" in message
+    assert "NOT repaired" in message
+    assert run.stages.entered == [SPEC.STAGE_START]
     assert not _canonical_root().exists()
 
 
