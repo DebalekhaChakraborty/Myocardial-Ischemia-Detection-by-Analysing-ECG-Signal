@@ -42,6 +42,7 @@ from cardiosentinel.neural.runtime_sentinel import (
     RuntimeIntegrityRecord,
     require_runtime_identity,
 )
+from cardiosentinel.neural.t1_config import require_canonical_execution_authorized
 from cardiosentinel.neural.t1_execution_spec import (
     STAGE_ASSEMBLE_LABEL_BLIND,
     STAGE_BOOTSTRAP,
@@ -79,7 +80,6 @@ from cardiosentinel.neural.t1_execution_spec import (
     T1_EXPECTED_GIT_SHA_FLAG,
     T1_FOLD_COUNT,
     T1_STRIDE_SECONDS,
-    T1ExecutionSpecError,
     require_cli_option_permitted,
     require_defined_metric,
     require_held_out_access_authorized,
@@ -433,10 +433,16 @@ def elapsed_stream_seconds(
 class T1DevelopmentRun:
     """The 29-stage canonical development run.
 
-    Constructing this object does nothing. ``execute`` walks the frozen stages
-    in order and the stage recorder refuses any step taken out of sequence, so
-    "the claim happened before any per-row access" is enforced by index rather
-    than by reading the code top to bottom.
+    Constructing this object does nothing. The stages are defined individually
+    and are walked in the frozen order by the stage recorder, which refuses any
+    step taken out of sequence, so "the claim happened before any per-row
+    access" is enforced by index rather than by reading the code top to bottom.
+
+    There is no end-to-end driver here. ``stage_preflight`` covers stages 1 to
+    9 and is what ``main`` runs; the stages after the claim are defined but
+    nothing sequences them, and ``stage_folds`` takes a fold evaluator that no
+    caller in this package supplies. Assembling that driver is a separate
+    reviewable change, and it is the change that would consume the attempt.
     """
 
     authorized_git_sha: str
@@ -917,21 +923,57 @@ def registered_options(
     return tuple(sorted(options))
 
 
-def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover
-    """Entry point. Never runs on import."""
+def main(argv: Sequence[str] | None = None) -> int:
+    """Entry point. Never runs on import.
+
+    Canonical execution is authorized, so this no longer refuses on permission.
+    Permission is only the first of seven questions, and it is the cheapest one:
+    it is a fact about a human decision, while the six that follow are facts
+    about this repository and this machine at this moment. All of them are
+    proven by ``stage_preflight`` -- stages 1 to 9 of the frozen order -- before
+    anything is claimed:
+
+    * the runtime identity matches the frozen dependency digest,
+    * ``--expected-git-sha`` matches HEAD and the working tree is clean,
+    * the protocol and execution-specification documents digest as frozen,
+    * the M2, U1 and T2 retention decisions all validate,
+    * TEST is unopened,
+    * the canonical attempt does not already exist.
+
+    A failure at any of them raises before the run directory is created, so a
+    refused invocation leaves the single canonical attempt unconsumed and
+    nothing is retried, repaired, renamed or re-rooted.
+
+    Preflight opens no VALIDATION row, writes no artifact and makes no claim.
+    What it does not do is run the science: the 29-stage choreography exists
+    here as individually verifiable stage methods and nothing sequences them
+    end to end, so a verified preflight is followed by an honest stop rather
+    than a run. That stop reports a missing capability, never a withheld
+    permission -- the distinction this module and ``t1_config`` both keep.
+    """
     parser = build_parser()
     arguments = parser.parse_args(argv)
     for option in registered_options(parser):
         require_cli_option_permitted(option)
-    require_no_test_access("validation")
-    validate_t1_protocol_document()
-    validate_t1_execution_spec_document()
-    raise T1ExecutionSpecError(
-        "The canonical T1 development run is implemented but has not been "
-        "authorized to execute. Authorization is a separate human decision taken "
-        f"after this harness is merged and its SHA frozen; "
-        f"{T1_EXPECTED_GIT_SHA_FLAG} {arguments.expected_git_sha} names a commit, "
-        "not a permission."
+
+    require_canonical_execution_authorized()
+
+    run = T1DevelopmentRun(authorized_git_sha=arguments.expected_git_sha)
+    run.stage_preflight()
+
+    raise T1DevelopmentError(
+        "Pre-claim verification passed: canonical execution is authorized, "
+        f"{T1_EXPECTED_GIT_SHA_FLAG} {arguments.expected_git_sha} matches a "
+        "clean HEAD, the runtime identity matches the frozen dependency "
+        "digest, the M2, U1 and T2 retention decisions validate, TEST is "
+        "unopened and the canonical attempt does not exist. The run stops "
+        "here because the 29-stage orchestration that would consume the "
+        "attempt is not implemented in this module: the stages are defined "
+        "individually and nothing sequences them, and "
+        f"{STAGE_FOLD_RUN_CANDIDATES!r} in particular requires a fold "
+        "evaluator no caller supplies. This is a missing capability, not a "
+        "withheld permission. Nothing was claimed and the single canonical "
+        "attempt remains unconsumed."
     )
 
 

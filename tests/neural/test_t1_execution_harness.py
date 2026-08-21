@@ -519,13 +519,22 @@ def test_the_shipped_config_loads_and_is_not_protocol_evidence(config):
     assert config.profile.name == "CONSERVATIVE"
 
 
-def test_a_canonical_run_is_refused_without_an_execution_specification():
+def test_a_canonical_run_is_refused_when_authorization_is_withdrawn(monkeypatch):
+    """Permission is still a gate, not a formality.
+
+    Canonical execution is authorized now, so this withdraws the permission to
+    prove the check is live rather than vestigial: with it off, the canonical
+    run class is unavailable no matter how correct the rest of the config is.
+    """
+    from cardiosentinel.neural import t1_config as C
+
+    monkeypatch.setattr(C, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
     raw = _raw_config()
     raw["run"]["run_class"] = RUN_CLASS_CANONICAL
     raw["thresholds"]["source"] = THRESHOLD_SOURCE_DERIVED
     for key in ("p_watch", "s_watch", "p_event", "s_event"):
         raw["thresholds"]["literal"][key] = None
-    with pytest.raises(T1ConfigError, match="execution specification"):
+    with pytest.raises(T1ConfigError, match="not authorized"):
         build_t1_episode_config(raw)
 
 
@@ -875,14 +884,25 @@ def test_the_three_authorization_facts_stay_separate():
 
     assert C.T1_EXECUTION_SPECIFICATION_EXISTS is True
     assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is True
-    assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
+    assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is True
     assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE == (
         "cardiosentinel.neural.t1_development_run"
     )
+    # All three read True now, which is exactly when a check derived from the
+    # other two would be indistinguishable from a deliberate one. They stay
+    # three separately assigned constants; `test_the_permission_gate_has_
+    # exactly_one_implementation` proves only one of them is ever read.
 
 
-def test_the_canonical_refusal_no_longer_claims_the_specification_is_missing():
-    """The old message said 'none exists'. One exists; it is merged."""
+def test_the_canonical_refusal_names_permission_not_absence(monkeypatch):
+    """The refusal must never claim the specification or harness is missing.
+
+    Both exist. If permission is ever withdrawn again, the message has to say
+    so honestly rather than blaming an absence that is not real.
+    """
+    from cardiosentinel.neural import t1_config as C
+
+    monkeypatch.setattr(C, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
     raw = _raw_config()
     raw["run"]["run_class"] = RUN_CLASS_CANONICAL
     raw["thresholds"]["source"] = THRESHOLD_SOURCE_DERIVED
@@ -892,18 +912,19 @@ def test_the_canonical_refusal_no_longer_claims_the_specification_is_missing():
         build_t1_episode_config(raw)
     message = str(caught.value)
     assert "exists and is merged" in message
-    assert "is implemented but has NOT been authorized" in message
+    assert "is implemented" in message
     assert "neither is a permission" in message
+    assert "a harness is a capability" in message
     assert "none exists" not in message
 
 
-def test_the_canonical_development_harness_exists_but_is_not_authorized():
+def test_the_canonical_development_harness_exists_and_is_now_authorized():
     """The gate's stated reason must match the repository, not just sound right.
 
-    This test previously asserted the harness was absent. It now exists, so the
-    tripwire it was fired to protect has done its job: the constant tracks
-    reality, and the authorization constant is deliberately unchanged. A module
-    existing is a capability, never a permission.
+    This test first asserted the harness was absent, then that its existence
+    had not authorized anything. Both tripwires did their job. Permission was
+    granted afterwards by a separate reviewed act, which is the only way it may
+    ever be granted: a module existing is a capability, never a permission.
     """
     import importlib.util
 
@@ -912,6 +933,7 @@ def test_the_canonical_development_harness_exists_but_is_not_authorized():
     found = importlib.util.find_spec(C.T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE)
     assert found is not None, "the harness module went missing"
     assert C.T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS is True
-    assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False, (
-        "implementing the harness must not authorize execution"
-    )
+    assert C.T1_EXECUTION_SPECIFICATION_AUTHORIZED is True
+    # Permission buys nothing on its own: the entry point still proves the
+    # commit, the runtime, the upstream chain, TEST and the attempt.
+    assert callable(C.require_canonical_execution_authorized)

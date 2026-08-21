@@ -17,7 +17,8 @@ Two run classes exist and they are not interchangeable:
 ``canonical_t1_development``
     Protocol evidence. Every frozen value must match exactly, thresholds must
     be derived, and a separately authorized T1 execution specification is
-    required. No such specification exists yet, so the harness refuses.
+    required. The specification is frozen, the harness is implemented and
+    canonical execution has been authorized, so this run class is available.
 
 ``harness_verification``
     Synthetic streams, reviewer acceptance checks, and integration of a future
@@ -72,25 +73,32 @@ THRESHOLD_SOURCES: Final = (THRESHOLD_SOURCE_DERIVED, THRESHOLD_SOURCE_LITERAL)
 
 REFRACTORY_SCOPE: Final = "alert_emission_only"
 
-# The frozen execution specification EXISTS and is merged. What does not exist
-# is the canonical development harness it specifies, and separately, an
-# authorization to run science.
-#
-# These are three different facts and conflating them is how a gate opens by
-# accident:
+# Three different facts, deliberately not conflated. Collapsing any two of them
+# is how a gate opens by accident:
 #
 #   1. the specification document exists                     -> True
-#   2. the canonical development harness is implemented      -> False
-#   3. canonical scientific execution is authorized          -> False
+#   2. the canonical development harness is implemented      -> True
+#   3. canonical scientific execution is authorized          -> True
 #
-# Only (3) gates execution. It is a deliberate constant rather than a derived
-# check, because the existence of a module is not permission to run it.
+# A specification is a contract. A harness is a capability. Neither is a
+# permission. Only (3) gates execution, and it stays a deliberate constant
+# rather than a check derived from (1) or (2), because the existence of a
+# document and the existence of a module are facts about the repository while
+# permission is a fact about a human decision.
+#
+# (3) was flipped by the reviewed enabling change that also replaced the
+# unconditional refusal in `t1_development_run.main` with the frozen pre-claim
+# verification. Granting permission weakened no check: the entry point still
+# proves the authorized commit against a clean HEAD, the runtime identity
+# against the frozen dependency digest, all three upstream retention
+# decisions, that TEST is unopened and that the canonical attempt does not
+# exist -- and it proves every one of them before anything is claimed.
 T1_EXECUTION_SPECIFICATION_EXISTS: Final = True
 T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE: Final = (
     "cardiosentinel.neural.t1_development_run"
 )
 T1_CANONICAL_DEVELOPMENT_HARNESS_EXISTS: Final = True
-T1_EXECUTION_SPECIFICATION_AUTHORIZED: Final = False
+T1_EXECUTION_SPECIFICATION_AUTHORIZED: Final = True
 
 _SECTIONS: Final = (
     "protocol",
@@ -159,6 +167,31 @@ _PROFILE_WINDOW_KEYS: Final = (
 
 class T1ConfigError(RuntimeError):
     """Raised when a T1 execution config is malformed or contradicts the protocol."""
+
+
+def require_canonical_execution_authorized() -> None:
+    """The permission gate, and the only one.
+
+    Lives beside the constant it reads so the permission and its enforcement
+    cannot drift apart, and is the single place any caller asks the question --
+    the config loader and the canonical entry point both come here rather than
+    testing the constant themselves.
+
+    Permission is not capability: this says nothing about whether the harness
+    exists or whether the specification is frozen, and passing it verifies
+    nothing about the commit, the runtime, the upstream chain or the attempt.
+    Those are proven separately, and afterwards.
+    """
+    if not T1_EXECUTION_SPECIFICATION_AUTHORIZED:
+        raise T1ConfigError(
+            "Canonical T1 execution is not authorized. The frozen execution "
+            f"specification {T1_EXECUTION_SPEC_NAME} exists and is merged "
+            f"(digest {T1_EXECUTION_SPEC_SHA256}), and the canonical "
+            f"development harness {T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE} is "
+            "implemented, but neither is a permission: a specification is a "
+            "contract and a harness is a capability. Canonical execution is "
+            "authorized separately, by a human naming the merged harness commit."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -345,18 +378,14 @@ def _require_canonical_agreement(
     q_event: float,
 ) -> None:
     """A canonical run must agree with the frozen protocol on every frozen value."""
-    if not T1_EXECUTION_SPECIFICATION_AUTHORIZED:
+    try:
+        require_canonical_execution_authorized()
+    except T1ConfigError as unauthorized:
         raise T1ConfigError(
-            f"run.run_class {RUN_CLASS_CANONICAL!r} is not available. The frozen "
-            f"execution specification {T1_EXECUTION_SPEC_NAME} exists and is merged "
-            f"(digest {T1_EXECUTION_SPEC_SHA256}), but the canonical development "
-            f"harness it specifies -- {T1_CANONICAL_DEVELOPMENT_HARNESS_MODULE} -- "
-            "is implemented but has NOT been authorized to execute. A merged "
-            "specification is a contract and a merged harness is a capability; "
-            "neither is a permission. Canonical execution is authorized "
-            "separately, by a human naming the merged harness commit. Use "
-            f"{RUN_CLASS_HARNESS!r} for synthetic and integration runs."
-        )
+            f"run.run_class {RUN_CLASS_CANONICAL!r} is not available. "
+            f"{unauthorized} Use {RUN_CLASS_HARNESS!r} for synthetic and "
+            "integration runs."
+        ) from unauthorized
     frozen = {
         "stream.sampling_frequency_hz": (
             stream["sampling_frequency_hz"],
