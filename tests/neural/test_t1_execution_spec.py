@@ -20,6 +20,7 @@ import tokenize
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_execution_spec as X
 from cardiosentinel.neural import t1_protocol as P
@@ -515,12 +516,16 @@ def test_40_the_spec_binder_cannot_perform_scientific_execution():
 
 
 def test_40b_no_planned_artifact_is_created_by_this_specification():
+    """The specification module declares artifacts; it never makes one.
+
+    This once proved the point by asserting the canonical run root did not
+    exist. The canonical run has since created it, so that assertion would now
+    fail for a reason that has nothing to do with this module. The guard proves
+    the honest version: importing and exercising the specification leaves the
+    canonical namespace exactly as it was found.
+    """
     assert X.T1_ARTIFACTS_CREATED_BY_THIS_SPECIFICATION == ()
-    run_root = REPOSITORY_ROOT / X.T1_RUN_ROOT_RELATIVE
-    assert not run_root.exists(), (
-        f"{run_root} exists; a canonical T1 attempt directory in any state "
-        "consumes the attempt, and this specification creates none"
-    )
+    assert_attempt_unconsumed()
 
 
 def test_40c_the_planned_artifact_names_are_frozen():

@@ -16,6 +16,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_config as CFG
@@ -465,7 +466,7 @@ def test_a_complete_graph_refuses_when_permission_is_withdrawn(monkeypatch):
     with pytest.raises(D.T1DriverError, match="human authorization is not granted"):
         executor.execute(_collaborators())
     assert executor.run.stages.entered == []
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 # ---------------------------------------------------------------------------
@@ -474,10 +475,10 @@ def test_a_complete_graph_refuses_when_permission_is_withdrawn(monkeypatch):
 
 
 def test_no_run_directory_is_created():
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     for index in range(len(t1_folds())):
         _request(index)
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_no_metrics_are_generated():

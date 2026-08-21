@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_config as CFG
@@ -153,7 +154,7 @@ def test_importing_the_driver_creates_nothing_and_emits_nothing(tmp_path, capsys
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_plan_is_readable_without_authorization(monkeypatch):
@@ -314,10 +315,10 @@ def test_granting_permission_is_not_something_the_driver_can_do():
 
 def test_the_canonical_attempt_directory_is_absent_and_stays_absent(monkeypatch):
     monkeypatch.setattr(D, "T1_EXECUTION_SPECIFICATION_AUTHORIZED", False)
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     with pytest.raises(D.T1DriverError):
         _executor().execute(_collaborators())
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_driver_never_creates_a_directory():
@@ -574,7 +575,7 @@ def test_an_unbound_collaborator_is_refused_before_the_claim(monkeypatch):
     with pytest.raises(D.T1DriverError, match="is not bound"):
         executor.execute(_collaborators(evaluate_fold=None))
     assert executor.run.stages.entered == []
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_every_label_bearing_step_is_a_required_collaborator():

@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_assembly as A
 from cardiosentinel.neural import t1_config as CFG
@@ -525,7 +526,7 @@ def test_no_collaborator_creates_a_scientific_artifact(tmp_path):
         assert not re.search(rf"\b{writer}\b", code), (
             f"the assembly layer calls {writer}"
         )
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     assert sorted(tmp_path.iterdir()) == []
 
 
@@ -550,7 +551,7 @@ def test_no_retry_force_reset_or_seed_override_is_introduced():
 
 
 def test_the_canonical_attempt_is_untouched():
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 # ---------------------------------------------------------------------------
@@ -686,4 +687,4 @@ def test_the_incomplete_graph_is_refused_before_the_claim():
 
     with pytest.raises(G.T1CapabilityError, match="evaluate_fold"):
         G.require_executable_capability(_bound_collaborators())
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()

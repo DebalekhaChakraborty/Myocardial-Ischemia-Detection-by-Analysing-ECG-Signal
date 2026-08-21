@@ -19,6 +19,7 @@ import functools
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_capability_gate as G
@@ -429,7 +430,7 @@ def test_passing_the_capability_gate_is_not_permission(unauthorized):
     G.require_executable_capability(_complete())
     with pytest.raises(D.T1DriverError, match="human authorization is not granted"):
         _executor().execute(_complete())
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_report_separates_bound_from_executable():
@@ -454,21 +455,21 @@ def test_the_report_never_raises_on_an_incomplete_graph():
 
 
 def test_no_run_directory_is_created_on_capability_failure(authorized):
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     with pytest.raises(G.T1CapabilityError):
         _executor().execute(_complete(evaluate_fold=E.T1NonExecutingFoldEvaluator()))
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_gate_alone_creates_nothing(authorized):
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     with pytest.raises(G.T1CapabilityError):
         G.require_executable_capability(
             _complete(evaluate_fold=E.T1NonExecutingFoldEvaluator())
         )
     G.require_executable_capability(_complete())
     G.capability_report(_complete())
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_gate_module_never_writes_or_opens_anything():
@@ -502,7 +503,7 @@ def test_authorization_is_unchanged_by_every_check():
 
 
 def test_the_canonical_attempt_is_still_unconsumed():
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 # ---------------------------------------------------------------------------

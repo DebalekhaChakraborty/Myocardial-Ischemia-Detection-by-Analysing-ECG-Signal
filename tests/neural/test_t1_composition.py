@@ -15,6 +15,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_capability_gate as G
@@ -149,7 +150,7 @@ def test_permission_is_the_only_remaining_blocker(monkeypatch):
         D.T1CanonicalDevelopmentExecutor(run=run).execute(collaborators)
     assert run.stages.entered == []
     assert run.claimed is None
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +161,7 @@ def test_permission_is_the_only_remaining_blocker(monkeypatch):
 def test_a_missing_artifact_fails_closed(tmp_path):
     with pytest.raises(C.T1CompositionError, match="is absent"):
         C.canonical_artifact_paths(tmp_path)
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_a_missing_artifact_refusal_names_the_artifact(tmp_path):
@@ -275,7 +276,7 @@ def test_composing_the_graph_does_not_change_authorization():
 
 
 def test_the_canonical_attempt_is_untouched():
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_no_test_access_occurs():

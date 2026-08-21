@@ -17,6 +17,7 @@ import math
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_assembly as A
 from cardiosentinel.neural import t1_config as CFG
@@ -302,9 +303,9 @@ def test_deriving_subject_evidence_does_not_change_authorization():
 
 
 def test_the_canonical_attempt_is_untouched():
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     A.derive_subject_statistic(held_out_traces=_traces())
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_final_configuration_is_not_implemented_here():
