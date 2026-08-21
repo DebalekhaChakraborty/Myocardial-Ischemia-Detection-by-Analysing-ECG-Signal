@@ -39,6 +39,9 @@ class _Source:
         raise AssertionError("no test in this module opens targets")
 
 
+IDENTITY_PATH = Path("/nonexistent/t2_outer_row_identity.npz")
+
+
 def _canonical_root() -> Path:
     return PERSIST.canonical_run_directory(REPOSITORY_ROOT)
 
@@ -126,6 +129,22 @@ def _code_only() -> str:
 def test_each_collaborator_exists(name):
     assert hasattr(A, name), name
     assert callable(getattr(A, name))
+
+
+def _identity_file(tmp_path):
+    """A synthetic row identity whose stable ids match `_columns()`."""
+    import numpy as _np
+
+    stable = _np.asarray(_columns()["stable_id"])
+    families = _np.asarray(
+        [
+            "rate_related_confounder" if index % 4 == 0 else "background_negative"
+            for index in range(len(stable))
+        ]
+    )
+    path = tmp_path / "t2_outer_row_identity.npz"
+    _np.savez(path, stable_id=stable, target_family=families)
+    return path
 
 
 def test_the_collaborators_are_exactly_the_drivers_missing_ones():
@@ -253,14 +272,30 @@ def test_final_configuration_refuses_a_missing_field():
         )(oof_columns=_columns(), selections=_selections())
 
 
-def test_challenge_refuses_an_unknown_family():
-    with pytest.raises(A.T1AssemblyError, match="Unknown challenge families"):
-        A.assemble_challenge(challenge_rows={"MADE_UP": [0, 1]})(oof_columns=_columns())
+def test_challenge_families_cannot_be_unknown_by_construction(tmp_path):
+    """The guarantee moved: membership is derived, so it cannot be forged.
+
+    The builder used to refuse an injected family it did not recognise. It no
+    longer takes one, so an unknown family is not refused -- it is unreachable,
+    which is the stronger property.
+    """
+    import inspect
+
+    assert "challenge_rows" not in inspect.signature(A.assemble_challenge).parameters
+    artifact = A.assemble_challenge(t2_identity=_identity_file(tmp_path))(
+        oof_columns=_columns()
+    )
+    assert set(artifact["families"]) == set(A.CHALLENGE_FAMILIES)
 
 
-def test_challenge_refuses_rows_outside_the_trace():
-    with pytest.raises(A.T1AssemblyError, match="outside the trace"):
-        A.assemble_challenge(challenge_rows={"RATE": [9999]})(oof_columns=_columns())
+def test_challenge_rows_cannot_fall_outside_the_trace(tmp_path):
+    """Rows are positions found in the trace, so out-of-range cannot arise."""
+    artifact = A.assemble_challenge(t2_identity=_identity_file(tmp_path))(
+        oof_columns=_columns()
+    )
+    width = len(_columns()["stable_id"])
+    for family in A.CHALLENGE_FAMILIES:
+        assert artifact["families"][family]["row_count"] <= width
 
 
 def test_subject_evidence_refuses_a_missing_subject():
@@ -374,8 +409,8 @@ def test_subject_order_is_the_frozen_roster_not_the_observed_order():
     assert evidence["inferential_unit"] == "subject"
 
 
-def test_challenge_is_annotation_never_an_input():
-    challenge = A.assemble_challenge(challenge_rows={"RATE": [0, 1, 2], "AXIS": [3]})(
+def test_challenge_is_annotation_never_an_input(tmp_path):
+    challenge = A.assemble_challenge(t2_identity=_identity_file(tmp_path))(
         oof_columns=_columns()
     )
     assert challenge["is_selection_input"] is False
@@ -468,10 +503,10 @@ def test_no_collaborator_creates_a_scientific_artifact(tmp_path):
     assert sorted(tmp_path.iterdir()) == []
 
 
-def test_no_collaborator_changes_authorization_state():
+def test_no_collaborator_changes_authorization_state(tmp_path):
     before = CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     A.assemble_oof_state_columns(columns=_columns(), selections=_selections())
-    A.assemble_challenge(challenge_rows={"RATE": [0]})(oof_columns=_columns())
+    A.assemble_challenge(t2_identity=_identity_file(tmp_path))(oof_columns=_columns())
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is before
     assert CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED is False
     code = _code_only()
@@ -576,7 +611,7 @@ def _bound_collaborators():
         assemble_bootstrap=A.assemble_bootstrap(
             subject_statistic={s: 0.5 for s in T1_VALIDATION_SUBJECTS}
         ),
-        assemble_challenge=A.assemble_challenge(challenge_rows={"RATE": [0]}),
+        assemble_challenge=A.assemble_challenge(t2_identity=IDENTITY_PATH),
         assemble_final_configuration=A.assemble_final_configuration(
             configuration=dict.fromkeys(A.FINAL_CONFIGURATION_FIELDS, 0.5),
             oof_result_promoted=True,

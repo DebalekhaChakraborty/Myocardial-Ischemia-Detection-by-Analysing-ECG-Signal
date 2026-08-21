@@ -34,6 +34,7 @@ from cardiosentinel.neural.t1_capability_gate import (
     attest,
     declare_execution_capability,
 )
+from cardiosentinel.neural.t1_challenge import derive_challenge_rows
 from cardiosentinel.neural.t1_development_run import (
     contiguous_runs,
     episode_f1,
@@ -657,8 +658,15 @@ def assemble_bootstrap(*, subject_statistic: Mapping[str, float]) -> Any:
     return collaborator
 
 
-def assemble_challenge(*, challenge_rows: Mapping[str, Sequence[int]]) -> Any:
-    """Bind challenge row membership; return the driver-shaped callable."""
+def assemble_challenge(*, t2_identity: Any) -> Any:
+    """Bind the canonical identity archive; return the driver-shaped callable.
+
+    A location, not a membership map. The caller says where the frozen row
+    identity lives and nothing about what is in it, so challenge membership is
+    derived from the canonical artifact at the moment of the join rather than
+    handed in by whoever composed the graph. The read itself lives in
+    `t1_challenge`, which keeps this layer a pure arranger.
+    """
 
     @declare_execution_capability(
         "assemble_challenge",
@@ -671,7 +679,10 @@ def assemble_challenge(*, challenge_rows: Mapping[str, Sequence[int]]) -> Any:
     )
     def collaborator(*, oof_columns: Mapping[str, Any]) -> dict[str, Any]:
         return _build_assemble_challenge(
-            oof_columns=oof_columns, challenge_rows=challenge_rows
+            oof_columns=oof_columns,
+            challenge_rows=derive_challenge_rows(
+                oof_columns=oof_columns, identity_path=t2_identity
+            ),
         )
 
     return collaborator
