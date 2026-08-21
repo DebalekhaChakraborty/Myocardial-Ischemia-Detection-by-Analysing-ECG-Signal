@@ -27,6 +27,35 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MODULES = (R, STORE, PERSIST)
 
 
+def _observed_dependency_digest() -> str:
+    from cardiosentinel.neural.provenance import dependency_environment
+
+    return str(dependency_environment()["installed_packages_sha256"])
+
+
+def _frozen_dependency_digest() -> str:
+    from cardiosentinel.neural.p1_experiment import FROZEN_DEPENDENCY_DIGEST
+
+    return str(FROZEN_DEPENDENCY_DIGEST)
+
+
+# A canonical claim requires the frozen scientific interpreter, by design: the
+# runtime sentinel refuses to let a claim rest on an environment that is not the
+# one the science was frozen against. CI installs a different set, so the tests
+# that actually claim a directory skip there -- the same convention the M2/U1/T2
+# selection suites use for artifacts that do not exist on that filesystem.
+# `test_a_claim_is_refused_outside_the_frozen_interpreter` covers the refusal
+# itself and runs everywhere.
+ON_FROZEN_INTERPRETER = _observed_dependency_digest() == _frozen_dependency_digest()
+requires_frozen_runtime = pytest.mark.skipif(
+    not ON_FROZEN_INTERPRETER,
+    reason=(
+        "a canonical claim requires the frozen scientific interpreter; this "
+        "environment reports a different installed-package digest"
+    ),
+)
+
+
 def _started_runtime() -> RuntimeIntegrityRecord:
     """A record carrying the START observation a canonical claim requires."""
     from cardiosentinel.neural.runtime_sentinel import (
@@ -266,6 +295,7 @@ def test_the_attempt_identity_is_deterministic():
     )
 
 
+@requires_frozen_runtime
 def test_a_claimed_directory_cannot_be_claimed_twice(tmp_path):
     runtime = _started_runtime()
     stages = PERSIST.T1StageRecorder()
@@ -287,6 +317,7 @@ def test_a_claimed_directory_cannot_be_claimed_twice(tmp_path):
         PERSIST.require_unclaimed_canonical_attempt(tmp_path)
 
 
+@requires_frozen_runtime
 def test_a_promoted_artifact_is_immutable(tmp_path):
     claimed = PERSIST.claim_canonical_run(
         authorized_git_sha="0" * 40,
@@ -299,6 +330,7 @@ def test_a_promoted_artifact_is_immutable(tmp_path):
         PERSIST.promote(claimed, PERSIST.OOF_RESULT_NAME, {"a": 2})
 
 
+@requires_frozen_runtime
 def test_an_unplanned_artifact_cannot_be_promoted(tmp_path):
     claimed = PERSIST.claim_canonical_run(
         authorized_git_sha="0" * 40,
@@ -310,6 +342,7 @@ def test_an_unplanned_artifact_cannot_be_promoted(tmp_path):
         PERSIST.promote(claimed, "T1_SOMETHING_ELSE.json", {})
 
 
+@requires_frozen_runtime
 def test_a_failure_receipt_is_additive_and_admits_the_attempt_is_consumed(tmp_path):
     claimed = PERSIST.claim_canonical_run(
         authorized_git_sha="0" * 40,
@@ -608,3 +641,33 @@ def test_unavailable_rows_carry_nothing(tmp_path):
     assert rows[1].calibrated_probability is None
     assert rows[1].decision_error_uncertainty is None
     assert rows[1].temporal_evidence is None
+
+
+def test_a_claim_is_refused_outside_the_frozen_interpreter(tmp_path):
+    """The guard that makes the four tests above skip in CI, tested directly.
+
+    A canonical claim may only rest on the frozen scientific identity. A record
+    that expects anything else is refused before a directory is created, so the
+    refusal cannot leave a half-claimed attempt behind.
+    """
+    from cardiosentinel.neural.m2_persistence import M2PersistenceError
+
+    impostor = RuntimeIntegrityRecord(expected_digest="0" * 64)
+    with pytest.raises((M2PersistenceError, Exception)) as caught:
+        PERSIST.claim_canonical_run(
+            authorized_git_sha="0" * 40,
+            runtime=impostor,
+            stages=PERSIST.T1StageRecorder(),
+            repository_root=tmp_path,
+        )
+    assert "frozen" in str(caught.value).lower()
+    assert not (tmp_path / "cardiosentinel-runs").exists(), (
+        "the refusal created a directory before refusing"
+    )
+
+
+def test_the_frozen_dependency_digest_is_the_one_the_program_records():
+    """Bound so a silently changed frozen identity is visible immediately."""
+    assert _frozen_dependency_digest() == (
+        "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a"
+    )
