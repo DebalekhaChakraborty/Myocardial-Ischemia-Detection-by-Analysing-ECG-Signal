@@ -28,7 +28,7 @@ import json
 from pathlib import Path
 
 import pytest
-from _attempt_guard import assert_attempt_unconsumed
+from _attempt_guard import ATTEMPT_PRESENT, assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_execution_spec as SPEC
 from cardiosentinel.neural import t1_persistence as PERSIST
@@ -69,7 +69,7 @@ PRESERVED_ARTIFACTS = {
     ),
 }
 
-ARTIFACTS_PRESENT = CONSUMED_ATTEMPT.is_dir()
+ARTIFACTS_PRESENT = ATTEMPT_PRESENT
 requires_consumed_attempt = pytest.mark.skipif(
     not ARTIFACTS_PRESENT,
     reason=(
@@ -322,8 +322,23 @@ def test_changed_consumed_evidence_would_be_detected(tmp_path):
 
 
 def test_the_canonical_attempt_cannot_be_claimed_again():
-    with pytest.raises(PERSIST.T1PersistenceError, match="already claimed"):
-        PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+    """Where the attempt exists, a second claim is refused.
+
+    On CI the run directory is gitignored and absent, so the guard's correct
+    answer there is its census. Both are the mechanism working; asserting
+    either world unconditionally is the mistake the attempt guard exists to
+    prevent.
+    """
+    if ATTEMPT_PRESENT:
+        with pytest.raises(PERSIST.T1PersistenceError, match="already claimed"):
+            PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+    else:
+        assert (
+            PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)[
+                "existing_run_directory"
+            ]
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
