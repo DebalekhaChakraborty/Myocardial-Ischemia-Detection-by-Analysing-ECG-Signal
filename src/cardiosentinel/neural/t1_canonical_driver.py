@@ -347,6 +347,28 @@ class T1CanonicalDevelopmentExecutor:
         return tuple(T1_PLANNED_ARTIFACTS)
 
     @staticmethod
+    def verify_collaborators(
+        collaborators: T1ExecutionCollaborators,
+    ) -> dict[str, Any]:
+        """Prove the execution collaborators are all bound, without executing.
+
+        Deliberately available without authorization and outside `execute`:
+        "could this run" and "may this run" are different questions, and a
+        reviewer must be able to ask the first without answering the second.
+        Nothing is claimed, read, opened or created, and the permission gate is
+        not consulted because no permission is being exercised.
+        """
+        collaborators.require_complete()
+        return {
+            "collaborators_complete": True,
+            "required_callables": list(REQUIRED_COLLABORATOR_CALLABLES),
+            "required_paths": list(REQUIRED_COLLABORATOR_PATHS),
+            "execution_authorized": bool(T1_EXECUTION_SPECIFICATION_AUTHORIZED),
+            "executed": False,
+            "attempt_consumed": False,
+        }
+
+    @staticmethod
     def validate_artifact_plan() -> tuple[str, ...]:
         """Stage 25: the artifact plan is the specification's, not the driver's."""
         planned = tuple(T1_PLANNED_ARTIFACTS)
