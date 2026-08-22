@@ -392,11 +392,27 @@ def test_clean_interpreter_proof_is_binding_when_asked():
 
 def test_the_gate_reports_both_halves_of_layer_two():
     proof = G.prove_negative_capability(CONTINUATION_MODULES)
-    assert proof["instrumented_entry_points"] == dict(
-        G.PROTOCOL_INSTRUMENTED_ENTRY_POINTS
+    instrumented = proof["instrumented_entry_points"]
+    # Keyed by module: the protocol is loaded because §9.1 requires it, and
+    # t1_development_run because the §16 label authority drags it in.
+    assert instrumented[G.PROTOCOL_MODULE] == dict(G.PROTOCOL_INSTRUMENTED_ENTRY_POINTS)
+    assert instrumented[G.DEVELOPMENT_RUN_MODULE] == dict(
+        G.DEVELOPMENT_RUN_INSTRUMENTED_ENTRY_POINTS
     )
     assert "interpreter" in proof
     assert proof["interpreter"]["binding"] is False
+
+
+def test_every_instrumented_counter_is_an_amendment_counter():
+    for points in G.INSTRUMENTED_ENTRY_POINTS.values():
+        assert set(points.values()) <= set(S.CONTINUATION_ZERO_COUNTERS)
+
+
+def test_the_never_loaded_set_is_the_forbidden_set_minus_the_instrumented_ones():
+    """Every forbidden module is covered by exactly one runtime proof."""
+    instrumented = set(G.INSTRUMENTED_ENTRY_POINTS) - {G.PROTOCOL_MODULE}
+    assert set(G.NEVER_LOADED_MODULES) | instrumented == set(G.FORBIDDEN_MODULES)
+    assert not (set(G.NEVER_LOADED_MODULES) & instrumented), "double-covered module"
 
 
 def test_counter_names_are_the_amendment_vocabulary():

@@ -39,12 +39,17 @@ each wrapper records and then refuses, since §13.7 makes a non-zero counter a
 stop rather than a warning. The frozen module's file is never modified -- the
 attributes are rebound in-process and restored in a `finally`.
 
-The remaining entry points -- `trace_stream`, `generate_thresholds`,
-`select_policy`, `T1CanonicalFoldEvaluator` -- live in modules the continuation
-never imports, so instrumenting them would require importing exactly what Layer 1
-forbids. For those, `prove_no_forbidden_module_loaded(binding=True)` proves the
-stronger property directly: a function in a module that was never loaded cannot
-have been called.
+`t1_development_run` joins it for the same reason: reaching the §16 label
+authority imports `t1_fold_evaluation` -> `t1_fold_authority` ->
+`t1_development_run`, so `generate_thresholds`, `select_policy` and
+`run_policy_over_streams` are in the process too, and they earn call counters
+rather than a carve-out.
+
+The remaining entry points -- `trace_stream`, `evaluate_held_out`,
+`T1CanonicalFoldEvaluator` -- live in `t1_fold_evaluator` and the driver graph,
+which the continuation never imports at all. For those,
+`prove_no_forbidden_module_loaded(binding=True)` proves the stronger property
+directly: a function in a module that was never loaded cannot have been called.
 
 Together the two halves cover every entry point. Neither alone does, and a
 counter that nothing can increment would be the unreferenced-import argument
@@ -98,9 +103,37 @@ FORBIDDEN_IMPORTS: Final = {
 
 #: Whole modules the continuation may not import. Importing any of them binds
 #: every forbidden name above transitively, whatever the import line says.
+#:
+#: This is a **Layer 1** list: no module in the proven continuation graph may
+#: name any of these. It is not the same question as which modules may be
+#: *loaded in the process* -- see `NEVER_LOADED_MODULES`.
 FORBIDDEN_MODULES: Final = (
     "cardiosentinel.neural.t1_fold_evaluator",
     "cardiosentinel.neural.t1_development_run",
+    "cardiosentinel.neural.t1_canonical_driver",
+    "cardiosentinel.neural.t1_composition",
+    "cardiosentinel.neural.t1_engine",
+    "cardiosentinel.neural.t1_stream",
+)
+
+#: Modules whose absence from `sys.modules` is the runtime proof (Layer 2a).
+#:
+#: `t1_development_run` is deliberately **not** here. Reaching the §16 label
+#: authority means importing `t1_fold_evaluation`, which imports
+#: `t1_fold_authority`, which imports `t1_development_run` -- so the continuation
+#: cannot both open held-out labels through the existing authority and keep that
+#: module unloaded. Rather than write a second label reader, or weaken the gate
+#: with a carve-out, the same rule is applied consistently:
+#:
+#:     a forbidden entry point in a module that must be loaded earns a real call
+#:     counter; a module that need not be loaded stays unloaded.
+#:
+#: So `t1_development_run`'s three entry points move to the instrumented set
+#: below, and the genuinely dangerous module -- `t1_fold_evaluator`, which holds
+#: the fold evaluator, `trace_stream` and `evaluate_held_out` -- keeps the
+#: stronger never-imported proof.
+NEVER_LOADED_MODULES: Final = (
+    "cardiosentinel.neural.t1_fold_evaluator",
     "cardiosentinel.neural.t1_canonical_driver",
     "cardiosentinel.neural.t1_composition",
     "cardiosentinel.neural.t1_engine",
@@ -342,7 +375,7 @@ def prove_no_forbidden_module_loaded(
     a check that refused there would make that proof impossible. The **run path
     passes `binding=True`**, where a dirty interpreter is a refusal.
     """
-    loaded = sorted(name for name in FORBIDDEN_MODULES if name in sys.modules)
+    loaded = sorted(name for name in NEVER_LOADED_MODULES if name in sys.modules)
     if loaded and binding:
         raise T1ContinuationCapabilityError(
             f"{GATE_NAME} refuses: {loaded} are loaded in this interpreter. "
@@ -374,6 +407,23 @@ PROTOCOL_INSTRUMENTED_ENTRY_POINTS: Final = {
     "candidate_policies": "policy_selection_calls",
 }
 
+#: The same treatment for `t1_development_run`, which the §16 label authority
+#: drags into the process. These three are the reason it was on the
+#: never-loaded list in the first place; instrumenting them keeps the proof
+#: rather than trading it away.
+DEVELOPMENT_RUN_MODULE: Final = "cardiosentinel.neural.t1_development_run"
+DEVELOPMENT_RUN_INSTRUMENTED_ENTRY_POINTS: Final = {
+    "generate_thresholds": "threshold_generation_calls",
+    "select_policy": "policy_selection_calls",
+    "run_policy_over_streams": "state_machine_invocations",
+}
+
+#: Every instrumented entry point, by the module that holds it.
+INSTRUMENTED_ENTRY_POINTS: Final = {
+    PROTOCOL_MODULE: PROTOCOL_INSTRUMENTED_ENTRY_POINTS,
+    DEVELOPMENT_RUN_MODULE: DEVELOPMENT_RUN_INSTRUMENTED_ENTRY_POINTS,
+}
+
 
 @contextmanager
 def instrumented_protocol_entry_points(counters: ContinuationCounters):
@@ -395,8 +445,7 @@ def instrumented_protocol_entry_points(counters: ContinuationCounters):
     in this process for the duration of the block and restored in a `finally`,
     so the module digest that seven suites pin is untouched.
     """
-    protocol = importlib.import_module(PROTOCOL_MODULE)
-    original: dict[str, Any] = {}
+    original: dict[tuple[str, str], Any] = {}
 
     def _tripwire(name: str, counter: str, wrapped: Any) -> Any:
         def guard(*args: Any, **kwargs: Any) -> Any:
@@ -413,20 +462,27 @@ def instrumented_protocol_entry_points(counters: ContinuationCounters):
         return guard
 
     try:
-        for name, counter in PROTOCOL_INSTRUMENTED_ENTRY_POINTS.items():
-            if not hasattr(protocol, name):
-                raise T1ContinuationCapabilityError(
-                    f"{PROTOCOL_MODULE} has no entry point {name!r} to "
-                    "instrument. The gate is bound to a protocol that has "
-                    "moved, so it can no longer prove what it claims."
-                )
-            wrapped = getattr(protocol, name)
-            original[name] = wrapped
-            setattr(protocol, name, _tripwire(name, counter, wrapped))
+        for module_name, entry_points in INSTRUMENTED_ENTRY_POINTS.items():
+            # Only instrument a module that is already loaded. Importing
+            # `t1_development_run` here purely to wrap it would load the very
+            # module the caller may be trying to keep out of its process.
+            if module_name != PROTOCOL_MODULE and module_name not in sys.modules:
+                continue
+            module = importlib.import_module(module_name)
+            for name, counter in entry_points.items():
+                if not hasattr(module, name):
+                    raise T1ContinuationCapabilityError(
+                        f"{module_name} has no entry point {name!r} to "
+                        "instrument. The gate is bound to a module that has "
+                        "moved, so it can no longer prove what it claims."
+                    )
+                wrapped = getattr(module, name)
+                original[(module_name, name)] = wrapped
+                setattr(module, name, _tripwire(name, counter, wrapped))
         yield counters
     finally:
-        for name, wrapped in original.items():
-            setattr(protocol, name, wrapped)
+        for (module_name, name), wrapped in original.items():
+            setattr(sys.modules[module_name], name, wrapped)
 
 
 def prove_negative_capability(
@@ -452,7 +508,9 @@ def prove_negative_capability(
     return {
         "gate": GATE_NAME,
         "interpreter": interpreter,
-        "instrumented_entry_points": dict(PROTOCOL_INSTRUMENTED_ENTRY_POINTS),
+        "instrumented_entry_points": {
+            module: dict(points) for module, points in INSTRUMENTED_ENTRY_POINTS.items()
+        },
         "modules_proven": list(modules),
         "import_surface": surface,
         "call_surface": calls,
