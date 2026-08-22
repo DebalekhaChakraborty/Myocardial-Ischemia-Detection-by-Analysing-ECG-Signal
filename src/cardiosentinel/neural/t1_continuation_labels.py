@@ -80,8 +80,99 @@ BARRIER_STATE_KEYS: Final = (
 )
 
 
+#: The members the target source requires. Mirrors
+#: `t1_fold_evaluation.T1_TARGET_MEMBERS`; a test asserts they are equal.
+REQUIRED_IDENTITY_MEMBERS: Final = ("stable_id", "subject_id", "label", "primary_mask")
+
+#: Members this module must never materialise. `label` is the PRIMARY positive
+#: truth and `primary_mask` selects the scored rows -- reading either here would
+#: be opening held-out labels outside the authorized measurement, which is the
+#: whole thing identity validation exists to avoid. `target_family` is refused
+#: by the source itself.
+NEVER_MATERIALISED_MEMBERS: Final = ("label", "primary_mask", "target_family")
+
+#: The one member identity validation may read. A subject id is not a label.
+IDENTITY_MEMBER: Final = "subject_id"
+
+
 class T1ContinuationLabelError(RuntimeError):
     """Raised when held-out labels cannot be obtained for exactly one fold."""
+
+
+class T1ContinuationIdentityArtifactError(RuntimeError):
+    """Raised when the identity artifact is absent or not shaped as expected.
+
+    Distinct from the label error on purpose: "the file the authority will read
+    is not what we expect" and "labels could not be obtained for this fold" are
+    different failures, and only the first can be diagnosed before a run.
+    """
+
+
+def validate_identity_artifact(identity_path: Path) -> dict[str, Any]:
+    """Prove the artifact the authority will read has the expected structure.
+
+    **Identity validation, not target validation.** The remaining risk before
+    the continuation runs is not whether the label-reading code works -- that is
+    tested against the real authority -- but whether the file it will open at
+    stage 8 physically contains what the authority expects. That is a
+    filesystem and data-contract question, and it can be answered without
+    opening a single label.
+
+    So this reads member *names* from the archive index, and materialises
+    exactly one array: `subject_id`. A subject id is identity, not truth. The
+    label, mask and target-family arrays are never touched, and a test asserts
+    that by failing if any of them is ever read.
+
+    Answering this before authorization is the point. An interface or layout
+    mismatch discovered at stage 8 would be discovered after the claim, and the
+    claim is the single authorized attempt.
+    """
+    import numpy as np
+
+    path = Path(identity_path)
+    if path.name != T1_T2_IDENTITY_ARTIFACT:
+        raise T1ContinuationIdentityArtifactError(
+            f"Identity validation reads {T1_T2_IDENTITY_ARTIFACT}, not {path.name!r}."
+        )
+    if not path.is_file():
+        raise T1ContinuationIdentityArtifactError(
+            f"The identity artifact is absent at {path}. The continuation would "
+            "discover this at stage 8, after the claim."
+        )
+
+    with np.load(path, allow_pickle=False) as payload:
+        members = tuple(payload.files)
+        missing = [m for m in REQUIRED_IDENTITY_MEMBERS if m not in members]
+        if missing:
+            raise T1ContinuationIdentityArtifactError(
+                f"The identity artifact lacks {missing}. The target source "
+                f"requires {list(REQUIRED_IDENTITY_MEMBERS)}."
+            )
+        # The one array identity validation reads. Nothing else is indexed.
+        subjects = np.asarray(payload[IDENTITY_MEMBER])
+
+    present = {str(value) for value in subjects}
+    expected = {subject for subject, _p, _d in PREDECESSOR_FOLD_SELECTIONS.values()}
+    absent = sorted(expected - present)
+    if absent:
+        raise T1ContinuationIdentityArtifactError(
+            f"The identity artifact carries no rows for {absent}. Every promoted "
+            "fold's held-out subject must be present, or that fold cannot be "
+            "measured."
+        )
+
+    return {
+        "identity_artifact": str(path),
+        "members_present": sorted(members),
+        "required_members_present": True,
+        "member_read": IDENTITY_MEMBER,
+        "members_never_materialised": list(NEVER_MATERIALISED_MEMBERS),
+        "labels_opened": False,
+        "row_count": int(subjects.shape[0]),
+        "distinct_subjects": len(present),
+        "promoted_held_out_subjects_present": sorted(expected),
+        "validation_class": "identity_only",
+    }
 
 
 def continuation_identity_path(repository_root: Path) -> Path:

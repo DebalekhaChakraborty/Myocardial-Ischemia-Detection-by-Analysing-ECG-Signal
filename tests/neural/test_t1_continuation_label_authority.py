@@ -242,3 +242,118 @@ def test_importing_the_label_module_dirties_nothing():
 def test_authorization_and_run_root_untouched():
     assert S.T1_CONTINUATION_AUTHORIZED is False
     assert not S.CONTINUATION_RUN_ROOT.exists()
+
+
+# ---------------------------------------------------------------------------
+# 5. Identity artifact validation -- identity, not targets
+#
+# The last reducible risk before authorization is not whether the label-reading
+# code works, which the tests above prove against the real authority. It is
+# whether the file that code will open at stage 8 physically contains what the
+# authority expects. That is answerable without opening a label, and answering
+# it after the claim would answer it too late.
+# ---------------------------------------------------------------------------
+
+IDENTITY = REPO / L.DEFAULT_IDENTITY_RELATIVE
+
+
+def test_required_members_mirror_the_authority():
+    from cardiosentinel.neural.t1_fold_evaluation import T1_TARGET_MEMBERS
+
+    assert L.REQUIRED_IDENTITY_MEMBERS == T1_TARGET_MEMBERS
+
+
+def test_never_materialised_members_cover_every_label_bearing_array():
+    """`primary_positive` is derived from `label`, so `label` is the truth."""
+    assert set(L.NEVER_MATERIALISED_MEMBERS) >= {"label", "primary_mask"}
+    assert L.IDENTITY_MEMBER == "subject_id"
+    assert L.IDENTITY_MEMBER not in L.NEVER_MATERIALISED_MEMBERS
+
+
+def test_a_missing_artifact_is_refused_before_the_run(tmp_path):
+    absent = tmp_path / L.T1_T2_IDENTITY_ARTIFACT
+    with pytest.raises(L.T1ContinuationIdentityArtifactError, match="absent"):
+        L.validate_identity_artifact(absent)
+
+
+def test_a_wrong_filename_is_refused(tmp_path):
+    with pytest.raises(L.T1ContinuationIdentityArtifactError, match="reads"):
+        L.validate_identity_artifact(tmp_path / "something_else.npz")
+
+
+def test_an_artifact_missing_a_required_member_is_refused(tmp_path):
+    import numpy as np
+
+    path = tmp_path / L.T1_T2_IDENTITY_ARTIFACT
+    np.savez(path, stable_id=np.array(["a"]), subject_id=np.array(["s"]))
+    with pytest.raises(L.T1ContinuationIdentityArtifactError, match="lacks"):
+        L.validate_identity_artifact(path)
+
+
+def test_an_artifact_missing_a_promoted_subject_is_refused(tmp_path):
+    import numpy as np
+
+    path = tmp_path / L.T1_T2_IDENTITY_ARTIFACT
+    np.savez(
+        path,
+        stable_id=np.array(["a"]),
+        subject_id=np.array([FOLD_0_SUBJECT]),
+        label=np.array([False]),
+        primary_mask=np.array([True]),
+    )
+    with pytest.raises(L.T1ContinuationIdentityArtifactError, match="no rows for"):
+        L.validate_identity_artifact(path)
+
+
+@pytest.mark.skipif(not IDENTITY.is_file(), reason="identity artifact is local-only")
+def test_the_real_identity_artifact_validates():
+    report = L.validate_identity_artifact(IDENTITY)
+    assert report["required_members_present"] is True
+    assert report["labels_opened"] is False
+    assert report["validation_class"] == "identity_only"
+    assert len(report["promoted_held_out_subjects_present"]) == 12
+    assert report["distinct_subjects"] == 12
+
+
+@pytest.mark.skipif(not IDENTITY.is_file(), reason="identity artifact is local-only")
+def test_the_identity_artifact_row_count_matches_the_persisted_trace():
+    """Both views of the run must describe the same rows.
+
+    A mismatch here is exactly the kind of layout drift that would have surfaced
+    at stage 8, one fold at a time, after the claim.
+    """
+    import json
+
+    report = L.validate_identity_artifact(IDENTITY)
+    manifest = json.loads(
+        (S.CONSUMED_ATTEMPT_DIR / "T1_OOF_STATE_EVIDENCE.json").read_text("utf-8")
+    )
+    assert report["row_count"] == manifest["row_count"] == 492904
+
+
+@pytest.mark.skipif(not IDENTITY.is_file(), reason="identity artifact is local-only")
+def test_validation_never_materialises_a_label_array(monkeypatch):
+    """The guarantee, enforced rather than documented.
+
+    Wraps the archive's item access so any read of `label`, `primary_mask` or
+    `target_family` fails the test. Identity validation must reach exactly one
+    array, and it must be `subject_id`.
+    """
+    import numpy as np
+
+    read: list[str] = []
+    original = np.lib.npyio.NpzFile.__getitem__
+
+    def recording(self, key):
+        read.append(key)
+        if key in L.NEVER_MATERIALISED_MEMBERS:
+            raise AssertionError(
+                f"identity validation materialised {key!r}, which is a label array"
+            )
+        return original(self, key)
+
+    monkeypatch.setattr(np.lib.npyio.NpzFile, "__getitem__", recording)
+
+    L.validate_identity_artifact(IDENTITY)
+
+    assert read == [L.IDENTITY_MEMBER], f"validation read {read}"
