@@ -292,6 +292,113 @@ def test_counters_start_zero_and_refuse_when_incremented():
     assert counters.observed == ["policy_selection_calls:select_policy"]
 
 
+def test_the_instrumentation_actually_fires_on_next_state():
+    """The counter must be reachable, or Layer 2 proves nothing.
+
+    A counter no production path can increment is the unreferenced-import
+    argument wearing a counter's clothes, which §13.6 forbids substituting for
+    real runtime evidence. This calls the real frozen entry point through the
+    instrumentation and proves the counter moves.
+    """
+    from cardiosentinel.neural import t1_protocol
+
+    counters = G.ContinuationCounters()
+    with G.instrumented_protocol_entry_points(counters):
+        with pytest.raises(G.T1ContinuationCapabilityError, match="next_state"):
+            t1_protocol.next_state(None, None, None, None)
+    assert counters.state_machine_invocations == 1
+    assert counters.observed == ["state_machine_invocations:next_state"]
+    with pytest.raises(G.T1ContinuationCapabilityError):
+        counters.require_all_zero()
+
+
+@pytest.mark.parametrize(
+    "entry_point,counter",
+    sorted(G.PROTOCOL_INSTRUMENTED_ENTRY_POINTS.items()),
+)
+def test_every_instrumented_entry_point_increments_its_counter(entry_point, counter):
+    from cardiosentinel.neural import t1_protocol
+
+    counters = G.ContinuationCounters()
+    with G.instrumented_protocol_entry_points(counters):
+        with pytest.raises(G.T1ContinuationCapabilityError):
+            getattr(t1_protocol, entry_point)()
+    assert getattr(counters, counter) == 1
+
+
+def test_instrumentation_restores_the_frozen_protocol():
+    """The frozen module must be exactly as it was, even after a tripwire fires."""
+    from cardiosentinel.neural import t1_protocol
+
+    before = {
+        name: getattr(t1_protocol, name)
+        for name in G.PROTOCOL_INSTRUMENTED_ENTRY_POINTS
+    }
+    counters = G.ContinuationCounters()
+    with G.instrumented_protocol_entry_points(counters):
+        assert getattr(t1_protocol, "next_state") is not before["next_state"]
+        with pytest.raises(G.T1ContinuationCapabilityError):
+            t1_protocol.next_state()
+    for name, original in before.items():
+        assert getattr(t1_protocol, name) is original, f"{name} was not restored"
+
+
+def test_instrumentation_restores_even_when_the_body_raises():
+    from cardiosentinel.neural import t1_protocol
+
+    original = t1_protocol.next_state
+    with pytest.raises(ValueError):
+        with G.instrumented_protocol_entry_points(G.ContinuationCounters()):
+            raise ValueError("body blew up")
+    assert t1_protocol.next_state is original
+
+
+def test_every_instrumented_name_maps_to_a_real_counter():
+    assert set(G.PROTOCOL_INSTRUMENTED_ENTRY_POINTS.values()) <= set(
+        S.CONTINUATION_ZERO_COUNTERS
+    )
+
+
+def test_instrumentation_refuses_if_the_protocol_moved(monkeypatch):
+    """A gate bound to a protocol that has moved cannot prove what it claims."""
+    from cardiosentinel.neural import t1_protocol
+
+    monkeypatch.delattr(t1_protocol, "policy_sort_key")
+    with pytest.raises(G.T1ContinuationCapabilityError, match="no entry point"):
+        with G.instrumented_protocol_entry_points(G.ContinuationCounters()):
+            pass  # pragma: no cover - the context manager refuses on entry
+
+
+def test_clean_interpreter_proof_is_binding_when_asked():
+    """Covers the entry points in modules the continuation never imports."""
+    counters = G.ContinuationCounters()
+
+    advisory = G.prove_no_forbidden_module_loaded(counters)
+    assert advisory["binding"] is False
+    assert "forbidden_modules_loaded" in advisory
+
+    # This suite imports the fold evaluator to prove helper equivalence, so the
+    # interpreter is deliberately dirty here and the binding form must refuse.
+    import cardiosentinel.neural.t1_fold_evaluator  # noqa: F401
+
+    with pytest.raises(G.T1ContinuationCapabilityError, match="loaded"):
+        G.prove_no_forbidden_module_loaded(counters, binding=True)
+
+    with pytest.raises(G.T1ContinuationCapabilityError):
+        G.prove_negative_capability(
+            CONTINUATION_MODULES, require_clean_interpreter=True
+        )
+
+
+def test_the_gate_reports_both_halves_of_layer_two():
+    proof = G.prove_negative_capability(CONTINUATION_MODULES)
+    assert proof["instrumented_entry_points"] == dict(
+        G.PROTOCOL_INSTRUMENTED_ENTRY_POINTS
+    )
+    assert "interpreter" in proof
+    assert proof["interpreter"]["binding"] is False
+
+
 def test_counter_names_are_the_amendment_vocabulary():
     """The defect that consumed the canonical attempt was a key-name mismatch."""
     from cardiosentinel.neural.t1_recovery_amendment import CONTINUATION_ZERO_COUNTERS

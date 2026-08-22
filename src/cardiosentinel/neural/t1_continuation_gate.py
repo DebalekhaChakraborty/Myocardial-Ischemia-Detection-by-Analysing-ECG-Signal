@@ -26,10 +26,29 @@ is systematically wrong: a module's own refusal list contains the words it
 refuses, and an attestation asserting an action did not occur necessarily names
 that action. This programme has produced that false positive five times.
 
-**Layer 2, runtime** -- `ContinuationCounters`. Each forbidden entry point is
-instrumented; every counter is read at completion and must be zero. A counter
-reading zero is positive evidence that nothing ran, which absence of code is
-not: an unreferenced import is an argument, a zero counter is a measurement.
+**Layer 2, runtime** -- and it has two halves, because the forbidden entry points
+do not all live in the same place.
+
+`t1_protocol` is loaded on purpose: §9.1 *requires* the continuation to group and
+match episodes with the frozen functions the consumed attempt used. So
+`next_state`, `empirical_order_statistic`, `policy_sort_key` and
+`candidate_policies` are in the process whether the continuation wants them or
+not, and only a real call counter can prove they did not fire.
+`instrumented_protocol_entry_points` wraps those four for the duration of a run;
+each wrapper records and then refuses, since §13.7 makes a non-zero counter a
+stop rather than a warning. The frozen module's file is never modified -- the
+attributes are rebound in-process and restored in a `finally`.
+
+The remaining entry points -- `trace_stream`, `generate_thresholds`,
+`select_policy`, `T1CanonicalFoldEvaluator` -- live in modules the continuation
+never imports, so instrumenting them would require importing exactly what Layer 1
+forbids. For those, `prove_no_forbidden_module_loaded(binding=True)` proves the
+stronger property directly: a function in a module that was never loaded cannot
+have been called.
+
+Together the two halves cover every entry point. Neither alone does, and a
+counter that nothing can increment would be the unreferenced-import argument
+wearing a counter's clothes -- which is precisely the substitution §13.6 forbids.
 
 **Layer 3, evidence** -- `t1_continuation_measurement`. The measured trace must
 be the predecessor's trace, by digest and by per-fold threshold equality.
@@ -42,6 +61,7 @@ from __future__ import annotations
 import ast
 import importlib
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Iterable
@@ -309,35 +329,130 @@ def prove_no_forbidden_calls(module_names: Iterable[str]) -> dict[str, list[str]
 
 
 def prove_no_forbidden_module_loaded(
-    counters: ContinuationCounters,
+    counters: ContinuationCounters, *, binding: bool = False
 ) -> dict[str, Any]:
     """Prove no forbidden module was imported into this interpreter.
 
-    The strongest of the three structural checks and the only one that inspects
-    the live process rather than source: a module can only be reached if it is
-    in `sys.modules`. It is advisory during tests -- the test suite legitimately
-    imports the fold evaluator to prove equivalence -- so it reports rather than
-    refuses, and the counters remain the binding runtime proof.
+    Runtime evidence of the strongest available kind for the entry points that
+    live in modules the continuation never imports: a function in a module that
+    was never loaded cannot have been called, whatever any counter says.
+
+    `binding` is False by default because the test suite legitimately imports
+    `t1_fold_evaluator` to prove the re-implemented helpers are equivalent, and
+    a check that refused there would make that proof impossible. The **run path
+    passes `binding=True`**, where a dirty interpreter is a refusal.
     """
     loaded = sorted(name for name in FORBIDDEN_MODULES if name in sys.modules)
+    if loaded and binding:
+        raise T1ContinuationCapabilityError(
+            f"{GATE_NAME} refuses: {loaded} are loaded in this interpreter. "
+            "The continuation's runtime proof that it never ran a fold "
+            "evaluator, a state machine or a threshold generator rests on "
+            "those modules being unreachable. A loaded module is reachable."
+        )
     return {
         "forbidden_modules_loaded": loaded,
         "clean_interpreter": not loaded,
+        "binding": binding,
         "counters": counters.as_dict(),
     }
 
 
+#: The forbidden entry points that live inside the **permitted** protocol
+#: module, mapped to the counter each would break.
+#:
+#: These are the reason a module-load proof is not sufficient on its own.
+#: `t1_protocol` is loaded on purpose -- amendment §9.1 requires the continuation
+#: to group and match episodes with the frozen functions the consumed attempt
+#: used -- so `next_state` and its neighbours are in the process whether the
+#: continuation wants them or not. They are the four entry points that need a
+#: real call counter rather than an absence argument.
+PROTOCOL_INSTRUMENTED_ENTRY_POINTS: Final = {
+    "next_state": "state_machine_invocations",
+    "empirical_order_statistic": "threshold_generation_calls",
+    "policy_sort_key": "policy_selection_calls",
+    "candidate_policies": "policy_selection_calls",
+}
+
+
+@contextmanager
+def instrumented_protocol_entry_points(counters: ContinuationCounters):
+    """Instrument the protocol's forbidden entry points for the duration of a run.
+
+    Amendment §13.6 Layer 2 asks for the entry points themselves to be
+    instrumented, and distinguishes that from Layer 1 precisely because "a
+    counter that reads zero is evidence, whereas an unreferenced import is only
+    an argument". A counter nothing can increment is the argument wearing a
+    counter's clothes, so these wrappers make the four reachable entry points
+    genuinely countable.
+
+    Each wrapper records the call and then refuses, because §13.7 makes a
+    non-zero counter a stop rather than a warning. Recording before raising is
+    deliberate: the receipt can then name which entry point fired instead of
+    only reporting that something did.
+
+    The frozen module's **file is never modified**. The attributes are rebound
+    in this process for the duration of the block and restored in a `finally`,
+    so the module digest that seven suites pin is untouched.
+    """
+    protocol = importlib.import_module(PROTOCOL_MODULE)
+    original: dict[str, Any] = {}
+
+    def _tripwire(name: str, counter: str, wrapped: Any) -> Any:
+        def guard(*args: Any, **kwargs: Any) -> Any:
+            counters.record(counter, name)
+            raise T1ContinuationCapabilityError(
+                f"The continuation called {name}, which amendment §9.1 forbids "
+                f"it to call. {counter} is now "
+                f"{getattr(counters, counter)}; the continuation stops."
+            )
+
+        guard.__name__ = getattr(wrapped, "__name__", name)
+        guard.__doc__ = getattr(wrapped, "__doc__", None)
+        guard.__wrapped__ = wrapped
+        return guard
+
+    try:
+        for name, counter in PROTOCOL_INSTRUMENTED_ENTRY_POINTS.items():
+            if not hasattr(protocol, name):
+                raise T1ContinuationCapabilityError(
+                    f"{PROTOCOL_MODULE} has no entry point {name!r} to "
+                    "instrument. The gate is bound to a protocol that has "
+                    "moved, so it can no longer prove what it claims."
+                )
+            wrapped = getattr(protocol, name)
+            original[name] = wrapped
+            setattr(protocol, name, _tripwire(name, counter, wrapped))
+        yield counters
+    finally:
+        for name, wrapped in original.items():
+            setattr(protocol, name, wrapped)
+
+
 def prove_negative_capability(
-    module_names: Iterable[str], counters: ContinuationCounters | None = None
+    module_names: Iterable[str],
+    counters: ContinuationCounters | None = None,
+    *,
+    require_clean_interpreter: bool = False,
 ) -> dict[str, Any]:
-    """Run every structural layer, then the runtime layer. Refuses on any."""
+    """Run every structural layer, then the runtime layer. Refuses on any.
+
+    `require_clean_interpreter` is what the run path sets. Left False, this
+    proves Layers 1 and 2b; set True it additionally proves 2a, which is the
+    half that covers the entry points living in never-imported modules.
+    """
     modules = tuple(module_names)
     surface = prove_import_surface(modules)
     calls = prove_no_forbidden_calls(modules)
     counters = counters if counters is not None else ContinuationCounters()
+    interpreter = prove_no_forbidden_module_loaded(
+        counters, binding=require_clean_interpreter
+    )
     zeroed = counters.require_all_zero()
     return {
         "gate": GATE_NAME,
+        "interpreter": interpreter,
+        "instrumented_entry_points": dict(PROTOCOL_INSTRUMENTED_ENTRY_POINTS),
         "modules_proven": list(modules),
         "import_surface": surface,
         "call_surface": calls,
