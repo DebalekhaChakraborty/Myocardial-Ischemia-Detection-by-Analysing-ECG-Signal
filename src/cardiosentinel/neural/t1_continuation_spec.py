@@ -54,10 +54,17 @@ REPOSITORY_ROOT: Final = Path(__file__).resolve().parents[3]
 
 #: Whether a human has authorized the continuation to execute.
 #:
-#: False here means the continuation refuses at its first gate, having touched
-#: nothing. Flipping it is a governance act on the same footing as the amendment
-#: itself, and it is deliberately the only edit that arms this path.
-T1_CONTINUATION_AUTHORIZED: Final = False
+#: **ARMED.** Set by explicit human authorization, recorded in
+#: `recovery/T1_CONTINUATION_PREAUTHORIZATION.md` and carried by the commit that
+#: made this edit. It is deliberately the only edit that arms this path.
+#:
+#: This enables **exactly one** continuation execution. A failure after the claim
+#: consumes the authorization; no retry and no successor identity is authorized.
+#:
+#: The test suite forces this back to False for the duration of a test session --
+#: see `tests/neural/conftest.py`. Arming is an operator decision, and pytest is
+#: not the operator.
+T1_CONTINUATION_AUTHORIZED: Final = True
 
 #: The continuation is authorized once. There is no second attempt predeclared,
 #: and no identity is reserved for one (amendment §14).

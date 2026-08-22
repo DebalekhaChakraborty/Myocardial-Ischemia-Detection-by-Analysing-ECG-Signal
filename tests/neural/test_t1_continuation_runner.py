@@ -67,8 +67,37 @@ def _measurements(count: int = 12):
 # ---------------------------------------------------------------------------
 
 
-def test_authorization_is_disabled():
-    assert S.T1_CONTINUATION_AUTHORIZED is False
+def test_the_repository_is_armed_and_the_session_is_not():
+    """Two different questions, deliberately kept apart.
+
+    The repository carries an explicit human authorization. This test process
+    does not, because the session fixture disarms it -- pytest is not the
+    operator, and a suite that could execute the continuation would be one
+    stray import away from consuming it.
+    """
+    assert committed_authorization_value() is True, "repository is not armed"
+    assert S.T1_CONTINUATION_AUTHORIZED is False, "the test session is armed"
+
+
+def committed_authorization_value() -> bool:
+    """The flag as **committed**, not as this test process sees it.
+
+    The session fixture forces the runtime value False so pytest can never
+    execute the continuation. That makes the runtime value useless for asking
+    "is the repository armed?", so this reads the assignment out of the source.
+    """
+    import ast
+    from pathlib import Path as _P
+
+    from cardiosentinel.neural import t1_continuation_spec as _S
+
+    tree = ast.parse(_P(_S.__file__).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == (
+            "T1_CONTINUATION_AUTHORIZED"
+        ):
+            return bool(ast.literal_eval(node.value))
+    raise AssertionError("T1_CONTINUATION_AUTHORIZED is not assigned in the spec")
 
 
 def test_preflight_refuses_at_the_first_stage_and_touches_nothing():
