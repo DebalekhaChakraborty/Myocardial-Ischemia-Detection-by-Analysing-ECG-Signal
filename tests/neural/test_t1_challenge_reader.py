@@ -16,6 +16,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_assembly as A
 from cardiosentinel.neural import t1_challenge as C
@@ -303,11 +304,11 @@ def test_reading_challenge_membership_does_not_change_authorization():
 
 
 def test_the_canonical_attempt_is_untouched(tmp_path):
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     C.derive_challenge_rows(
         oof_columns=_traced_columns(), identity_path=_identity(tmp_path)
     )
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_reader_refuses_a_test_partition_archive(tmp_path):

@@ -17,6 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_config as CFG
 from cardiosentinel.neural import t1_execution_spec as SPEC
@@ -389,11 +390,11 @@ def test_selecting_a_configuration_does_not_change_authorization(corpus):
 
 def test_the_canonical_attempt_is_untouched(corpus):
     columns, targets = corpus
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     F.select_final_validation_configuration(
         columns=columns, authority=F.final_validation_authority(source=_Source(targets))
     )
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_entrypoint_asks_permission_before_executing():

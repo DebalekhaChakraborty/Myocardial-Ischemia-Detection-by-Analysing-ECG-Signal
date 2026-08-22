@@ -16,6 +16,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_config as CFG
@@ -375,10 +376,10 @@ def test_no_scientific_artifact_is_generated(tmp_path):
 
 
 def test_the_canonical_attempt_directory_is_not_created():
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     for fold in t1_folds():
         A.fit_evaluation_authority(fold, source=CountingSource())
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_authority_computes_no_metric_and_selects_no_policy():
@@ -433,7 +434,7 @@ def test_the_driver_can_verify_collaborators_without_executing():
     assert report["execution_authorized"] is (
         CFG.T1_EXECUTION_SPECIFICATION_AUTHORIZED
     )
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_verifying_collaborators_does_not_grant_permission():

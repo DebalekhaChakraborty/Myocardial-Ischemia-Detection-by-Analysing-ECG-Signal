@@ -20,6 +20,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _attempt_guard import assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_capability_gate as G
@@ -560,9 +561,9 @@ def test_authorization_is_untouched():
 
 def test_the_canonical_attempt_is_untouched(corpus):
     columns, targets = corpus
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
     _run_fold(columns, targets)
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_evaluator_creates_nothing_and_opens_no_file():

@@ -24,6 +24,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _attempt_guard import ATTEMPT_PRESENT, assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_canonical_driver as D
 from cardiosentinel.neural import t1_composition as C
@@ -202,7 +203,7 @@ def test_the_gate_refuses_when_authorization_is_withdrawn(monkeypatch):
     message = str(caught.value)
     assert "human authorization is not granted" in message
     assert "none of them a permission" in message
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 @needs_artifacts
@@ -218,7 +219,7 @@ def test_the_entry_point_refuses_when_authorization_is_withdrawn(monkeypatch):
     with pytest.raises(D.T1DriverError, match="human authorization is not granted"):
         R.main(_argv(WRONG_SHA))
     assert opened == [], "artifacts were resolved despite a closed gate"
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_granting_permission_is_not_something_the_driver_can_do():
@@ -244,13 +245,13 @@ def test_the_expected_sha_is_required():
     """There is no default commit and no way to omit the flag."""
     with pytest.raises(SystemExit):
         R.main([SPEC.T1_CANONICAL_EXECUTION_FLAG])
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_the_execution_flag_is_required():
     with pytest.raises(SystemExit):
         R.main([f"{SPEC.T1_EXPECTED_GIT_SHA_FLAG}={WRONG_SHA}"])
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 @requires_frozen_runtime
@@ -265,7 +266,7 @@ def test_a_wrong_sha_is_refused(monkeypatch):
     with pytest.raises(PERSIST.T1PersistenceError) as caught:
         R.main(_argv(WRONG_SHA))
     assert WRONG_SHA in str(caught.value)
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 @requires_frozen_runtime
@@ -280,7 +281,7 @@ def test_a_dirty_tree_is_refused(monkeypatch):
     with pytest.raises(PERSIST.T1PersistenceError) as caught:
         R.main(_argv(WRONG_SHA))
     assert "dirty" in str(caught.value).lower()
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 def test_a_foreign_runtime_is_refused_first():
@@ -297,7 +298,7 @@ def test_a_foreign_runtime_is_refused_first():
     with pytest.raises(RuntimeIntegrityError):
         run.stage_preflight()
     assert run.stages.entered == [SPEC.STAGE_START]
-    assert not _canonical_root().exists()
+    assert_attempt_unconsumed()
 
 
 # ---------------------------------------------------------------------------
@@ -349,16 +350,23 @@ def test_the_cli_surface_is_still_exactly_two_options():
     )
 
 
-def test_the_canonical_attempt_is_still_absent():
-    """The single canonical attempt has not been consumed by these tests."""
-    assert not _canonical_root().exists()
-    assert PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT) == {
-        "attempt_id": SPEC.T1_DEVELOPMENT_ATTEMPT_ID,
-        "existing_run_directory": False,
-        "automatic_retry_permitted": False,
-        "automatic_alternate_name_permitted": False,
-        "recovery_identity_predeclared": False,
-    }
+def test_the_canonical_attempt_was_not_consumed_by_these_tests():
+    """Nothing here claimed the attempt, and nothing can claim it again.
+
+    The attempt was consumed on 2026-08-21 by the canonical run, so the
+    unclaimed check now refuses rather than returning its census. Both halves
+    matter: this suite disturbed nothing, and the claim guard still stands
+    between any caller and a second attempt.
+    """
+    assert_attempt_unconsumed()
+    if ATTEMPT_PRESENT:
+        with pytest.raises(PERSIST.T1PersistenceError, match="already claimed"):
+            PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+    else:
+        # Gitignored and local-only: CI has no copy of the consumed attempt.
+        assert PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)[
+            "existing_run_directory"
+        ] is False
 
 
 def test_an_existing_attempt_refuses_rather_than_re_rooting(tmp_path):

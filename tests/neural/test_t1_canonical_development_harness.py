@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from _attempt_guard import ATTEMPT_PRESENT, assert_attempt_unconsumed
 
 from cardiosentinel.neural import t1_development_run as R
 from cardiosentinel.neural import t1_evidence_store as STORE
@@ -84,12 +85,34 @@ def test_importing_the_harness_creates_no_files_and_emits_nothing(tmp_path, caps
     assert {p for p in tmp_path.rglob("*")} == before
 
 
-def test_no_canonical_run_directory_exists():
-    """The one canonical attempt is unclaimed, and this test says so out loud."""
-    run_dir = PERSIST.canonical_run_directory(REPOSITORY_ROOT)
-    assert not run_dir.exists(), f"{run_dir} exists; the attempt would be consumed"
-    assert not PERSIST.canonical_run_root(REPOSITORY_ROOT).exists()
-    PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+def test_the_canonical_attempt_cannot_be_claimed_twice():
+    """The one canonical attempt is spent, and a second claim is refused.
+
+    This test used to assert the run directory did not exist. It did not, until
+    2026-08-21; the attempt then ran and failed after the claim, and the
+    directory is now permanent evidence. The property worth holding is not that
+    no run has happened -- that can never be true again -- but that nothing
+    claims the attempt a second time, which is what the guard proves for this
+    suite and what the refusal below proves for the mechanism.
+    """
+    assert_attempt_unconsumed()
+    if not ATTEMPT_PRESENT:
+        # CI has no copy of the run directory -- it is gitignored and
+        # local-only -- so there the guard's correct answer is the census.
+        assert PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT) == {
+            "attempt_id": SPEC.T1_DEVELOPMENT_ATTEMPT_ID,
+            "existing_run_directory": False,
+            "automatic_retry_permitted": False,
+            "automatic_alternate_name_permitted": False,
+            "recovery_identity_predeclared": False,
+        }
+        return
+    with pytest.raises(PERSIST.T1PersistenceError) as caught:
+        PERSIST.require_unclaimed_canonical_attempt(REPOSITORY_ROOT)
+    message = str(caught.value).lower()
+    assert "already claimed" in message
+    assert "no automatic retry" in message
+    assert "human review" in message
 
 
 def test_the_harness_performs_no_work_at_module_scope():
