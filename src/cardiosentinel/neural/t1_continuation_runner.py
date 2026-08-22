@@ -85,6 +85,7 @@ from cardiosentinel.neural.t1_continuation_spec import (
     CONTINUATION_RUN_ROOT,
     CONTINUATION_RUN_ROOT_RELATIVE,
     PREDECESSOR_FOLD_SELECTIONS,
+    REPOSITORY_ROOT,
     require_continuation_authorized,
     require_continuation_identity,
 )
@@ -173,10 +174,17 @@ class ContinuationRunRecord:
 
 
 def _authorized_git_sha() -> str:
-    """The commit the continuation runs at, from git provenance."""
+    """The commit the continuation runs at, from git provenance.
+
+    `git_provenance` takes the repository root; every other call site in the
+    codebase passes it. Omitting it raised `TypeError` on the first real
+    invocation -- six lines before the claim, so the refusal was pre-claim and
+    the attempt survived. The seam test below now drives this whole function
+    chain before a real run reaches it.
+    """
     from cardiosentinel.data.provenance import git_provenance
 
-    provenance = git_provenance()
+    provenance = git_provenance(REPOSITORY_ROOT)
     if provenance.get("git_dirty"):
         raise T1ContinuationRunError(
             "The working tree is dirty. A continuation whose code cannot be "
