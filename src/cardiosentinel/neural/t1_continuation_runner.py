@@ -55,6 +55,7 @@ from cardiosentinel.neural.t1_continuation_gate import (
     prove_negative_capability,
 )
 from cardiosentinel.neural.t1_continuation_labels import (
+    continuation_held_out_authority,
     held_out_labels_for_fold,
     require_labels_cover_trace,
 )
@@ -291,8 +292,14 @@ def execute_continuation(corpus_root: Path) -> dict[str, Any]:
         target_source = _target_source(corpus_root)
         measurements: dict[int, dict[str, Any]] = {}
         for fold_index in sorted(PREDECESSOR_FOLD_SELECTIONS):
-            _reverify_fold_selection(fold_index)
-            labels = held_out_labels_for_fold(target_source, fold_index)
+            # The §16 barrier is re-proved here, and the digest it returns is
+            # what builds this fold's authority. A caller that verified nothing
+            # has nothing to build an authority from.
+            verified_digest = _reverify_fold_selection(fold_index)
+            authority = continuation_held_out_authority(
+                fold_index, target_source, verified_selection_sha256=verified_digest
+            )
+            labels = held_out_labels_for_fold(authority, fold_index)
             mask = trace.fold_mask(fold_index)
             require_labels_cover_trace(
                 labels,
@@ -363,10 +370,16 @@ def execute_continuation(corpus_root: Path) -> dict[str, Any]:
     }
 
 
-def _target_source(corpus_root: Path) -> Any:
+def _target_source(identity_path: Path) -> Any:
+    """The §16 target source, from the promoted T2 row-identity artifact.
+
+    Takes the artifact path rather than a corpus directory: the source refuses
+    any other filename, and a refusal at construction costs nothing while the
+    same refusal at stage 8 would consume the attempt.
+    """
     from cardiosentinel.neural.t1_continuation_labels import continuation_target_source
 
-    return continuation_target_source(corpus_root)
+    return continuation_target_source(identity_path)
 
 
 def _reverify_fold_selection(fold_index: int) -> str:

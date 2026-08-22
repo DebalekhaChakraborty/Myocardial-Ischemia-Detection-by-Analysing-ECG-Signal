@@ -151,6 +151,11 @@ PERMITTED_PROTOCOL_NAMES: Final = (
     "T1ProtocolError",
     "T1_STATE_EVENT",
     "validate_t1_protocol_document",
+    # The frozen fold table. `t1_folds` and `T1Fold` name which subject each
+    # fold held out; they are not a transition, a threshold, a selector or an
+    # evaluator, and the held-out authority cannot be built without them.
+    "t1_folds",
+    "T1Fold",
 )
 
 PROTOCOL_MODULE: Final = "cardiosentinel.neural.t1_protocol"
