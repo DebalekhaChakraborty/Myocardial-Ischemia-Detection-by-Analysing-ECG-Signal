@@ -1,0 +1,218 @@
+{
+  "artifact_class": "t1_v1_reconstructed_failure_receipt",
+  "receipt_type": "reconstructed",
+  "schema": "t1_v1_reconstructed_failure_receipt/1",
+  "statement": "The receipt reconstructs the failure record from surviving evidence. It does not claim to have been emitted by the failed execution.",
+  "why_reconstruction_was_necessary": "Specification section 25 requires a failure receipt with fourteen named fields. PERSIST.write_failure_receipt and T1DevelopmentRun.failure_receipt were both implemented, but no caller invoked either and t1_canonical_driver.execute contained no exception handler, so the exception propagated to the interpreter and the specification's mandated artifact was never written. The gap was closed for future runs by PR #49.",
+  "attempt_id": "t1-v1-development",
+  "experiment_identity": "T1_state_machine_v1",
+  "run_root": "cardiosentinel-runs/phase9-t1-development-v1",
+  "authorized_git_sha": "c538181eb93884f4583a8bd328e50573efbcf3df",
+  "runtime_integrity_state": {
+    "installed_packages_sha256": "b0fd6eaa592537b7e4d5574ca68b675e85e923ae3c4a5ba411028ba6fcd7297a",
+    "installed_package_count": 335,
+    "python_version": "3.12.6",
+    "matched_frozen_digest": true
+  },
+  "claimed_at": "2026-08-21T19:47:24Z",
+  "failed_at": "2026-08-21T19:57:57Z",
+  "elapsed_seconds_claim_to_failure": 632.8,
+  "stage": "promote_oof_result",
+  "stage_index": 24,
+  "stage_count": 29,
+  "last_completed_stage": "promote_oof_state_evidence",
+  "failure_classification": "incomplete execution requiring recovery",
+  "failure_class": "software_integration_defect",
+  "exception_type": "KeyError",
+  "exception_message": "true_positive",
+  "traceback": "Traceback (most recent call last):\n  File \"<frozen runpy>\", line 198, in _run_module_as_main\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"/home/AI_POC/tactics/Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal/src/cardiosentinel/neural/t1_development_run.py\", line 1018, in <module>\n    raise SystemExit(main())\n                     ^^^^^^\n  File \"/home/AI_POC/tactics/Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal/src/cardiosentinel/neural/t1_development_run.py\", line 1013, in main\n    result = executor.execute(collaborators)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/AI_POC/tactics/Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal/src/cardiosentinel/neural/t1_canonical_driver.py\", line 512, in execute\n    collaborators.assemble_oof_result(\n  File \"/home/AI_POC/tactics/Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal/src/cardiosentinel/neural/t1_assembly.py\", line 612, in collaborator\n    return _build_assemble_oof_result(\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/home/AI_POC/tactics/Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal/src/cardiosentinel/neural/t1_assembly.py\", line 336, in _build_assemble_oof_result\n    tp = int(primary_confusion[\"true_positive\"])\n             ~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/home/AI_POC/tactics/Myocardial-Ischemia-Detection-by-Analysing-ECG-Signal/src/cardiosentinel/neural/t1_composition.py\", line 225, in __getitem__\n    return self._resolved()[key]\n           ~~~~~~~~~~~~~~~~^^^^^\nKeyError: 'true_positive'\n",
+  "defect": "t1_fold_evaluator counted PRIMARY margins as tp/fp/tn/fn; t1_assembly read true_positive/false_positive/false_negative/true_negative; t1_composition._pooled_confusion forwarded the producer's mapping unchanged and it resolved lazily, so the mismatch first surfaced at stage 24. Fixed by PR #49.",
+  "why_unrecoverable_in_place": "Specification section 17 requires the held-out state trace AND evaluation evidence to be persisted once. Only the trace was persisted, by widening it into the stage-23 OOF store; the per-fold confusion counts, episode evidence and onset latencies lived in run.held_out_traces and were destroyed with the process. Fixed for future runs by PR #50.",
+  "current_fold": null,
+  "label_blind_input_opened": true,
+  "fit_labels_opened_for_folds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "fold_selections_promoted": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "held_out_labels_opened_for_folds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11
+  ],
+  "held_out_traces_completed": 12,
+  "held_out_evaluation_evidence_persisted": false,
+  "oof_evidence_promoted": true,
+  "final_configuration_started": false,
+  "final_configuration_completed": false,
+  "attempt_consumed": true,
+  "automatic_retry_permitted": false,
+  "recovery_identity_predeclared": false,
+  "run_directory_modified": false,
+  "run_directory_modified_by_this_receipt": false,
+  "test_state": "unopened",
+  "test_accessed": false,
+  "sealed_test_state": "unopened",
+  "artifact_preservation": {
+    "run_directory_present": true,
+    "file_count": 20,
+    "earliest_artifact_utc": "2026-08-21T19:47:24.856042Z",
+    "latest_artifact_utc": "2026-08-21T19:57:57.576648Z",
+    "modified_after_failure": false,
+    "files": {
+      "T1_FOLD_SELECTIONS.json": {
+        "sha256": "71e0da62ad2a86fd6bb2561137e0a152df2d5b894bd9fecfb67ad762a5682f6d",
+        "bytes": 75457,
+        "modified_utc": "2026-08-21T19:57:54.564417Z"
+      },
+      "T1_INPUT_EVIDENCE.json": {
+        "sha256": "bf36ac0e538b0cee61a97109de413c52ec942356d974930e5de64bc32b86423b",
+        "bytes": 8338,
+        "modified_utc": "2026-08-21T19:47:31.624562Z"
+      },
+      "T1_INPUT_LINEAGE.json": {
+        "sha256": "e307bdd3ad244f6440ad437f66d5f7b4e2af3072b6b1833e74552095ede3c555",
+        "bytes": 7970,
+        "modified_utc": "2026-08-21T19:47:31.920585Z"
+      },
+      "T1_OOF_STATE_EVIDENCE.json": {
+        "sha256": "aefc922a5224b7c857b9bf99b12441e55e46fdc71def373c043ffb112e5e2405",
+        "bytes": 1123,
+        "modified_utc": "2026-08-21T19:57:57.576648Z"
+      },
+      "T1_PREFLIGHT.json": {
+        "sha256": "917b5421c9c7731eb185821ed279564c65fed5737153316cfa410811ea4f25da",
+        "bytes": 8466,
+        "modified_utc": "2026-08-21T19:47:25.472090Z"
+      },
+      "T1_RUN_STATUS.json": {
+        "sha256": "f305da7ad3d465c4500124fe4d4422dfc471580a01afe7b9d424e866e9e2c59d",
+        "bytes": 475,
+        "modified_utc": "2026-08-21T19:47:24.856042Z"
+      },
+      "fold_selections/T1_FOLD_00_SELECTION.json": {
+        "sha256": "02ffccd4eb546a7d07017f7234aec9f3c3f189819f4f90ca5663e1d4cf11467c",
+        "bytes": 5527,
+        "modified_utc": "2026-08-21T19:48:22.388460Z"
+      },
+      "fold_selections/T1_FOLD_01_SELECTION.json": {
+        "sha256": "f08799a205200c7b1d22a26f1d8354848149828c4eb6e68beb51c6eebde5a786",
+        "bytes": 5537,
+        "modified_utc": "2026-08-21T19:49:16.008578Z"
+      },
+      "fold_selections/T1_FOLD_02_SELECTION.json": {
+        "sha256": "e5d4967a45eb891a11294d640ab6a5e5de77cffdb60cf0c1338be5ff8e3558a1",
+        "bytes": 5534,
+        "modified_utc": "2026-08-21T19:50:07.272515Z"
+      },
+      "fold_selections/T1_FOLD_03_SELECTION.json": {
+        "sha256": "daa0e1def15d45cc826516b8478369c92755ec77634429014580161ed7d6d7ed",
+        "bytes": 5525,
+        "modified_utc": "2026-08-21T19:51:01.280664Z"
+      },
+      "fold_selections/T1_FOLD_04_SELECTION.json": {
+        "sha256": "fa3cec3519513d7681100bb701f38d988af3bacb504cb9dc4702bd6432559dc0",
+        "bytes": 5507,
+        "modified_utc": "2026-08-21T19:51:53.760695Z"
+      },
+      "fold_selections/T1_FOLD_05_SELECTION.json": {
+        "sha256": "6c07098b90548fe03eddf8437ac56bedccd3b1a39abdaa90aa077694b2fb0d0f",
+        "bytes": 5532,
+        "modified_utc": "2026-08-21T19:52:47.620833Z"
+      },
+      "fold_selections/T1_FOLD_06_SELECTION.json": {
+        "sha256": "c9c1b0fb345693ff07f95073d92afb3cacaa72cfb05e290c36dd07ee2c5a6c9a",
+        "bytes": 5514,
+        "modified_utc": "2026-08-21T19:53:40.740914Z"
+      },
+      "fold_selections/T1_FOLD_07_SELECTION.json": {
+        "sha256": "9a6ee4e4e33372e5208234c38c7830015ddccb23ee166140a1a78c83eb68a72d",
+        "bytes": 5523,
+        "modified_utc": "2026-08-21T19:54:32.308876Z"
+      },
+      "fold_selections/T1_FOLD_08_SELECTION.json": {
+        "sha256": "602c9d1f09a3af4f46b234e483592ccb3eb56a9f78251f95f030ce150630a07e",
+        "bytes": 5528,
+        "modified_utc": "2026-08-21T19:55:25.892993Z"
+      },
+      "fold_selections/T1_FOLD_09_SELECTION.json": {
+        "sha256": "31bca60e10377c7bfc77f9fb6a9c54340b6b91e9c048b006f8e198781df99961",
+        "bytes": 5533,
+        "modified_utc": "2026-08-21T19:56:16.844908Z"
+      },
+      "fold_selections/T1_FOLD_10_SELECTION.json": {
+        "sha256": "696e99527caf33c9798721dffd92d12a5d98ef98720579f006c9a96aae4c26a8",
+        "bytes": 5530,
+        "modified_utc": "2026-08-21T19:57:07.116771Z"
+      },
+      "fold_selections/T1_FOLD_11_SELECTION.json": {
+        "sha256": "3384a1261c7e069d8276eb5fe35a66dd7589c953fd37d3ae902ab0e496e03050",
+        "bytes": 5537,
+        "modified_utc": "2026-08-21T19:57:51.200158Z"
+      },
+      "t1_input_evidence.npz": {
+        "sha256": "4391b4e7cda5ac5d70c93663563cc37954afdfc7b28092ef65c2d351006c2f5c",
+        "bytes": 127172462,
+        "modified_utc": "2026-08-21T19:47:31.216531Z"
+      },
+      "t1_oof_state_evidence.npz": {
+        "sha256": "72f13a8b29eafdd99801bb64dbf8b61f19717f3d7af777d74f21c9709dd28232",
+        "bytes": 238078688,
+        "modified_utc": "2026-08-21T19:57:56.820590Z"
+      }
+    }
+  },
+  "reconstruction": {
+    "reconstructed_at": "2026-08-21T22:12:53Z",
+    "basis": [
+      "traceback captured by the launching process at /tmp/t1_canonical_run.log",
+      "filesystem timestamps of every promoted artifact",
+      "sha256 digests of every promoted artifact, re-verified at reconstruction",
+      "T1_RUN_STATUS.json and T1_PREFLIGHT.json as written by the run",
+      "the frozen stage order in t1_execution_spec.T1_STAGE_ORDER"
+    ],
+    "not_reconstructed": [
+      "per-fold PRIMARY confusion counts",
+      "per-fold episode evidence",
+      "per-fold onset latencies"
+    ],
+    "not_reconstructed_reason": "These were never persisted and cannot be derived from the label-free artifacts that survive. Recovering them is the whole purpose of the authorized measurement continuation, and inventing them here would be fabricating evidence.",
+    "governing_amendment": "T1_EXECUTION_RECOVERY_AMENDMENT_V1_1",
+    "governing_amendment_sha256": "d3ea7734c93be8f59796e03e8c0210778716327f7adc033cb2d3dcfff7f92c96"
+  },
+  "known_stale_in_the_consumed_attempt": {
+    "T1_RUN_STATUS.json": "reads status STARTED with updated_at equal to the claim timestamp, and label_blind_input_opened / held_out_labels_opened_for_folds / oof_evidence_promoted all false. Every one of those was false at 19:47:24 and none was true at 19:57:57. It is left exactly as the run wrote it: a failed attempt is not rewritten to look clean."
+  }
+}
