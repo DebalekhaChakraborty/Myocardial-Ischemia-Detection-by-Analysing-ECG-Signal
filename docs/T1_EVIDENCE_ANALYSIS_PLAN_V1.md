@@ -278,6 +278,70 @@ artifacts.
 scored as it did. That remains excluded by §4.5, and it is excluded precisely
 because it is the analysis most likely to be written backwards from the numbers.
 
+### 7.7 Pooled and subject-macro are different estimands
+
+Established by reading `t1_continuation_results.py`, not by reading any value.
+This is the most consequential thing the original plan did not say.
+
+**The bootstrap does not describe the pooled episode F1.** Its replicate
+statistic is
+
+```
+build_bootstrap:  float(np.mean(values[row]))
+```
+
+the **mean over resampled subjects of each subject's own `episode_f1`**. The
+pooled figure reported in §4.1 is
+
+```
+pooled_episode_f1 = _episode_f1(pooled_episodes)
+                  = 2 * matched / (predicted_event_runs + reference_episodes)
+```
+
+computed from **counts pooled across subjects**. The first is subject-weighted;
+the second is episode-weighted. They are different estimators of different
+quantities, they need not be close, and **the pooled value need not lie inside
+the bootstrap interval.**
+
+**Binding consequence.** The interval must never be printed adjacent to
+`pooled_episode_f1` in a way that lets a reader take it as an interval around
+that number. Wherever the interval appears it carries, in the same block, the
+statement that its central quantity is the subject-macro mean of per-subject
+`episode_f1`.
+
+**One derived quantity is authorized, and only one.** The subject-macro mean of
+the twelve stored per-subject `episode_f1` values may be computed and reported,
+labelled **derived**, with its formula shown, so that the pre-registered interval
+has the point estimate it actually refers to. This is the sole exception to
+"nothing is recomputed" in §4.1 item 1. It is admissible because `episode_f1` is
+defined for 12/12 subjects, so the mean is over the complete subject set and not
+over a data-dependent subset — which is exactly why the same exception is **not**
+extended to MCC or latency (§7.3 item 3). It is authorized here, before any value
+is visible.
+
+**The pooled onset latency is episode-weighted too.** `onset_latency_seconds_median`
+is `_median` over the concatenation of every fold's `onset_latency_seconds`, so
+subjects contributing more matched episodes count more heavily. It is a median
+over episodes, not over subjects, and must be labelled that way.
+
+**Resolution caveat.** The bootstrap resamples 12 subjects. However many
+replicates are drawn, the underlying sample has twelve distinct values, so the
+percentile interval is coarse and its tails are governed by a handful of
+subjects. Report it as an indication of between-subject spread, which is what its
+`claim_scope` already says, and never as a precision statement.
+
+### 7.8 Where §7 supersedes §4
+
+§7.3 item 3 is stricter than §4.2 item 5. §4.2 item 5 permits a summary of MCC or
+latency provided `n` is stated in the same sentence, which leaves open a mean
+over the five defined subjects; §7.3 item 3 forbids a subject-macro mean of those
+two entirely. **§7.3 governs.** The tightening runs in the conservative
+direction — it removes a reportable number rather than adding one — and it is
+made before any value is visible.
+
+§7.7 relaxes §4.1 item 1 in exactly one place, the subject-macro mean of
+`episode_f1`, for the reason given there. No other recomputation is authorized.
+
 ---
 
 ## 8. Approval record
