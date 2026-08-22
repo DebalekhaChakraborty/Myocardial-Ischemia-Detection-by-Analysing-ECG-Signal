@@ -195,20 +195,53 @@ streaming-order guarantee about information access.
 **It is not causal inference.** Nothing in this evidence estimates a treatment
 effect, an intervention, or a counterfactual. The phrase "causal episode
 measurement" must never appear in a paper without that qualification attached,
-and "causal" should not appear in an abstract at all.
+and bare "causal" should not appear in an abstract at all.
+
+**Fixed terminology for the paper:**
+
+| | |
+|---|---|
+| ❌ Never | "causal episode model" |
+| ✅ Use | "causally ordered streaming episode model" |
+| ✅ Or | "non-anticipative temporal episode modelling" |
+
+and the definition travels with the first use:
+
+> *Causal here refers to temporal non-anticipation — the model reads no
+> information from beyond the current window — not to causal inference.*
+
+The internal identifiers `causal_s4d_longitudinal_v1` and
+`causal_gru_longitudinal_v1` are frozen and are not renamed; they are code
+identity, not prose.
 
 ### 7.2 Endpoint hierarchy
 
 | Tier | Endpoint | Basis |
 |---|---|---|
-| **Primary** | `episode_f1`, pooled and per subject, with the 1000-replicate subject bootstrap | Defined for 12/12 subjects; it is the quantity T1 exists to measure — episode-level alerting; it is the only slot that supports a subject bootstrap without conditioning on a data-dependent subset |
+| **Primary** | **Subject-macro mean `episode_f1`**, `(1/N)·Σ F1_i` over N = 12 subjects, with the 1000-replicate subject bootstrap as its interval | Defined for 12/12 subjects; the quantity T1 exists to measure — episode-level alerting; **the estimand the pre-registered bootstrap actually targets** (§7.7); the only slot supporting a subject bootstrap without conditioning on a data-dependent subset |
+| **Descriptive** | `pooled_episode_f1`, and per-subject `episode_f1` for all 12 | Episode-weighted rather than subject-weighted. Reported **separately**, never as the figure the interval brackets |
 | **Secondary** | `primary_window_mcc`, per subject and pooled | Window-level, a different task from episode alerting; defined for 5/12 subjects individually |
 | **Exploratory** | `onset_latency_seconds_median` | Conditional on successful detection **by construction** — a subject with no matched episode has no latency at all, so latency is only ever measured where detection already succeeded |
+
+**The primary estimate and its interval are the subject-macro pair, and they are
+the only pair reported adjacently.** The pooled figure appears in its own block,
+labelled descriptive and episode-weighted. Any layout that places
+`pooled_episode_f1` next to the interval is a layout that makes a false claim,
+however careful the surrounding prose.
 
 **Latency is never a headline claim.** Because it is defined only on matched
 episodes, a latency figure describes the timeliness of the detections that
 happened, not the timeliness of the system. Those two are different quantities
 and only the first is measurable here.
+
+**Fixed wording for latency**, because the natural phrasing is the wrong one:
+
+| | |
+|---|---|
+| ❌ Never | "median patient onset latency" — implies a per-patient quantity; the statistic is not per patient |
+| ❌ Never | "median detection latency of the system" — implies it covers episodes the system missed; it cannot |
+| ✅ Acceptable | "median latency across detected episodes" |
+| ✅ Preferred | "episode-level onset latency distribution among detected episodes" |
 
 **Disclosure.** This hierarchy is conditioned on metric availability, and
 availability is a measured property of the data (§2). It was fixed before any
@@ -236,7 +269,9 @@ To remove an ambiguity in the phrase "defined subjects only":
 
 Within the 12 LTSTDB validation subjects, cross-fitted and subject-disjoint:
 
-- Episode-level detection performance, as pooled and per-subject `episode_f1`
+- Episode-level detection performance, as the **subject-macro mean `episode_f1`**
+  with its bootstrap interval (primary), with per-subject values for all 12 and
+  the episode-weighted pooled figure reported separately as descriptive
 - Between-subject variability, exactly as scoped by the bootstrap's own
   `claim_scope` string
 - Window-level pooled description, labelled as window-level
@@ -341,6 +376,53 @@ made before any value is visible.
 
 §7.7 relaxes §4.1 item 1 in exactly one place, the subject-macro mean of
 `episode_f1`, for the reason given there. No other recomputation is authorized.
+
+### 7.9 What this study does not evaluate
+
+A single list, stated plainly, so it can be quoted into the paper's limitations
+section and into a reviewer response without re-deriving the argument.
+
+**This study does not evaluate:**
+
+- **Improvement over a T1-disabled system.** No T1-disabled arm was run on these
+  held-out subjects. The study measures one configuration; it does not compare
+  two.
+- **The contribution of the memory modules.** No no-memory arm exists. M1/M2
+  reruns are forbidden by standing constraint, so this cannot be answered by
+  re-analysis.
+- **The contribution of the longitudinal SSM architecture.** The continuation
+  measured the retained arm only. `T1_T2_COMPARATOR_ARM` is declared in
+  `t1_protocol` and is referenced by no file in the run.
+- **External generalization.** One dataset, 12 validation subjects. EDB shares
+  source recordings with LTSTDB per `CROSS_DATASET_PROVENANCE.md` and is not a
+  clean external cohort.
+- **Subgroup or stratified performance.** `join_performed: false`,
+  `strata_reported: []`, recorded before execution.
+- **Held-out test performance.** The B4/neural sealed test is unopened.
+- **Clinical utility.** Research software, public-dataset validation only.
+- **Deployment behaviour.** No inference or serving path exists — no `predict()`,
+  no ONNX, no TorchScript. Nothing here is a latency or throughput claim about a
+  deployed system.
+
+None of these is a gap discovered in the evidence. Each is a boundary that was
+fixed by what was run, and every one of them was known before the values were
+read.
+
+### 7.10 Where the policy-selection structure belongs
+
+`T1_FINAL_CONFIGURATION.json` records the set of policies promoted across the
+twelve folds. That set is **methods, not results.**
+
+- ✅ Methods: *"Policy selection was performed independently within each fold by
+  the frozen development procedure; the promoted policy per fold is recorded in
+  the per-fold evidence."*
+- ❌ Results: any sentence presenting the composition of that set as a finding.
+
+The moment the selected set is framed as a result, the natural next question is
+whether the better one was chosen — which reopens a selection argument that the
+cross-fitted design exists to close. The per-fold policy column stays in the
+per-fold table (§4.1 item 2) as provenance for each row, and carries no
+commentary.
 
 ---
 
