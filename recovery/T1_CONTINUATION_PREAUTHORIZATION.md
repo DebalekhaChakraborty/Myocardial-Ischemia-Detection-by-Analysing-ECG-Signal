@@ -35,7 +35,7 @@ Continuation executed  : NO
 Authorized by       : Debalekha Chakraborty
 Date                : 2026-08-22
 Authorization commit: b40b4acac16893dcb1af1f1fa91feb0d74c8a78d
-Execution commit    : pending
+Execution commit    : 61704aa7259d91eaf9d4dfc2502bf78881a05d61
 ```
 
 **The authorization enables exactly one continuation execution. Failure after
@@ -231,3 +231,90 @@ and the consumed attempt directory was unchanged throughout.
 the act of authorizing. Only human authorization remains.
 
 The signature block in §1 is unsigned.
+
+---
+
+## 10. Post-execution completion
+
+**Added 2026-08-22, after the authorized continuation was executed. Everything
+above this section is preserved exactly as it was written before execution.**
+
+The only in-place change made to the pre-execution text is the `Execution
+commit` field in §1, which was written as `pending` precisely so that it could
+be filled once the commit existed. Every other pre-execution statement stands as
+recorded, including `Continuation executed: NO` in §1 and §9 and the sentence in
+§1 noting that `cardiosentinel-runs/phase9-t1-continuation-v1` did not exist.
+Those were true when written. They are superseded by this section, not edited —
+a pre-authorization record that is rewritten after the fact stops being one.
+
+### 10.1 Outcome
+
+```
+Continuation executed  : YES
+Outcome                : COMPLETED
+Authorization          : CONSUMED by a completed run
+```
+
+| | |
+|---|---|
+| `attempt_id` | `t1-v1-measurement-continuation` |
+| `run_class` | `t1_continuation_measurement` |
+| Execution commit | `61704aa7259d91eaf9d4dfc2502bf78881a05d61` |
+| Authorization commit | `b40b4acac16893dcb1af1f1fa91feb0d74c8a78d` |
+| Started | 2026-08-22T16:18:39Z |
+| Completed | 2026-08-22T16:18:49Z |
+| Folds measured | 12 / 12 |
+| Artifacts promoted | 19 files (6 run-level, 1 attestation, 12 per-fold) |
+| Attestation SHA-256 | `b5a557dd40927999e00516e982c2f1619fdbeb3e5ebdd3ad108037b474eca588` |
+
+The artifacts carry no wall-clock field by design; the times above are the
+operator record of the run, and the attestation is the authority on everything
+else in this table.
+
+### 10.2 It took two launches, and the first did not consume the attempt
+
+The first invocation raised
+`TypeError: git_provenance() missing 1 required positional argument` at
+`runner.py:282`, inside `_authorized_git_sha()` — six lines before `_claim()` at
+`runner.py:288`. The attempt was therefore **not** claimed and, per §25, the
+authorization survived. PR #59 fixed the argument and added the seam test that
+should have preceded the first launch. The second launch crossed the claim and
+completed.
+
+This is recorded rather than glossed. The refusal was a real defect in the
+assembled path, caught by luck of ordering rather than by test, and the lesson
+belongs in this record: the stages were each tested and the junctions were not,
+which is the same defect class that consumed the canonical attempt at stage 24.
+
+### 10.3 Firewall state after execution
+
+| Counter | Value |
+|---|---|
+| `fold_evaluations` | `0` |
+| `policy_selection_calls` | `0` |
+| `state_machine_invocations` | `0` |
+| `threshold_generation_calls` | `0` |
+| `state_transitions_regenerated` | `false` |
+| `test_accessed` | `false` |
+| `sealed_test_state` | `unopened` |
+
+The measurement consumed a persisted state trace
+(`state_trace_source: predecessor_oof_state_evidence`,
+`state_trace_content_sha256: cf74f00a…`) and ran no model. All three negative
+capability gate layers passed. Predecessor verification re-verified 8 §1.3
+artifact digests and 12 §1.4 fold-selection digests. No file in the run contains
+`policy_runs`.
+
+**The consumed attempt directory was unchanged by the continuation**, still 20
+files with mtime `2026-08-21T19:57:57`. The continuation wrote only into its own
+run root.
+
+### 10.4 Standing after execution
+
+**The authorization is spent.** It was consumed by a completed run rather than a
+failed one. `T1_CONTINUATION_AUTHORIZED` remains `True` on disk; that flag is now
+a spent token, not a live permission. §14 authorizes no second continuation and
+none is predeclared, so the continuation run directory is immutable on the same
+terms as the consumed attempt.
+
+TEST was never opened by either run.
