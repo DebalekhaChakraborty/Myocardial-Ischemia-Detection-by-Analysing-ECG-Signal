@@ -99,10 +99,18 @@ def test_the_guard_is_applied_to_every_test_in_this_package():
             for keyword in decorator.keywords
         )
     ]
-    assert len(fixtures) == 1, "the package guard is not a single autouse fixture"
+    # Named rather than counted. This asserted `len(fixtures) == 1` when the
+    # attempt guard was the only package-wide fixture, which locked the file to
+    # one forever -- a property nobody chose and which broke the moment the
+    # continuation interlock was added. What matters is that the guard is
+    # autouse, not that it is lonely.
+    by_name = {node.name: node for node in fixtures}
+    assert "canonical_attempt_is_not_consumed" in by_name, (
+        f"the attempt guard is not an autouse fixture; found {sorted(by_name)}"
+    )
     called = {
         node.func.id
-        for node in ast.walk(fixtures[0])
+        for node in ast.walk(by_name["canonical_attempt_is_not_consumed"])
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
     assert "assert_attempt_unconsumed" in called

@@ -96,6 +96,7 @@ def test_continuation_authorization_is_its_own_decision():
     from cardiosentinel.neural import t1_config
 
     assert t1_config.T1_EXECUTION_SPECIFICATION_AUTHORIZED is True
+    # Disarmed for the session, so the refusal mechanism is still exercisable.
     assert S.T1_CONTINUATION_AUTHORIZED is False
     with pytest.raises(S.T1ContinuationPermissionError):
         S.require_continuation_authorized()

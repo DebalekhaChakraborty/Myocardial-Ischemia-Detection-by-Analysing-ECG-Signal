@@ -27,20 +27,27 @@ governance record that exists on one disk only is not a record.
 
 ```
 Technical readiness    : GO
-Execution authorization: PENDING HUMAN AUTHORIZATION
+Execution authorization: AUTHORIZED
 Continuation executed  : NO
 ```
 
 ```
-Authorized by       : ______________________
-Date                : ______________________
-Authorization commit: ______________________
-Execution commit    : ______________________
+Authorized by       : Debalekha Chakraborty
+Date                : 2026-08-22
+Authorization commit: b40b4acac16893dcb1af1f1fa91feb0d74c8a78d
+Execution commit    : pending
 ```
 
-Until that block is signed and the flag is set, the continuation refuses at
-stage 1 of 11, having resolved no artifact, opened no label and created no
-directory.
+**The authorization enables exactly one continuation execution. Failure after
+claim consumes the authorization. No retry or successor identity is authorized.**
+
+The flag is now `True` on disk. The continuation will proceed past stage 1 when
+an operator invokes it. It has not been invoked: `Continuation executed: NO`, and
+`cardiosentinel-runs/phase9-t1-continuation-v1` does not exist.
+
+The test suite cannot invoke it. `tests/neural/conftest.py` forces the flag back
+to `False` for the duration of a test session, because arming is an operator
+decision and pytest is not the operator.
 
 ---
 

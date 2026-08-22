@@ -240,6 +240,7 @@ def test_importing_the_label_module_dirties_nothing():
 
 
 def test_authorization_and_run_root_untouched():
+    # Disarmed for the session by conftest; the repository itself is armed.
     assert S.T1_CONTINUATION_AUTHORIZED is False
     assert not S.CONTINUATION_RUN_ROOT.exists()
 
