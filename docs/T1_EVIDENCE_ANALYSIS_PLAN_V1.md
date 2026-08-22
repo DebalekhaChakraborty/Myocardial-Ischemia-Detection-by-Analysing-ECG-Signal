@@ -178,11 +178,115 @@ amount of resolution on this evidence substitutes for a clean second cohort.
 
 ---
 
-## 7. Approval record
+## 7. Endpoint and claim hierarchy
 
-**Added 2026-08-22 at approval. Sections 1–6 above are the pre-registration and
-are committed exactly as written before any measured value was read. Nothing in
-them was altered at approval.**
+**Added 2026-08-22 at approval, still before any measured value has been read.**
+Sections 1–6 are unchanged. This section adds structure the pre-registration
+lacked; it removes nothing and weakens no constraint.
+
+### 7.1 What "causal" means in this programme
+
+Load-bearing, because it is the single most misreadable word in the eventual
+paper. In this codebase **causal means non-anticipative**: `t1_protocol.step` is
+"one causal step. Pure: it reads the current row and nothing ahead of it", and
+`t1_stream` adapts a chronological stream "strictly causally". It is a
+streaming-order guarantee about information access.
+
+**It is not causal inference.** Nothing in this evidence estimates a treatment
+effect, an intervention, or a counterfactual. The phrase "causal episode
+measurement" must never appear in a paper without that qualification attached,
+and "causal" should not appear in an abstract at all.
+
+### 7.2 Endpoint hierarchy
+
+| Tier | Endpoint | Basis |
+|---|---|---|
+| **Primary** | `episode_f1`, pooled and per subject, with the 1000-replicate subject bootstrap | Defined for 12/12 subjects; it is the quantity T1 exists to measure — episode-level alerting; it is the only slot that supports a subject bootstrap without conditioning on a data-dependent subset |
+| **Secondary** | `primary_window_mcc`, per subject and pooled | Window-level, a different task from episode alerting; defined for 5/12 subjects individually |
+| **Exploratory** | `onset_latency_seconds_median` | Conditional on successful detection **by construction** — a subject with no matched episode has no latency at all, so latency is only ever measured where detection already succeeded |
+
+**Latency is never a headline claim.** Because it is defined only on matched
+episodes, a latency figure describes the timeliness of the detections that
+happened, not the timeliness of the system. Those two are different quantities
+and only the first is measurable here.
+
+**Disclosure.** This hierarchy is conditioned on metric availability, and
+availability is a measured property of the data (§2). It was fixed before any
+value was read, but it was not fixed before *anything* was known — §2 was. That
+is disclosed rather than presented as fully a priori, and it is why §2 was
+restricted to definedness and confined to counts.
+
+### 7.3 Reporting rules, reconciled with §4.2
+
+To remove an ambiguity in the phrase "defined subjects only":
+
+1. **The per-subject table is always complete.** Twelve rows, always, with
+   undefined cells shown as undefined. "Defined subjects only" never applies to
+   the table.
+2. It applies only to **summaries**, and every summary states its `n` in the
+   same sentence — *"n of 12 subjects, the remainder undefined"*.
+3. **No subject-macro mean of MCC or latency is reported anywhere**, with or
+   without an attached `n`. A mean over a data-determined subset answers "how
+   did it do where the metric happened to exist", not "how did it do".
+4. A pooled value is labelled **pooled** and never described as an average
+   across subjects. Pooling confusion counts and averaging per-subject metrics
+   are different estimators with different meanings.
+
+### 7.4 Supported claims
+
+Within the 12 LTSTDB validation subjects, cross-fitted and subject-disjoint:
+
+- Episode-level detection performance, as pooled and per-subject `episode_f1`
+- Between-subject variability, exactly as scoped by the bootstrap's own
+  `claim_scope` string
+- Window-level pooled description, labelled as window-level
+- Onset latency on the subset where episodes were matched, labelled exploratory
+- The provenance and auditability of the chain itself: which artifacts were
+  consumed, which digests verified, that no model ran and no test was opened
+
+### 7.5 Not supported
+
+Each of these needs evidence that does not exist, and in several cases evidence
+that is not authorized to be created.
+
+| Claim | Why not |
+|---|---|
+| **External generalization** | One dataset, 12 subjects. EDB shares source recordings with LTSTDB per `CROSS_DATASET_PROVENANCE.md` and is not a clean external cohort |
+| **Population subgroup** | `join_performed: false`, `strata_reported: []` — an absent join, recorded before execution |
+| **Candidate architecture comparison** | The rejected B4 candidates were never run on held-out subjects, by design |
+| **Any test claim** | The B4/neural sealed test is unopened and stays so |
+| **Clinical claim** | Research software, public-dataset validation only |
+| **Statistical significance** | The bootstrap is not a hypothesis test |
+| **"T1 improved episode detection"** | **There is no comparator in this evidence.** No no-T1 arm was run on these held-out subjects. Improvement is a two-armed claim and this is a one-armed measurement |
+| **"Memory helps"** | An ablation. No no-memory arm exists, and M1/M2 reruns are forbidden by standing constraint |
+| **"S4D improves temporal coherence over GRU"** | `T1_T2_COMPARATOR_ARM` is declared in `t1_protocol`, but the continuation measured the retained arm only — **no file in the run references the comparator**. If this is answerable at all it is from the T2 artifacts under T2's own claim scope, not from T1 |
+
+**The general rule this table encodes:** T1 measures one configuration on held-out
+subjects. Every comparative verb — improved, helped, outperformed, better — needs
+a second arm, and this evidence has one arm. A comparative claim requires the
+ablation package, which is a separate decision and would require runs that are
+currently unauthorized.
+
+### 7.6 Failure-mode analysis
+
+Permitted at the **aggregate structural** level: counts of unmatched predicted
+runs, reference episodes with no matched prediction, and the relationship between
+empty confusion margins and undefined metrics. These read directly off the
+artifacts.
+
+**Not permitted:** per-subject narrative explaining why a particular subject
+scored as it did. That remains excluded by §4.5, and it is excluded precisely
+because it is the analysis most likely to be written backwards from the numbers.
+
+---
+
+## 8. Approval record
+
+**Added 2026-08-22 at approval. Sections 1–6 are the pre-registration as written
+at the end of ECG 12 and are committed exactly as written; nothing in them was
+altered at approval. Section 7 was added at approval, and — like §§1–6 — was
+written before any measured value was read. It adds structure and removes no
+constraint.**
 
 ```
 Plan status  : APPROVED AS WRITTEN
@@ -194,11 +298,19 @@ Step 4       : AUTHORIZED — the §4 descriptive report may be produced
 §5 step 1 (`Approve this plan`, gate: human) is satisfied. Step 4, the first read
 of the measured values, is authorized as an explicit analysis authorization
 rather than as a side effect of a status check, and is bound to the reporting
-shape fixed in §4 — in particular §4.2 item 4: **undefined subjects are shown as
-undefined, never omitted, never zero-filled.** That shape was chosen before the
-values were visible and is not renegotiable now that they are.
+shape fixed in §4 and §7 — in particular §4.2 item 4 and §7.3: **undefined
+subjects are shown as undefined, never omitted, never zero-filled; the
+per-subject table is always complete; and no subject-macro mean of MCC or
+latency is reported anywhere.** That shape was chosen before the values were
+visible and is not renegotiable now that they are.
 
-### 7.1 Structural re-verification at approval
+The §7.5 exclusions bind the same way. In particular, **no comparative verb —
+improved, helped, outperformed, better — may be applied to this evidence**, which
+measures one arm. Comparative and ablation questions are not deferred pending
+analysis; they are unanswerable from this run and require separate authorized
+evidence.
+
+### 8.1 Structural re-verification at approval
 
 Every structural claim in §1 and §2 was re-checked against the artifacts on disk
 before approval. No measured value was read, reported or interpreted in doing so;
